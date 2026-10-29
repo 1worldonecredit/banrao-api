@@ -84,10 +84,10 @@ app.post('/api/save-location', async (req, res) => {
 // 0. ตั้งค่า CORS (จำกัดโดเมนที่อนุญาตให้เข้าถึง API)
 // ---------------------------------------------------------
 const allowedOrigins = [
-  'https://kinnon.live',             // โดเมนหลัก
-  'https://useradmin.kinnon.live', 
-  'https://apibooking.smartsoft.agency',
-  'https://emp.kinnon.live',
+  'https://banrao.life',             // โดเมนหลัก
+  'https://supper.banrao.life', 
+  'https://api.banrao.life',
+  'https://emp.banrao.life',
    // โดเมนหลัก (มี www)
  'http://localhost:5173',
   'http://localhost:5174'       // สำหรับทดสอบ Frontend (อื่นๆ)
