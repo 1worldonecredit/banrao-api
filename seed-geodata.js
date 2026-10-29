@@ -1,6 +1,8 @@
 require('dotenv').config();
 const { Pool } = require('pg');
 
+console.log("Database URL: ", process.env.DATABASE_URL ? "Loaded" : "Missing"); 
+// ... (โค้ดเดิม) ...
 // ใช้การเชื่อมต่อแบบเดียวกับ server.js ของคุณ
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
