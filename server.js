@@ -129,6 +129,72 @@ app.get('/api/sys-menus', async (req, res) => {
 
 
 // ==========================================
+// API สำหรับระบบเลือกพื้นที่ (Dropdown)
+// ==========================================
+
+// 1. ดึงรายชื่อประเทศทั้งหมด
+app.get('/api/countries', async (req, res) => {
+    try {
+        const result = await pool.query('SELECT * FROM sys_countries WHERE is_active = true ORDER BY country_name_th ASC');
+        res.json(result.rows);
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'เกิดข้อผิดพลาดในการดึงข้อมูลประเทศ' });
+    }
+});
+
+// 2. ดึงรายชื่อจังหวัดตามรหัสประเทศ (เช่น /api/provinces?country_id=1)
+app.get('/api/provinces', async (req, res) => {
+    const { country_id } = req.query;
+    if (!country_id) return res.status(400).json({ error: 'กรุณาระบุ country_id' });
+
+    try {
+        const result = await pool.query(
+            'SELECT * FROM sys_provinces WHERE country_id = $1 ORDER BY province_name_th ASC',
+            [country_id]
+        );
+        res.json(result.rows);
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'เกิดข้อผิดพลาดในการดึงข้อมูลจังหวัด' });
+    }
+});
+
+// 3. ดึงรายชื่ออำเภอตามรหัสจังหวัด (เช่น /api/amphures?province_id=10)
+app.get('/api/amphures', async (req, res) => {
+    const { province_id } = req.query;
+    if (!province_id) return res.status(400).json({ error: 'กรุณาระบุ province_id' });
+
+    try {
+        const result = await pool.query(
+            'SELECT * FROM sys_amphures WHERE province_id = $1 ORDER BY amphure_name_th ASC',
+            [province_id]
+        );
+        res.json(result.rows);
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'เกิดข้อผิดพลาดในการดึงข้อมูลอำเภอ' });
+    }
+});
+
+// 4. ดึงรายชื่อตำบลและรหัสไปรษณีย์ตามรหัสอำเภอ (เช่น /api/tambons?amphure_id=1001)
+app.get('/api/tambons', async (req, res) => {
+    const { amphure_id } = req.query;
+    if (!amphure_id) return res.status(400).json({ error: 'กรุณาระบุ amphure_id' });
+
+    try {
+        const result = await pool.query(
+            'SELECT * FROM sys_tambons WHERE amphure_id = $1 ORDER BY tambon_name_th ASC',
+            [amphure_id]
+        );
+        res.json(result.rows);
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'เกิดข้อผิดพลาดในการดึงข้อมูลตำบล' });
+    }
+});
+
+// ==========================================
 // API สำหรับจัดการเมนูระบบ (Menu Management)
 // ==========================================
 
