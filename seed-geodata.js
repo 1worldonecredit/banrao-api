@@ -14,16 +14,18 @@ async function seedData() {
     try {
         console.log("⏳ กำลังดาวน์โหลดข้อมูล อำเภอ และ ตำบล ทั่วประเทศ...");
 
-        // 1. ดึงข้อมูล JSON พื้นฐานของไทยจาก Public Repository (อัปเดตล่าสุด)
-        const amphuresRes = await fetch('https://raw.githubusercontent.com/kongvut/thai-province-data/master/api_amphure.json');
+// 1. ดึงข้อมูล JSON พื้นฐานของไทยจาก Public Repository
+        const amphuresRes = await fetch('https://raw.githubusercontent.com/kongvut/thai-province-data/main/api_amphure.json');
+        if (!amphuresRes.ok) {
+            throw new Error(`โหลดข้อมูลอำเภอไม่สำเร็จ (Status: ${amphuresRes.status})`);
+        }
         const amphures = await amphuresRes.json();
 
-        const tambonsRes = await fetch('https://raw.githubusercontent.com/kongvut/thai-province-data/master/api_tambon.json');
+        const tambonsRes = await fetch('https://raw.githubusercontent.com/kongvut/thai-province-data/main/api_tambon.json');
+        if (!tambonsRes.ok) {
+            throw new Error(`โหลดข้อมูลตำบลไม่สำเร็จ (Status: ${tambonsRes.status})`);
+        }
         const tambons = await tambonsRes.json();
-
-        console.log(`✅ โหลดข้อมูลสำเร็จ: อำเภอ ${amphures.length} แห่ง | ตำบล ${tambons.length} แห่ง`);
-
-        await client.query('BEGIN'); // เริ่ม Transaction
 
         // 2. เคลียร์ข้อมูลอำเภอและตำบลเดิม (รวมถึงตัวอย่างเขต กทม. ที่ทดสอบไป) เพื่อใส่ข้อมูลฉบับเต็ม
         console.log("🧹 กำลังล้างข้อมูลตารางเดิมเพื่อเตรียมนำเข้า...");
