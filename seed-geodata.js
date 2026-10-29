@@ -6,7 +6,7 @@ console.log("Database URL: ", process.env.DATABASE_URL ? "Loaded" : "Missing");
 // ใช้การเชื่อมต่อแบบเดียวกับ server.js ของคุณ
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
-    ssl: { rejectUnauthorized: false } 
+    //ssl: { rejectUnauthorized: false } 
 });
 
 async function seedData() {
