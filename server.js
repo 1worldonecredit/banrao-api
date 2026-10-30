@@ -265,13 +265,19 @@ app.post('/api/login', async (req, res) => {
 
     try {
         // 1. ค้นหาผู้ใช้งาน พร้อมดึงข้อมูลหมู่บ้าน ผู้ใหญ่บ้าน และที่อยู่ (แก้ไขชื่อคอลัมน์เป็น _th ตาม DB)
-        const userQuery = await pgPool.query(
-            `SELECT a.account_id, a.username_phone, a.password_hash, a.occupation_id, a.is_active,
-                    p.first_name, p.last_name, o.occupation_name,
+      const userQuery = await pgPool.query(
+            `SELECT a.account_id, a.username_phone, a.password_hash, a.occupation_id, a.is_active, a.household_member_count,
+                    p.first_name, p.last_name, p.dob, p.gender, p.house_no, o.occupation_name,
                     v.village_id, v.village_name, v.headman_lat, v.headman_lng,
                     hp.first_name AS headman_first_name, 
                     hp.last_name AS headman_last_name,
-                    t.tambon_name_th, am.amphure_name_th, pr.province_name_th
+                    t.tambon_name_th, am.amphure_name_th, pr.province_name_th,
+                    
+                    -- คำนวณอายุเป็น ปี, เดือน, วัน จากวันเกิด (dob)
+                    EXTRACT(YEAR FROM age(CURRENT_DATE, p.dob)) AS age_years,
+                    EXTRACT(MONTH FROM age(CURRENT_DATE, p.dob)) AS age_months,
+                    EXTRACT(DAY FROM age(CURRENT_DATE, p.dob)) AS age_days
+
              FROM user_accounts a
              LEFT JOIN user_profiles p ON a.profile_id = p.profile_id
              LEFT JOIN sys_occupations o ON a.occupation_id = o.occupation_id
@@ -322,7 +328,7 @@ app.post('/api/login', async (req, res) => {
         res.json({
             message: 'เข้าสู่ระบบสำเร็จ',
             token,
-            user: {
+           user: {
                 id: user.account_id,
                 username: user.username_phone,
                 firstName: user.first_name,
@@ -331,9 +337,17 @@ app.post('/api/login', async (req, res) => {
                 permissions: permissions,
                 villageName: user.village_name, 
                 headmanName: user.headman_first_name ? `${user.headman_first_name} ${user.headman_last_name}` : null,
-                tambonName: user.tambon_name_th,    // ดึงจากคอลัมน์ _th
-                amphureName: user.amphure_name_th,  // ดึงจากคอลัมน์ _th
-                provinceName: user.province_name_th // ดึงจากคอลัมน์ _th
+                tambonName: user.tambon_name_th,
+                amphureName: user.amphure_name_th,
+                provinceName: user.province_name_th,
+                
+                // ข้อมูลที่เพิ่มใหม่
+                gender: user.gender === 'MALE' ? 'ชาย' : (user.gender === 'FEMALE' ? 'หญิง' : user.gender),
+                age_years: user.age_years,
+                age_months: user.age_months,
+                age_days: user.age_days,
+                house_no: user.house_no,
+                household_member_count: user.household_member_count
             }
         });
 
