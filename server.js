@@ -258,25 +258,26 @@ app.delete('/api/menus/:id', async (req, res) => {
 });
 
 
+// ต้องมี import 2 ตัวนี้ด้านบนสุดของไฟล์ด้วยนะครับ (ถ้ายังไม่มี)
+// const bcrypt = require('bcrypt');
+// const jwt = require('jsonwebtoken');
 
 // ==========================================
-// API สำหรับดึงรายชื่อประเทศ  สิ้นสุด
-// ==========================================
-// ==========================================
-// API: เข้าสู่ระบบ (Login) ด้วยเบอร์โทรศัพท์ banrao
+// API: เข้าสู่ระบบ (Login) อัปเดตตาม DB ใหม่
 // ==========================================
 app.post('/api/login', async (req, res) => {
-    const { username, password } = req.body; // username คือเบอร์โทรศัพท์ 10 หลัก
+    const { username, password } = req.body;
 
     try {
-        // 1. ค้นหาผู้ใช้งานจากเบอร์โทรศัพท์
+        // 1. ค้นหาผู้ใช้งาน โดย Join ตาราง accounts -> identities -> profiles
         const userQuery = await pool.query(
-            `SELECT a.account_id, a.username_phone, a.password_hash, a.occupation_id, a.area_code,
+            `SELECT a.account_id, a.username_phone, a.password_hash, a.occupation_id, a.is_approved,
                     p.first_name, p.last_name, o.occupation_name
              FROM user_accounts a
-             JOIN user_profiles p ON a.profile_id = p.profile_id
+             JOIN user_identities i ON a.identity_id = i.identity_id
+             JOIN user_profiles p ON i.identity_id = p.identity_id
              LEFT JOIN sys_occupations o ON a.occupation_id = o.occupation_id
-             WHERE a.username_phone = $1 AND a.is_active = true`,
+             WHERE a.username_phone = $1`,
             [username]
         );
 
@@ -286,13 +287,18 @@ app.post('/api/login', async (req, res) => {
 
         const user = userQuery.rows[0];
 
-        // 2. ตรวจสอบรหัสผ่าน (สมมติว่าคุณใช้ bcrypt ในการเข้ารหัสตอนสมัคร)
+        // 2. เช็คสถานะว่าได้รับการอนุมัติจากผู้ใหญ่บ้านหรือยัง
+        if (user.is_approved === false) {
+            return res.status(403).json({ message: 'บัญชีนี้ยังไม่ได้รับการอนุมัติ กรุณาติดต่อผู้ใหญ่บ้าน' });
+        }
+
+        // 3. ตรวจสอบรหัสผ่าน (ใช้ bcrypt)
         const isValidPassword = await bcrypt.compare(password, user.password_hash);
         if (!isValidPassword) {
             return res.status(401).json({ message: 'เบอร์โทรศัพท์หรือรหัสผ่านไม่ถูกต้อง' });
         }
 
-        // 3. ดึงสิทธิ์ (Permissions) ของอาชีพนี้
+        // 4. ดึงสิทธิ์ (Permissions)
         const permQuery = await pool.query(
             `SELECT sp.permission_code
              FROM occupation_permissions op
@@ -300,12 +306,12 @@ app.post('/api/login', async (req, res) => {
              WHERE op.occupation_id = $1`,
             [user.occupation_id]
         );
-        const permissions = permQuery.rows.map(row => row.permission_code); // เช่น ['VIEW_OWN_DATA', 'VIEW_VILLAGE_MAP']
+        const permissions = permQuery.rows.map(row => row.permission_code);
 
-        // 4. สร้าง Token และส่งข้อมูลกลับไปให้ React
+        // 5. สร้าง Token
         const token = jwt.sign(
             { account_id: user.account_id, occupation_id: user.occupation_id },
-            process.env.JWT_SECRET || 'mySuperSecretKey',
+            process.env.JWT_SECRET || 'banrao_secret_key',
             { expiresIn: '1d' }
         );
 
@@ -318,14 +324,14 @@ app.post('/api/login', async (req, res) => {
                 firstName: user.first_name,
                 lastName: user.last_name,
                 occupation: user.occupation_name,
-                permissions: permissions, // ส่งสิทธิ์กลับไปด้วย
-                areaCode: user.area_code
+                permissions: permissions
             }
         });
 
     } catch (error) {
         console.error('Login API Error:', error);
-        res.status(500).json({ message: 'ไม่สามารถเชื่อมต่อเซิร์ฟเวอร์ได้' });
+        // ส่งข้อความ Error กลับไปให้รู้ว่าพังที่บรรทัดไหน
+        res.status(500).json({ message: 'Internal Server Error', error: error.message });
     }
 });
 // =========================================================
