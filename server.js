@@ -271,7 +271,6 @@ app.post('/api/login', async (req, res) => {
     try {
         // 1. ค้นหาผู้ใช้งาน พร้อมดึงข้อมูลหมู่บ้านและข้อมูลผู้ใหญ่บ้าน
         const userQuery = await pgPool.query(
-           const userQuery = await pgPool.query(
             `SELECT a.account_id, a.username_phone, a.password_hash, a.occupation_id, a.is_active,
                     p.first_name, p.last_name, o.occupation_name,
                     v.village_id, v.village_name, v.headman_lat, v.headman_lng,
