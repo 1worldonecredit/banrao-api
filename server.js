@@ -271,17 +271,22 @@ app.post('/api/login', async (req, res) => {
     try {
         // 1. ค้นหาผู้ใช้งาน พร้อมดึงข้อมูลหมู่บ้านและข้อมูลผู้ใหญ่บ้าน
         const userQuery = await pgPool.query(
+           const userQuery = await pgPool.query(
             `SELECT a.account_id, a.username_phone, a.password_hash, a.occupation_id, a.is_active,
                     p.first_name, p.last_name, o.occupation_name,
                     v.village_id, v.village_name, v.headman_lat, v.headman_lng,
                     hp.first_name AS headman_first_name, 
-                    hp.last_name AS headman_last_name
+                    hp.last_name AS headman_last_name,
+                    t.tambon_name, am.amphure_name, pr.province_name
              FROM user_accounts a
              LEFT JOIN user_profiles p ON a.profile_id = p.profile_id
              LEFT JOIN sys_occupations o ON a.occupation_id = o.occupation_id
              LEFT JOIN villages v ON a.village_id = v.village_id
              LEFT JOIN user_accounts ha ON v.headman_account_id = ha.account_id
              LEFT JOIN user_profiles hp ON ha.profile_id = hp.profile_id
+             LEFT JOIN sys_tambons t ON v.tambon_id = t.tambon_id
+             LEFT JOIN sys_amphures am ON t.amphure_id = am.amphure_id
+             LEFT JOIN sys_provinces pr ON am.province_id = pr.province_id
              WHERE a.username_phone = $1`,
             [username]
         );
@@ -320,7 +325,7 @@ app.post('/api/login', async (req, res) => {
             { expiresIn: '1d' }
         );
 
-        res.json({
+       res.json({
             message: 'เข้าสู่ระบบสำเร็จ',
             token,
             user: {
@@ -330,8 +335,11 @@ app.post('/api/login', async (req, res) => {
                 lastName: user.last_name,
                 occupation: user.occupation_name,
                 permissions: permissions,
-                villageName: user.village_name, // ส่งชื่อหมู่บ้านไป Frontend
-                headmanName: user.headman_first_name ? `${user.headman_first_name} ${user.headman_last_name}` : null // ส่งชื่อผู้ใหญ่บ้านไป Frontend
+                villageName: user.village_name, 
+                headmanName: user.headman_first_name ? `${user.headman_first_name} ${user.headman_last_name}` : null,
+                tambonName: user.tambon_name,     // เพิ่มบรรทัดนี้
+                amphureName: user.amphure_name,   // เพิ่มบรรทัดนี้
+                provinceName: user.province_name  // เพิ่มบรรทัดนี้
             }
         });
 
