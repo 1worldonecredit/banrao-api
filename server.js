@@ -270,7 +270,7 @@ app.post('/api/login', async (req, res) => {
 
     try {
         // 1. ค้นหาผู้ใช้งาน โดย Join ตาราง accounts -> identities -> profiles
-        const userQuery = await pool.query(
+        const userQuery = await pgPool.query(
             `SELECT a.account_id, a.username_phone, a.password_hash, a.occupation_id, a.is_approved,
                     p.first_name, p.last_name, o.occupation_name
              FROM user_accounts a
@@ -299,7 +299,7 @@ app.post('/api/login', async (req, res) => {
         }
 
         // 4. ดึงสิทธิ์ (Permissions)
-        const permQuery = await pool.query(
+        const permQuery = await pgPool.query(
             `SELECT sp.permission_code
              FROM occupation_permissions op
              JOIN sys_permissions sp ON op.permission_id = sp.permission_id
