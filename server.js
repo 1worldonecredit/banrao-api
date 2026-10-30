@@ -390,120 +390,70 @@ app.post('/api/register', async (req, res) => {
 // ==========================================
 // API สำหรับดึงรายชื่อประเทศ  สิ้นสุด
 // ==========================================
-
-// =========================================================
-// 4. API เข้าสู่ระบบ (Login) และสร้าง JWT Token
-// =========================================================
+// ==========================================
+// API: เข้าสู่ระบบ (Login) ด้วยเบอร์โทรศัพท์ banrao
+// ==========================================
 app.post('/api/login', async (req, res) => {
-    const { username, password } = req.body;
+    const { username, password } = req.body; // username คือเบอร์โทรศัพท์ 10 หลัก
 
     try {
-        // 1. ค้นหาผู้ใช้จากตาราง users พร้อมดึงข้อมูลจากตารางอื่นๆ ที่เกี่ยวข้อง
-        const userQuery = await pgPool.query(`
-            SELECT 
-                u.id, 
-                u.username, 
-                u.global_id,
-                u.level_id,
-                u.accumulated_spending,
-                u.accumulated_earning,
-                u.status,
-                c.iso_code,
-                c.name_en AS country_name,
-                p.full_name,
-                p.email,
-                p.avatar_url
-            FROM users u
-            LEFT JOIN countries c ON u.country_id = c.id
-            LEFT JOIN user_profiles p ON u.id = p.user_id
-            WHERE u.username = $1
-        `, [username]);
+        // 1. ค้นหาผู้ใช้งานจากเบอร์โทรศัพท์
+        const userQuery = await pool.query(
+            `SELECT a.account_id, a.username_phone, a.password_hash, a.occupation_id, a.area_code,
+                    p.first_name, p.last_name, o.occupation_name
+             FROM user_accounts a
+             JOIN user_profiles p ON a.profile_id = p.profile_id
+             LEFT JOIN sys_occupations o ON a.occupation_id = o.occupation_id
+             WHERE a.username_phone = $1 AND a.is_active = true`,
+            [username]
+        );
 
-        // ตรวจสอบว่าพบผู้ใช้หรือไม่
         if (userQuery.rows.length === 0) {
-            return res.status(401).json({ success: false, message: 'ชื่อผู้ใช้ หรือ รหัสผ่าน ไม่ถูกต้อง' });
+            return res.status(401).json({ message: 'เบอร์โทรศัพท์หรือรหัสผ่านไม่ถูกต้อง' });
         }
 
         const user = userQuery.rows[0];
 
-        // ตรวจสอบสถานะผู้ใช้งาน
-        if (user.status !== 'active') {
-             return res.status(403).json({ success: false, message: 'บัญชีนี้ถูกระงับการใช้งาน กรุณาติดต่อผู้ดูแลระบบ' });
+        // 2. ตรวจสอบรหัสผ่าน (สมมติว่าคุณใช้ bcrypt ในการเข้ารหัสตอนสมัคร)
+        const isValidPassword = await bcrypt.compare(password, user.password_hash);
+        if (!isValidPassword) {
+            return res.status(401).json({ message: 'เบอร์โทรศัพท์หรือรหัสผ่านไม่ถูกต้อง' });
         }
 
-        // 2. ดึงรหัสผ่านที่เข้ารหัสไว้ (status = 'active') จากตาราง user_passwords
-        const pwdQuery = await pgPool.query(`
-            SELECT password_hash FROM user_passwords 
-            WHERE user_id = $1 AND status = 'active'
-        `, [user.id]);
+        // 3. ดึงสิทธิ์ (Permissions) ของอาชีพนี้
+        const permQuery = await pool.query(
+            `SELECT sp.permission_code
+             FROM occupation_permissions op
+             JOIN sys_permissions sp ON op.permission_id = sp.permission_id
+             WHERE op.occupation_id = $1`,
+            [user.occupation_id]
+        );
+        const permissions = permQuery.rows.map(row => row.permission_code); // เช่น ['VIEW_OWN_DATA', 'VIEW_VILLAGE_MAP']
 
-        if (pwdQuery.rows.length === 0) {
-            return res.status(401).json({ success: false, message: 'ชื่อผู้ใช้ หรือ รหัสผ่าน ไม่ถูกต้อง' });
-        }
-
-        const hashedPassword = pwdQuery.rows[0].password_hash;
-
-        // 3. เปรียบเทียบรหัสผ่านด้วย bcrypt
-        const isMatch = await bcrypt.compare(password, hashedPassword);
-        if (!isMatch) {
-            return res.status(401).json({ success: false, message: 'ชื่อผู้ใช้ หรือ รหัสผ่าน ไม่ถูกต้อง' });
-        }
-
-        // 4. ดึงสิทธิ์ (Roles) ของผู้ใช้
-        const rolesQuery = await pgPool.query(`
-            SELECT r.role_name 
-            FROM user_roles ur
-            JOIN roles r ON ur.role_id = r.id
-            WHERE ur.user_id = $1
-        `, [user.id]);
-        
-        const roles = rolesQuery.rows.map(row => row.role_name);
-
-        // 5. สร้าง JWT Token (หมดอายุใน 24 ชั่วโมง)
+        // 4. สร้าง Token และส่งข้อมูลกลับไปให้ React
         const token = jwt.sign(
-            { 
-                userId: user.id, 
-                globalId: user.global_id,
-                username: user.username,
-                roles: roles 
-            }, 
-            JWT_SECRET, 
-            { expiresIn: '24h' }
+            { account_id: user.account_id, occupation_id: user.occupation_id },
+            process.env.JWT_SECRET || 'mySuperSecretKey',
+            { expiresIn: '1d' }
         );
 
-        // 6. จัดเตรียมข้อมูล User ส่งกลับให้ Frontend (เปลี่ยน LA เป็น US ตามหน้าบ้าน)
-        let countryForFrontend = user.country_name;
-        if (user.iso_code === 'US' || user.country_name === 'United States') {
-             countryForFrontend = 'US สหรัฐอเมริกา (USD)'; // ให้ตรงเงื่อนไขของ Frontend
-        } else if (user.iso_code === 'TH') {
-             countryForFrontend = 'Thailand';
-        }
-
-        const userDataForFrontend = {
-            id: user.id,
-            global_id: user.global_id,
-            username: user.username,
-            full_name: user.full_name,
-            email: user.email,
-            avatar_url: user.avatar_url,
-            country: countryForFrontend, 
-            level_id: user.level_id,
-            wallet: user.accumulated_earning, // สมมติให้ใช้ earning เป็น wallet
-            point: Math.floor(user.accumulated_spending / 100), // สมมติการคำนวณ point
-            roles: roles
-        };
-
-        // ส่งผลลัพธ์กลับ
-        res.json({ 
-            success: true, 
+        res.json({
             message: 'เข้าสู่ระบบสำเร็จ',
-            token: token,
-            user: userDataForFrontend
+            token,
+            user: {
+                id: user.account_id,
+                username: user.username_phone,
+                firstName: user.first_name,
+                lastName: user.last_name,
+                occupation: user.occupation_name,
+                permissions: permissions, // ส่งสิทธิ์กลับไปด้วย
+                areaCode: user.area_code
+            }
         });
 
     } catch (error) {
-        console.error('Login Error:', error);
-        res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดที่เซิร์ฟเวอร์' });
+        console.error('Login API Error:', error);
+        res.status(500).json({ message: 'ไม่สามารถเชื่อมต่อเซิร์ฟเวอร์ได้' });
     }
 });
 // =========================================================
