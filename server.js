@@ -261,22 +261,26 @@ app.delete('/api/menus/:id', async (req, res) => {
 // ต้องมี import 2 ตัวนี้ด้านบนสุดของไฟล์ด้วยนะครับ (ถ้ายังไม่มี)
 // const bcrypt = require('bcrypt');
 // const jwt = require('jsonwebtoken');
-
 // ==========================================
-// API: เข้าสู่ระบบ (Login) อัปเดตตาม DB ใหม่
+// API: เข้าสู่ระบบ (Login) อัปเดตตาม DB ใหม่ และดึงข้อมูลหมู่บ้าน
 // ==========================================
 app.post('/api/login', async (req, res) => {
     const { username, password } = req.body;
 
     try {
-        // 1. ค้นหาผู้ใช้งาน โดย Join ตาราง accounts -> identities -> profiles
-      // 1. ค้นหาผู้ใช้งาน โดย Join ตาราง accounts -> profiles (ผ่าน profile_id)
+        // 1. ค้นหาผู้ใช้งาน พร้อมดึงข้อมูลหมู่บ้านและข้อมูลผู้ใหญ่บ้าน
         const userQuery = await pgPool.query(
             `SELECT a.account_id, a.username_phone, a.password_hash, a.occupation_id, a.is_active,
-                    p.first_name, p.last_name, o.occupation_name
+                    p.first_name, p.last_name, o.occupation_name,
+                    v.village_id, v.village_name, v.headman_lat, v.headman_lng,
+                    hp.first_name AS headman_first_name, 
+                    hp.last_name AS headman_last_name
              FROM user_accounts a
              LEFT JOIN user_profiles p ON a.profile_id = p.profile_id
              LEFT JOIN sys_occupations o ON a.occupation_id = o.occupation_id
+             LEFT JOIN villages v ON a.village_id = v.village_id
+             LEFT JOIN user_accounts ha ON v.headman_account_id = ha.account_id
+             LEFT JOIN user_profiles hp ON ha.profile_id = hp.profile_id
              WHERE a.username_phone = $1`,
             [username]
         );
@@ -287,13 +291,8 @@ app.post('/api/login', async (req, res) => {
 
         const user = userQuery.rows[0];
 
-        // 2. เช็คสถานะว่าได้รับการอนุมัติเปิดใช้งานหรือยัง (ใช้ is_active ตาม DB)
+        // 2. เช็คสถานะว่าได้รับการอนุมัติเปิดใช้งานหรือยัง (ลบ is_approved ที่ซ้ำซ้อนออก)
         if (user.is_active === false) {
-            return res.status(403).json({ message: 'บัญชีนี้ยังไม่ได้รับการอนุมัติ กรุณาติดต่อผู้ใหญ่บ้าน' });
-        }
-
-        // 2. เช็คสถานะว่าได้รับการอนุมัติจากผู้ใหญ่บ้านหรือยัง
-        if (user.is_approved === false) {
             return res.status(403).json({ message: 'บัญชีนี้ยังไม่ได้รับการอนุมัติ กรุณาติดต่อผู้ใหญ่บ้าน' });
         }
 
@@ -313,9 +312,9 @@ app.post('/api/login', async (req, res) => {
         );
         const permissions = permQuery.rows.map(row => row.permission_code);
 
-        // 5. สร้าง Token
+        // 5. สร้าง Token (ฝัง village_id ลงไปใน Token ด้วยเพื่อให้ Backend รู้ว่า User อยู่หมู่บ้านไหน)
         const token = jwt.sign(
-            { account_id: user.account_id, occupation_id: user.occupation_id },
+            { account_id: user.account_id, occupation_id: user.occupation_id, village_id: user.village_id },
             process.env.JWT_SECRET || 'banrao_secret_key',
             { expiresIn: '1d' }
         );
@@ -329,13 +328,14 @@ app.post('/api/login', async (req, res) => {
                 firstName: user.first_name,
                 lastName: user.last_name,
                 occupation: user.occupation_name,
-                permissions: permissions
+                permissions: permissions,
+                villageName: user.village_name, // ส่งชื่อหมู่บ้านไป Frontend
+                headmanName: user.headman_first_name ? `${user.headman_first_name} ${user.headman_last_name}` : null // ส่งชื่อผู้ใหญ่บ้านไป Frontend
             }
         });
 
     } catch (error) {
         console.error('Login API Error:', error);
-        // ส่งข้อความ Error กลับไปให้รู้ว่าพังที่บรรทัดไหน
         res.status(500).json({ message: 'Internal Server Error', error: error.message });
     }
 });
