@@ -4,6 +4,9 @@ const jwt = require('jsonwebtoken');
 const cors = require('cors');
 const { Pool } = require('pg'); // <-- ต้องมีแค่บรรทัดเดียวในไฟล์
 const cron = require('node-cron');
+const multer = require('multer');
+// ตั้งค่าให้ multer เก็บไฟล์ไว้ในหน่วยความจำ (RAM) ก่อนส่งไป Cloudflare
+const upload = multer({ storage: multer.memoryStorage() });
 
 const app = express();
 
@@ -28,6 +31,86 @@ const pgPool = new Pool({
     }
 });
 
+// ==========================================
+// API: อัปโหลดรูป Profile
+// ==========================================
+app.post('/api/upload-profile', upload.single('profileImage'), async (req, res) => {
+    const client = await pgPool.connect();
+    
+    try {
+        // 1. ตรวจสอบว่ามีไฟล์และข้อมูลครบหรือไม่
+        if (!req.file) {
+            return res.status(400).json({ error: 'ไม่พบไฟล์รูปภาพ' });
+        }
+
+        const accountId = req.body.userId;
+        if (!accountId) {
+            return res.status(400).json({ error: 'ไม่พบรหัสผู้ใช้งาน' });
+        }
+
+        // 2. ค้นหารหัส profile_id จาก account_id
+        const userResult = await client.query('SELECT profile_id FROM user_accounts WHERE account_id = $1', [accountId]);
+        if (userResult.rows.length === 0) {
+            return res.status(404).json({ error: 'ไม่พบผู้ใช้งานในระบบ' });
+        }
+        const profileId = userResult.rows[0].profile_id;
+
+        // 3. เตรียมไฟล์เพื่อส่งไป Cloudflare Images
+        // แปลงไฟล์เป็น Blob เพื่อให้ใช้งานกับ fetch ได้
+        const fileBlob = new Blob([req.file.buffer], { type: req.file.mimetype });
+        const formData = new FormData();
+        formData.append('file', fileBlob, req.file.originalname);
+
+        console.log('กำลังส่งรูปขึ้น Cloudflare...');
+
+        // ยิง API ไปที่ Cloudflare
+        const cfResponse = await fetch(`https://api.cloudflare.com/client/v4/accounts/${process.env.CF_ACCOUNT_ID}/images/v1`, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${process.env.CF_API_TOKEN}`
+            },
+            body: formData
+        });
+
+        const cfData = await cfResponse.json();
+
+        if (!cfData.success) {
+            console.error("Cloudflare Error:", cfData.errors);
+            return res.status(500).json({ error: 'อัปโหลดขึ้น Cloudflare ไม่สำเร็จ' });
+        }
+
+        // Cloudflare จะคืนค่า variants ของรูปภาพกลับมา (ใช้ลิงก์แรก)
+        const imageUrl = cfData.result.variants[0];
+        console.log('อัปโหลดสำเร็จ Link:', imageUrl);
+
+        // 4. บันทึก URL ลงในฐานข้อมูล Neon
+        await client.query('BEGIN'); // เริ่มทำ Transaction
+
+        // 4.1 เปลี่ยนสถานะรูปโปรไฟล์เก่า (ถ้ามี) ให้ปิดการใช้งาน (is_active = false)
+        await client.query(
+            'UPDATE citizen_profiles_media SET is_active = false WHERE profile_id = $1',
+            [profileId]
+        );
+
+        // 4.2 เพิ่มรูปโปรไฟล์ใหม่เข้าไป (is_active = true)
+        await client.query(
+            'INSERT INTO citizen_profiles_media (profile_id, image_url, is_active) VALUES ($1, $2, true)',
+            [profileId, imageUrl]
+        );
+
+        await client.query('COMMIT'); // ยืนยันการเปลี่ยนแปลงข้อมูล
+
+        // 5. ส่งลิงก์รูปใหม่กลับไปให้หน้าเว็บ (Frontend) แสดงผลทันที
+        res.json({ message: 'Upload successful', imageUrl: imageUrl });
+
+    } catch (error) {
+        await client.query('ROLLBACK'); // ยกเลิกการอัปเดต DB ถ้ามีอะไรพังกลางคัน
+        console.error('Upload Profile Error:', error);
+        res.status(500).json({ error: 'เกิดข้อผิดพลาดในระบบ' });
+    } finally {
+        client.release();
+    }
+});
 
 // API สำหรับขอค่ารัศมีการแสดงผลตามพิกัดปัจจุบัน
 app.post('/api/get-display-radius', async (req, res) => {
