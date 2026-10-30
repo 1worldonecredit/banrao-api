@@ -257,26 +257,21 @@ app.delete('/api/menus/:id', async (req, res) => {
   }
 });
 
-
-// ต้องมี import 2 ตัวนี้ด้านบนสุดของไฟล์ด้วยนะครับ (ถ้ายังไม่มี)
-// const bcrypt = require('bcrypt');
-// const jwt = require('jsonwebtoken');
-
 // ==========================================
-// API: เข้าสู่ระบบ (Login) อัปเดตตาม DB ใหม่ และดึงข้อมูลหมู่บ้าน
+// API: เข้าสู่ระบบ (Login) อัปเดตตาม DB ใหม่ และดึงข้อมูลหมู่บ้าน+ที่อยู่
 // ==========================================
 app.post('/api/login', async (req, res) => {
     const { username, password } = req.body;
 
     try {
-        // 1. ค้นหาผู้ใช้งาน พร้อมดึงข้อมูลหมู่บ้านและข้อมูลผู้ใหญ่บ้าน
+        // 1. ค้นหาผู้ใช้งาน พร้อมดึงข้อมูลหมู่บ้าน ผู้ใหญ่บ้าน และที่อยู่ (แก้ไขชื่อคอลัมน์เป็น _th ตาม DB)
         const userQuery = await pgPool.query(
             `SELECT a.account_id, a.username_phone, a.password_hash, a.occupation_id, a.is_active,
                     p.first_name, p.last_name, o.occupation_name,
                     v.village_id, v.village_name, v.headman_lat, v.headman_lng,
                     hp.first_name AS headman_first_name, 
                     hp.last_name AS headman_last_name,
-                    t.tambon_name, am.amphure_name, pr.province_name
+                    t.tambon_name_th, am.amphure_name_th, pr.province_name_th
              FROM user_accounts a
              LEFT JOIN user_profiles p ON a.profile_id = p.profile_id
              LEFT JOIN sys_occupations o ON a.occupation_id = o.occupation_id
@@ -317,14 +312,14 @@ app.post('/api/login', async (req, res) => {
         );
         const permissions = permQuery.rows.map(row => row.permission_code);
 
-        // 5. สร้าง Token (ฝัง village_id ลงไปใน Token ด้วยเพื่อให้ Backend รู้ว่า User อยู่หมู่บ้านไหน)
+        // 5. สร้าง Token
         const token = jwt.sign(
             { account_id: user.account_id, occupation_id: user.occupation_id, village_id: user.village_id },
             process.env.JWT_SECRET || 'banrao_secret_key',
             { expiresIn: '1d' }
         );
 
-       res.json({
+        res.json({
             message: 'เข้าสู่ระบบสำเร็จ',
             token,
             user: {
@@ -336,9 +331,9 @@ app.post('/api/login', async (req, res) => {
                 permissions: permissions,
                 villageName: user.village_name, 
                 headmanName: user.headman_first_name ? `${user.headman_first_name} ${user.headman_last_name}` : null,
-                tambonName: user.tambon_name,     // เพิ่มบรรทัดนี้
-                amphureName: user.amphure_name,   // เพิ่มบรรทัดนี้
-                provinceName: user.province_name  // เพิ่มบรรทัดนี้
+                tambonName: user.tambon_name_th,    // ดึงจากคอลัมน์ _th
+                amphureName: user.amphure_name_th,  // ดึงจากคอลัมน์ _th
+                provinceName: user.province_name_th // ดึงจากคอลัมน์ _th
             }
         });
 
