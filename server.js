@@ -319,16 +319,25 @@ app.post('/api/login', async (req, res) => {
         const permissions = permQuery.rows.map(row => row.permission_code);
 
         // 5. สร้าง Token
+       // 5. สร้าง Token
         const token = jwt.sign(
             { account_id: user.account_id, occupation_id: user.occupation_id, village_id: user.village_id },
             process.env.JWT_SECRET || 'banrao_secret_key',
             { expiresIn: '1d' }
         );
 
+        // แปลงวันที่ (dob) ให้เป็นชื่อวันภาษาไทย (จันทร์, อังคาร, ...)
+        const daysTh = ['อาทิตย์', 'จันทร์', 'อังคาร', 'พุธ', 'พฤหัสบดี', 'ศุกร์', 'เสาร์'];
+        const birthDate = user.dob ? new Date(user.dob) : null;
+        const dayNameTh = birthDate ? daysTh[birthDate.getDay()] : '-';
+        
+        // แปลงเพศ
+        const genderTh = user.gender === 'MALE' ? 'ชาย' : (user.gender === 'FEMALE' ? 'หญิง' : '-');
+
         res.json({
             message: 'เข้าสู่ระบบสำเร็จ',
             token,
-           user: {
+            user: {
                 id: user.account_id,
                 username: user.username_phone,
                 firstName: user.first_name,
@@ -342,12 +351,13 @@ app.post('/api/login', async (req, res) => {
                 provinceName: user.province_name_th,
                 
                 // ข้อมูลที่เพิ่มใหม่
-                gender: user.gender === 'MALE' ? 'ชาย' : (user.gender === 'FEMALE' ? 'หญิง' : user.gender),
-                age_years: user.age_years,
-                age_months: user.age_months,
-                age_days: user.age_days,
-                house_no: user.house_no,
-                household_member_count: user.household_member_count
+                gender: genderTh,
+                birthDayName: dayNameTh, // ส่งชื่อวันกลับไป
+                age_years: user.age_years || 0,
+                age_months: user.age_months || 0,
+                age_days: user.age_days || 0,
+                house_no: user.house_no || '-',
+                household_member_count: user.household_member_count || 0
             }
         });
 
