@@ -270,21 +270,27 @@ app.post('/api/login', async (req, res) => {
 
     try {
         // 1. ค้นหาผู้ใช้งาน โดย Join ตาราง accounts -> identities -> profiles
-       const userQuery = await pgPool.query(
-    `SELECT a.account_id, a.username_phone, a.password_hash, a.occupation_id, a.is_approved,
-            p.first_name, p.last_name, o.occupation_name
-     FROM user_accounts a
-     JOIN user_identities i ON a.account_id = i.account_id
-     JOIN user_profiles p ON a.account_id = p.account_id
-     LEFT JOIN sys_occupations o ON a.occupation_id = o.occupation_id
-     WHERE a.username_phone = $1`,
-    [username]
-);
+      // 1. ค้นหาผู้ใช้งาน โดย Join ตาราง accounts -> profiles (ผ่าน profile_id)
+        const userQuery = await pgPool.query(
+            `SELECT a.account_id, a.username_phone, a.password_hash, a.occupation_id, a.is_active,
+                    p.first_name, p.last_name, o.occupation_name
+             FROM user_accounts a
+             LEFT JOIN user_profiles p ON a.profile_id = p.profile_id
+             LEFT JOIN sys_occupations o ON a.occupation_id = o.occupation_id
+             WHERE a.username_phone = $1`,
+            [username]
+        );
+
         if (userQuery.rows.length === 0) {
             return res.status(401).json({ message: 'เบอร์โทรศัพท์หรือรหัสผ่านไม่ถูกต้อง' });
         }
 
         const user = userQuery.rows[0];
+
+        // 2. เช็คสถานะว่าได้รับการอนุมัติเปิดใช้งานหรือยัง (ใช้ is_active ตาม DB)
+        if (user.is_active === false) {
+            return res.status(403).json({ message: 'บัญชีนี้ยังไม่ได้รับการอนุมัติ กรุณาติดต่อผู้ใหญ่บ้าน' });
+        }
 
         // 2. เช็คสถานะว่าได้รับการอนุมัติจากผู้ใหญ่บ้านหรือยัง
         if (user.is_approved === false) {
