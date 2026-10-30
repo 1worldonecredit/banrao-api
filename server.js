@@ -265,7 +265,8 @@ app.post('/api/login', async (req, res) => {
 
     try {
         // 1. ค้นหาผู้ใช้งาน พร้อมดึงข้อมูลหมู่บ้าน ผู้ใหญ่บ้าน และที่อยู่ (แก้ไขชื่อคอลัมน์เป็น _th ตาม DB)
-      const userQuery = await pgPool.query(
+      // 1. ค้นหาผู้ใช้งาน พร้อมดึงข้อมูลรูปภาพ
+        const userQuery = await pgPool.query(
             `SELECT a.account_id, a.username_phone, a.password_hash, a.occupation_id, a.is_active, a.household_member_count,
                     p.first_name, p.last_name, p.dob, p.gender, p.house_no, o.occupation_name,
                     v.village_id, v.village_name, v.headman_lat, v.headman_lng,
@@ -273,10 +274,13 @@ app.post('/api/login', async (req, res) => {
                     hp.last_name AS headman_last_name,
                     t.tambon_name_th, am.amphure_name_th, pr.province_name_th,
                     
-                    -- คำนวณอายุเป็น ปี, เดือน, วัน จากวันเกิด (dob)
                     EXTRACT(YEAR FROM age(CURRENT_DATE, p.dob)) AS age_years,
                     EXTRACT(MONTH FROM age(CURRENT_DATE, p.dob)) AS age_months,
-                    EXTRACT(DAY FROM age(CURRENT_DATE, p.dob)) AS age_days
+                    EXTRACT(DAY FROM age(CURRENT_DATE, p.dob)) AS age_days,
+                    
+                    -- ดึง URL รูปภาพ
+                    cpm.image_url AS user_image,
+                    hpm.image_url AS headman_image
 
              FROM user_accounts a
              LEFT JOIN user_profiles p ON a.profile_id = p.profile_id
@@ -287,6 +291,12 @@ app.post('/api/login', async (req, res) => {
              LEFT JOIN sys_tambons t ON v.tambon_id = t.tambon_id
              LEFT JOIN sys_amphures am ON t.amphure_id = am.amphure_id
              LEFT JOIN sys_provinces pr ON am.province_id = pr.province_id
+             
+             -- JOIN ดึงรูป Profile ของผู้ใช้งาน
+             LEFT JOIN citizen_profiles_media cpm ON p.profile_id = cpm.profile_id AND cpm.is_active = true
+             -- JOIN ดึงรูป Profile ของผู้ใหญ่บ้าน
+             LEFT JOIN citizen_profiles_media hpm ON hp.profile_id = hpm.profile_id AND hpm.is_active = true
+             
              WHERE a.username_phone = $1`,
             [username]
         );
@@ -357,7 +367,9 @@ app.post('/api/login', async (req, res) => {
                 age_months: user.age_months || 0,
                 age_days: user.age_days || 0,
                 house_no: user.house_no || '-',
-                household_member_count: user.household_member_count || 0
+                household_member_count: user.household_member_count || 0,
+                userImage: user.user_image || 'https://cdn-icons-png.flaticon.com/512/149/149071.png', 
+                headmanImage: user.headman_image || 'https://cdn-icons-png.flaticon.com/512/149/149071.png'
             }
         });
 
