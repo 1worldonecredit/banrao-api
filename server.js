@@ -698,6 +698,33 @@ app.post('/api/upload-image', upload.single('image'), async (req, res) => {
     }
 });
 
+
+// ==========================================
+// API: ดึงข้อมูลสถานที่ของฉัน (My Places)
+// ==========================================
+app.get('/api/my-places/:accountId', async (req, res) => {
+    try {
+        const { accountId } = req.params;
+        const query = `
+            SELECT p.*, c.category_name, c.icon_name
+            FROM community_places p
+            LEFT JOIN sys_place_categories c ON p.category_id = c.category_id
+            WHERE p.owner_account_id = $1
+            ORDER BY p.created_at DESC;
+        `;
+        const result = await pgPool.query(query, [accountId]);
+        res.json({ success: true, data: result.rows });
+    } catch (error) {
+        console.error('API My Places Error:', error);
+        res.status(500).json({ success: false, message: 'Internal Server Error' });
+    }
+});
+
+
+
+// ==========================================
+// API: ดึงข้อมูลสถานที่ของฉัน (My Places)  สิ้นสุด
+// ==========================================
 app.listen(port, () => {
     console.log(`Server is running on port ${port}`);
 });
