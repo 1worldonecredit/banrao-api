@@ -661,8 +661,8 @@ app.post('/api/upload-image', upload.single('image'), async (req, res) => {
             return res.status(400).json({ success: false, message: 'ไม่มีไฟล์รูปภาพถูกส่งมา' });
         }
 
-        const CLOUDFLARE_ACCOUNT_ID = process.env.CLOUDFLARE_ACCOUNT_ID || 'เอา_Account_ID_ของคุณมาใส่ที่นี่'; 
-        const CLOUDFLARE_API_TOKEN = process.env.CLOUDFLARE_API_TOKEN || 'เอา_API_Token_ของคุณมาใส่ที่นี่';
+        const CLOUDFLARE_ACCOUNT_ID = process.env.CF_ACCOUNT_ID; 
+        const CLOUDFLARE_API_TOKEN = process.env.CF_API_TOKEN;
 
         const formData = new FormData();
         
