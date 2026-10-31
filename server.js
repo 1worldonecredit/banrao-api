@@ -463,6 +463,67 @@ app.post('/api/login', async (req, res) => {
 });
 // =========================================================
 
+// ==========================================
+// API: ดึงเมนู Sidebar ตามสิทธิ์ของผู้ใช้งาน (Dynamic Role-Based Menu)
+// ==========================================
+app.get('/api/sidebar-menus/:accountId', async (req, res) => {
+    const { accountId } = req.params;
+    const client = await pgPool.connect();
+
+    try {
+        // Query สุดฉลาด: หาว่าคนๆ นี้มีสิทธิ์อะไรบ้างในวันนี้ แล้วดึงเมนูที่ตรงกับสิทธิ์นั้นออกมา
+        const query = `
+            WITH UserPermissions AS (
+                -- 1. ดึงสิทธิ์จาก 'ตำแหน่งทางการ' (user_positions) ที่ยังไม่หมดวาระ
+                SELECT pp.permission_id
+                FROM user_positions up
+                JOIN position_permissions pp ON up.position_id = pp.position_id
+                WHERE up.account_id = $1 
+                  AND up.is_active = TRUE 
+                  AND up.start_date <= CURRENT_DATE 
+                  AND (up.end_date IS NULL OR up.end_date >= CURRENT_DATE)
+                  
+                -- หมายเหตุ: หากมีการผูกสิทธิ์จาก delegated_tasks สามารถนำมา UNION ต่อตรงนี้ได้เลย
+            )
+            SELECT 
+                mg.group_name, 
+                m.menu_name AS name, 
+                m.icon_name AS icon, 
+                m.route_path AS path
+            FROM sys_menus m
+            JOIN sys_menu_groups mg ON m.group_id = mg.group_id
+            WHERE m.is_active = TRUE 
+              -- เงื่อนไข: ถ้า permission_id เป็น NULL คือเมนูสาธารณะ หรือ ถ้ามีค่าต้องตรงกับสิทธิ์ที่คนๆ นี้มี
+              AND (m.permission_id IS NULL OR m.permission_id IN (SELECT permission_id FROM UserPermissions))
+            ORDER BY mg.display_order, m.display_order;
+        `;
+
+        const result = await client.query(query, [accountId]);
+
+        // จัดกลุ่มข้อมูล (Group By) ให้เป็นรูปแบบ JSON ที่ Frontend ต้องการ
+        const groupedMenus = result.rows.reduce((acc, row) => {
+            // หาว่ากลุ่มนี้ (เช่น 'เมนูทั่วไป') ถูกสร้างไว้ใน array หรือยัง
+            const group = acc.find(g => g.group_name === row.group_name);
+            const menuData = { name: row.name, icon: row.icon, path: row.path };
+            
+            if (group) {
+                group.menus.push(menuData); // ถ้ามีกลุ่มแล้ว จับเมนูยัดใส่ array
+            } else {
+                acc.push({ group_name: row.group_name, menus: [menuData] }); // ถ้ายังไม่มี สร้างกลุ่มใหม่
+            }
+            return acc;
+        }, []);
+
+        res.json({ success: true, data: groupedMenus });
+
+    } catch (error) {
+        console.error("Fetch Sidebar Menus Error:", error);
+        res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการดึงข้อมูลเมนู' });
+    } finally {
+        client.release();
+    }
+});
+
 
 app.listen(port, () => {
     console.log(`Server is running on port ${port}`);
