@@ -766,6 +766,44 @@ app.put('/api/community-places/:id', async (req, res) => {
         res.status(500).json({ success: false, message: 'Internal Server Error' });
     }
 });
+
+
+// ==========================================
+// API: ดึงรายการสินค้า/เมนู ของร้านค้านั้นๆ
+// ==========================================
+app.get('/api/community-places/:placeId/products', async (req, res) => {
+    try {
+        const { placeId } = req.params;
+        const query = `SELECT * FROM place_products WHERE place_id = $1 ORDER BY created_at DESC;`;
+        const result = await pgPool.query(query, [placeId]);
+        res.json({ success: true, data: result.rows });
+    } catch (error) {
+        console.error('API Get Products Error:', error);
+        res.status(500).json({ success: false, message: 'Internal Server Error' });
+    }
+});
+
+// ==========================================
+// API: เพิ่มสินค้า/เมนูใหม่ เข้าร้านค้า
+// ==========================================
+app.post('/api/community-places/:placeId/products', async (req, res) => {
+    try {
+        const { placeId } = req.params;
+        const { product_name, description, price, image_url } = req.body;
+        
+        const insertQuery = `
+            INSERT INTO place_products (place_id, product_name, description, price, image_url)
+            VALUES ($1, $2, $3, $4, $5) RETURNING *;
+        `;
+        const result = await pgPool.query(insertQuery, [
+            placeId, product_name, description, price || 0, image_url
+        ]);
+        res.json({ success: true, message: 'เพิ่มสินค้าสำเร็จ', data: result.rows[0] });
+    } catch (error) {
+        console.error('API Add Product Error:', error);
+        res.status(500).json({ success: false, message: 'Internal Server Error' });
+    }
+});
 // ==========================================
 // API: ดึงข้อมูลสถานที่ของฉัน (My Places)  สิ้นสุด
 // ==========================================
