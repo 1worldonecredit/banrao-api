@@ -606,6 +606,57 @@ app.get('/api/community-places', async (req, res) => {
     }
 });
 
+
+// ==========================================
+// API: สร้าง/เพิ่มสถานที่และบริการในชุมชน (Create Place)
+// ==========================================
+app.post('/api/community-places', async (req, res) => {
+    const { 
+        category_id, 
+        place_name, 
+        description, 
+        cover_image_url, 
+        owner_account_id, // 🌟 รหัส Account ID ของผู้ใช้ที่กำลัง Login 
+        address_text, 
+        visibility_level, 
+        services, 
+        operating_hours 
+    } = req.body;
+
+    try {
+        // ค่าเริ่มต้นเมื่อเพิ่มใหม่: is_verified = false (รออนุมัติ), is_active = true
+        const insertQuery = `
+            INSERT INTO community_places (
+                category_id, place_name, description, cover_image_url, 
+                owner_account_id, address_text, visibility_level, 
+                services, operating_hours, is_verified, is_active
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, false, true
+            ) RETURNING place_id;
+        `;
+        
+        // แปลง Array/Object ให้เป็น JSON string ก่อนบันทึกลง Database
+        const servicesJson = JSON.stringify(services || []);
+        const hoursJson = JSON.stringify(operating_hours || {});
+
+        const result = await pgPool.query(insertQuery, [
+            category_id, place_name, description, cover_image_url, 
+            owner_account_id, address_text, visibility_level, 
+            servicesJson, hoursJson
+        ]);
+
+        res.json({ 
+            success: true, 
+            message: 'เพิ่มข้อมูลสถานที่เรียบร้อยแล้ว (รอผู้นำชุมชนอนุมัติ)',
+            place_id: result.rows[0].place_id
+        });
+
+    } catch (error) {
+        console.error('API Create Place Error:', error);
+        res.status(500).json({ success: false, message: 'Internal Server Error' });
+    }
+});
+
 app.listen(port, () => {
     console.log(`Server is running on port ${port}`);
 });
