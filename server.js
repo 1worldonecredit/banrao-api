@@ -341,7 +341,7 @@ app.delete('/api/menus/:id', async (req, res) => {
 });
 
 // ==========================================
-// API: เข้าสู่ระบบ (Login) + ระบบ Fallback ตำแหน่งเก่า/ใหม่
+// API: เข้าสู่ระบบ (Login) + รองรับข้อมูลผู้ใหญ่บ้านจาก village_committees
 // ==========================================
 app.post('/api/login', async (req, res) => {
     const { username, password } = req.body;
@@ -350,7 +350,7 @@ app.post('/api/login', async (req, res) => {
         const userQuery = await pgPool.query(
             `SELECT a.account_id, a.username_phone, a.password_hash, a.occupation_id, a.is_active, a.household_member_count,
                     p.first_name, p.last_name, p.dob, p.gender, p.house_no, 
-                    o.occupation_name, -- 📌 ชื่ออาชีพจากระบบเก่า
+                    o.occupation_name, 
                     v.village_id, v.village_name, v.headman_lat, v.headman_lng,
                     hp.first_name AS headman_first_name, 
                     hp.last_name AS headman_last_name,
@@ -363,8 +363,11 @@ app.post('/api/login', async (req, res) => {
                     cpm.image_url AS user_image,
                     hpm.image_url AS headman_image,
 
-                    pos.position_name, -- 📌 ชื่อตำแหน่งจากระบบใหม่
-                    pos.position_level
+                    pos.position_name, 
+                    pos.position_level,
+                    
+                    -- 🌟 เช็คเพิ่มเติมว่าคนนี้เป็นผู้ใหญ่บ้านในตาราง village_committees หรือไม่
+                    (SELECT COUNT(*) FROM village_committees vc WHERE vc.account_id = a.account_id AND vc.is_active = TRUE) AS is_committee
 
              FROM user_accounts a
              LEFT JOIN user_profiles p ON a.profile_id = p.profile_id
@@ -425,16 +428,24 @@ app.post('/api/login', async (req, res) => {
         const dayNameTh = birthDate ? daysTh[birthDate.getDay()] : '-';
         const genderTh = user.gender === 'MALE' ? 'ชาย' : (user.gender === 'FEMALE' ? 'หญิง' : '-');
 
-        // 🌟🌟 ความฉลาดขั้นสุด: Fallback Logic 🌟🌟
-        // ถ้าระบบใหม่มีชื่อตำแหน่ง ให้ใช้ระบบใหม่ แต่ถ้าไม่มี ให้ไปเอา "อาชีพ" จากระบบเก่ามาใช้แทน (ยกเว้นคำว่า ประชาชนทั่วไป)
-        const finalPositionName = user.position_name || (user.occupation_name && user.occupation_name !== 'ประชาชนทั่วไป' ? user.occupation_name : null);
-        
+        // 🌟🌟 Fallback Logic ที่ครอบคลุมขึ้น 🌟🌟
+        let finalPositionName = user.position_name;
         let finalPositionLevel = user.position_level;
-        // ถ้าระบบเก่าไม่มี Level จัดให้โดยการอ่านจากชื่อแทน
-        if (!finalPositionLevel && finalPositionName) {
-            if (finalPositionName.includes('นายอำเภอ')) finalPositionLevel = 'AMPHURE';
-            else if (finalPositionName.includes('ผู้ใหญ่บ้าน') || finalPositionName.includes('อสม.')) finalPositionLevel = 'VILLAGE';
-            else if (finalPositionName.includes('อบต.') || finalPositionName.includes('นายก')) finalPositionLevel = 'TAMBON';
+
+        // ถ้าระบบใหม่ไม่มีตำแหน่ง ให้เช็คจากระบบเก่า
+        if (!finalPositionName) {
+            // 1. เช็คว่าเป็นผู้ใหญ่บ้านจากตาราง village_committees ไหม?
+            if (parseInt(user.is_committee) > 0) {
+                finalPositionName = 'ผู้ใหญ่บ้าน';
+                finalPositionLevel = 'VILLAGE';
+            } 
+            // 2. ถ้าไม่ใช่ผู้ใหญ่บ้าน ให้เช็คจากอาชีพ (sys_occupations)
+            else if (user.occupation_name && user.occupation_name !== 'ประชาชนทั่วไป') {
+                finalPositionName = user.occupation_name;
+                if (finalPositionName.includes('นายอำเภอ')) finalPositionLevel = 'AMPHURE';
+                else if (finalPositionName.includes('ผู้ใหญ่บ้าน') || finalPositionName.includes('อสม.')) finalPositionLevel = 'VILLAGE';
+                else if (finalPositionName.includes('อบต.') || finalPositionName.includes('นายก')) finalPositionLevel = 'TAMBON';
+            }
         }
 
         res.json({
@@ -462,7 +473,6 @@ app.post('/api/login', async (req, res) => {
                 userImage: user.user_image || '/profile-img.jpg', 
                 headmanImage: user.headman_image || 'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=150&q=80',
                 
-                // 🌟 ส่งค่าตำแหน่งที่ประมวลผลแล้วกลับไป
                 position_name: finalPositionName,
                 position_level: finalPositionLevel
             }
