@@ -721,7 +721,51 @@ app.get('/api/my-places/:accountId', async (req, res) => {
 });
 
 
+// ==========================================
+// API: ดึงข้อมูลสถานที่ 1 รายการ (สำหรับหน้า Edit)
+// ==========================================
+app.get('/api/community-places/detail/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const query = `SELECT * FROM community_places WHERE place_id = $1;`;
+        const result = await pgPool.query(query, [id]);
+        
+        if (result.rows.length === 0) {
+            return res.status(404).json({ success: false, message: 'ไม่พบข้อมูลสถานที่' });
+        }
+        res.json({ success: true, data: result.rows[0] });
+    } catch (error) {
+        console.error('API Get Place Detail Error:', error);
+        res.status(500).json({ success: false, message: 'Internal Server Error' });
+    }
+});
 
+// ==========================================
+// API: อัปเดตข้อมูลสถานที่ (Edit Place)
+// ==========================================
+app.put('/api/community-places/:id', async (req, res) => {
+    const { id } = req.params;
+    const { place_name, description, address_text, visibility_level, services, operating_hours } = req.body;
+    
+    try {
+        const updateQuery = `
+            UPDATE community_places 
+            SET place_name = $1, description = $2, address_text = $3, 
+                visibility_level = $4, services = $5, operating_hours = $6, updated_at = CURRENT_TIMESTAMP
+            WHERE place_id = $7 RETURNING *;
+        `;
+        const servicesJson = JSON.stringify(services || []);
+        const hoursJson = JSON.stringify(operating_hours || {});
+
+        await pgPool.query(updateQuery, [
+            place_name, description, address_text, visibility_level, servicesJson, hoursJson, id
+        ]);
+        res.json({ success: true, message: 'อัปเดตข้อมูลสำเร็จ' });
+    } catch (error) {
+        console.error('API Update Place Error:', error);
+        res.status(500).json({ success: false, message: 'Internal Server Error' });
+    }
+});
 // ==========================================
 // API: ดึงข้อมูลสถานที่ของฉัน (My Places)  สิ้นสุด
 // ==========================================
