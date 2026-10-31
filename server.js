@@ -616,7 +616,7 @@ app.post('/api/community-places', async (req, res) => {
         place_name, 
         description, 
         cover_image_url, 
-        owner_account_id, // 🌟 รหัส Account ID ของผู้ใช้ที่กำลัง Login 
+        owner_account_id, 
         address_text, 
         visibility_level, 
         services, 
@@ -624,7 +624,6 @@ app.post('/api/community-places', async (req, res) => {
     } = req.body;
 
     try {
-        // ค่าเริ่มต้นเมื่อเพิ่มใหม่: is_verified = false (รออนุมัติ), is_active = true
         const insertQuery = `
             INSERT INTO community_places (
                 category_id, place_name, description, cover_image_url, 
@@ -635,9 +634,9 @@ app.post('/api/community-places', async (req, res) => {
             ) RETURNING place_id;
         `;
         
-        // แปลง Array/Object ให้เป็น JSON string ก่อนบันทึกลง Database
+        // แปลง Array/Object ให้เป็น JSON string 
         const servicesJson = JSON.stringify(services || []);
-        const hoursJson = JSON.stringify(operating_hours || {});
+        const hoursJson = JSON.stringify(operating_hours || {}); // 🌟 ตรงนี้จะรับ JSON วันเวลาจาก Frontend มา
 
         const result = await pgPool.query(insertQuery, [
             category_id, place_name, description, cover_image_url, 
@@ -645,14 +644,54 @@ app.post('/api/community-places', async (req, res) => {
             servicesJson, hoursJson
         ]);
 
-        res.json({ 
-            success: true, 
-            message: 'เพิ่มข้อมูลสถานที่เรียบร้อยแล้ว (รอผู้นำชุมชนอนุมัติ)',
-            place_id: result.rows[0].place_id
-        });
+        res.json({ success: true, message: 'เพิ่มข้อมูลสำเร็จ', place_id: result.rows[0].place_id });
 
     } catch (error) {
         console.error('API Create Place Error:', error);
+        res.status(500).json({ success: false, message: 'Internal Server Error' });
+    }
+});
+
+// ==========================================
+// API: อัปโหลดรูปภาพขึ้น Cloudflare Images
+// ==========================================
+app.post('/api/upload-image', upload.single('image'), async (req, res) => {
+    try {
+        if (!req.file) {
+            return res.status(400).json({ success: false, message: 'ไม่มีไฟล์รูปภาพถูกส่งมา' });
+        }
+
+        // 🌟 ตั้งค่า Cloudflare (คุณต้องเอา Account ID และ API Token ของคุณมาใส่แทนที่)
+        const CLOUDFLARE_ACCOUNT_ID = process.env.CLOUDFLARE_ACCOUNT_ID || 'เอา_Account_ID_ของคุณมาใส่ที่นี่'; 
+        const CLOUDFLARE_API_TOKEN = process.env.CLOUDFLARE_API_TOKEN || 'เอา_API_Token_ของคุณมาใส่ที่นี่';
+
+        const formData = new FormData();
+        formData.append('file', req.file.buffer, {
+            filename: req.file.originalname,
+            contentType: req.file.mimetype,
+        });
+
+        const response = await fetch(`https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/images/v1`, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${CLOUDFLARE_API_TOKEN}`
+            },
+            body: formData
+        });
+
+        const data = await response.json();
+
+        if (data.success) {
+            // ดึง URL ของรูปภาพที่อัปโหลดสำเร็จ (Variants ปกติจะใช้ 'public' หรือ 'variants[0]')
+            const imageUrl = data.result.variants[0]; 
+            res.json({ success: true, imageUrl: imageUrl });
+        } else {
+            console.error('Cloudflare Error:', data.errors);
+            res.status(500).json({ success: false, message: 'อัปโหลด Cloudflare ไม่สำเร็จ', errors: data.errors });
+        }
+
+    } catch (error) {
+        console.error('Upload Error:', error);
         res.status(500).json({ success: false, message: 'Internal Server Error' });
     }
 });
