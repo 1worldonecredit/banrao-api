@@ -339,8 +339,9 @@ app.delete('/api/menus/:id', async (req, res) => {
     res.status(500).json({ message: "ลบไม่ได้" });
   }
 });
+
 // ==========================================
-// API: เข้าสู่ระบบ (Login) อัปเดตโครงสร้างดึงตำแหน่ง
+// API: เข้าสู่ระบบ (Login) + ระบบ Fallback ตำแหน่งเก่า/ใหม่
 // ==========================================
 app.post('/api/login', async (req, res) => {
     const { username, password } = req.body;
@@ -348,7 +349,8 @@ app.post('/api/login', async (req, res) => {
     try {
         const userQuery = await pgPool.query(
             `SELECT a.account_id, a.username_phone, a.password_hash, a.occupation_id, a.is_active, a.household_member_count,
-                    p.first_name, p.last_name, p.dob, p.gender, p.house_no, o.occupation_name,
+                    p.first_name, p.last_name, p.dob, p.gender, p.house_no, 
+                    o.occupation_name, -- 📌 ชื่ออาชีพจากระบบเก่า
                     v.village_id, v.village_name, v.headman_lat, v.headman_lng,
                     hp.first_name AS headman_first_name, 
                     hp.last_name AS headman_last_name,
@@ -361,17 +363,14 @@ app.post('/api/login', async (req, res) => {
                     cpm.image_url AS user_image,
                     hpm.image_url AS headman_image,
 
-                    -- 🌟 ดึงข้อมูลตำแหน่งปัจจุบัน
-                    pos.position_name,
+                    pos.position_name, -- 📌 ชื่อตำแหน่งจากระบบใหม่
                     pos.position_level
 
              FROM user_accounts a
              LEFT JOIN user_profiles p ON a.profile_id = p.profile_id
              LEFT JOIN sys_occupations o ON a.occupation_id = o.occupation_id
              
-             -- 🌟 กลับไปใช้โครงสร้าง JOIN เดิมของคุณ 100% เพื่อไม่ให้เกิด Error
              LEFT JOIN villages v ON a.village_id = v.village_id
-             
              LEFT JOIN user_accounts ha ON v.headman_account_id = ha.account_id
              LEFT JOIN user_profiles hp ON ha.profile_id = hp.profile_id
              LEFT JOIN sys_tambons t ON v.tambon_id = t.tambon_id
@@ -381,7 +380,6 @@ app.post('/api/login', async (req, res) => {
              LEFT JOIN citizen_profiles_media cpm ON p.profile_id = cpm.profile_id AND cpm.is_active = true
              LEFT JOIN citizen_profiles_media hpm ON hp.profile_id = hpm.profile_id AND hpm.is_active = true
              
-             -- 🌟 เพิ่มเฉพาะการ JOIN ตารางตำแหน่ง
              LEFT JOIN user_positions up ON a.account_id = up.account_id AND up.is_active = TRUE AND (up.end_date IS NULL OR up.end_date >= CURRENT_DATE)
              LEFT JOIN sys_positions pos ON up.position_id = pos.position_id
 
@@ -404,7 +402,6 @@ app.post('/api/login', async (req, res) => {
             return res.status(401).json({ message: 'เบอร์โทรศัพท์หรือรหัสผ่านไม่ถูกต้อง' });
         }
 
-        // 🌟 แก้ไขจุดที่ทำให้พัง: ตรวจสอบว่ามี occupation_id ไหมก่อนไปค้นหาสิทธิ์อาชีพ
         let permissions = [];
         if (user.occupation_id) {
             const permQuery = await pgPool.query(
@@ -427,6 +424,18 @@ app.post('/api/login', async (req, res) => {
         const birthDate = user.dob ? new Date(user.dob) : null;
         const dayNameTh = birthDate ? daysTh[birthDate.getDay()] : '-';
         const genderTh = user.gender === 'MALE' ? 'ชาย' : (user.gender === 'FEMALE' ? 'หญิง' : '-');
+
+        // 🌟🌟 ความฉลาดขั้นสุด: Fallback Logic 🌟🌟
+        // ถ้าระบบใหม่มีชื่อตำแหน่ง ให้ใช้ระบบใหม่ แต่ถ้าไม่มี ให้ไปเอา "อาชีพ" จากระบบเก่ามาใช้แทน (ยกเว้นคำว่า ประชาชนทั่วไป)
+        const finalPositionName = user.position_name || (user.occupation_name && user.occupation_name !== 'ประชาชนทั่วไป' ? user.occupation_name : null);
+        
+        let finalPositionLevel = user.position_level;
+        // ถ้าระบบเก่าไม่มี Level จัดให้โดยการอ่านจากชื่อแทน
+        if (!finalPositionLevel && finalPositionName) {
+            if (finalPositionName.includes('นายอำเภอ')) finalPositionLevel = 'AMPHURE';
+            else if (finalPositionName.includes('ผู้ใหญ่บ้าน') || finalPositionName.includes('อสม.')) finalPositionLevel = 'VILLAGE';
+            else if (finalPositionName.includes('อบต.') || finalPositionName.includes('นายก')) finalPositionLevel = 'TAMBON';
+        }
 
         res.json({
             message: 'เข้าสู่ระบบสำเร็จ',
@@ -453,9 +462,9 @@ app.post('/api/login', async (req, res) => {
                 userImage: user.user_image || '/profile-img.jpg', 
                 headmanImage: user.headman_image || 'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=150&q=80',
                 
-                // ส่งตำแหน่งไปแสดงหน้าจอ
-                position_name: user.position_name || null,
-                position_level: user.position_level || null
+                // 🌟 ส่งค่าตำแหน่งที่ประมวลผลแล้วกลับไป
+                position_name: finalPositionName,
+                position_level: finalPositionLevel
             }
         });
 
