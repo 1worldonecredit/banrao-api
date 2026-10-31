@@ -543,6 +543,69 @@ app.get('/api/sidebar-menus/:accountId', async (req, res) => {
 });
 
 
+// ==========================================
+// API: ดึงข้อมูลสถานที่และบริการในชุมชน (Community Places)
+// ==========================================
+app.get('/api/community-places', async (req, res) => {
+    try {
+        const query = `
+            SELECT 
+                cp.place_id, 
+                cp.place_name, 
+                cp.description, 
+                cp.cover_image_url, 
+                cp.visibility_level, 
+                cp.operating_hours, 
+                cp.services, 
+                cp.is_verified,
+                cat.category_name,
+                p.first_name AS owner_first_name, 
+                p.last_name AS owner_last_name,
+                cpm.image_url AS owner_image
+            FROM community_places cp
+            LEFT JOIN sys_place_categories cat ON cp.category_id = cat.category_id
+            LEFT JOIN user_accounts a ON cp.owner_account_id = a.account_id
+            LEFT JOIN user_profiles p ON a.profile_id = p.profile_id
+            LEFT JOIN citizen_profiles_media cpm ON p.profile_id = cpm.profile_id AND cpm.is_active = true
+            WHERE cp.is_active = TRUE
+            ORDER BY cp.created_at DESC
+        `;
+        
+        const result = await pgPool.query(query);
+        
+        // จัด Format ข้อมูลให้ง่ายต่อการนำไปใช้งานใน React
+        const places = result.rows.map(row => {
+            // สมมติฐานให้เป็น true ก่อน (ถ้าต้องการเช็คเวลาจริง สามารถเพิ่มเงื่อนไขจาก operating_hours ได้)
+            const isOpen = true; 
+            
+            return {
+                id: row.place_id,
+                name: row.place_name,
+                category: row.category_name || 'สถานที่ทั่วไป',
+                desc: row.description,
+                img: row.cover_image_url || 'https://images.unsplash.com/photo-1555396273-367ea4eb4db5?w=600&q=80',
+                isOpen: isOpen,
+                visibility: row.visibility_level === 'PUBLIC' ? 'สาธารณะ' : 
+                            row.visibility_level === 'PROVINCE' ? 'ระดับจังหวัด' :
+                            row.visibility_level === 'AMPHURE' ? 'ระดับอำเภอ' :
+                            row.visibility_level === 'TAMBON' ? 'ระดับตำบล' : 'ระดับหมู่บ้าน',
+                services: row.services || [],
+                isVerified: row.is_verified,
+                owner: {
+                    name: row.owner_first_name ? `${row.owner_first_name} ${row.owner_last_name}` : 'ผู้ใช้งาน',
+                    img: row.owner_image || 'https://images.unsplash.com/photo-1472099645785-5658abf4ff4e?w=150&q=80'
+                }
+            };
+        });
+
+        res.json({ success: true, places });
+
+    } catch (error) {
+        console.error('API Community Places Error:', error);
+        res.status(500).json({ success: false, message: 'Internal Server Error' });
+    }
+});
+
 app.listen(port, () => {
     console.log(`Server is running on port ${port}`);
 });
