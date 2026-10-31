@@ -339,9 +339,8 @@ app.delete('/api/menus/:id', async (req, res) => {
     res.status(500).json({ message: "ลบไม่ได้" });
   }
 });
-
 // ==========================================
-// API: เข้าสู่ระบบ (Login) + รองรับข้อมูลผู้ใหญ่บ้านจาก village_committees
+// API: เข้าสู่ระบบ (Login) + ระบบ Fallback แบบปลอดภัย 100%
 // ==========================================
 app.post('/api/login', async (req, res) => {
     const { username, password } = req.body;
@@ -351,7 +350,8 @@ app.post('/api/login', async (req, res) => {
             `SELECT a.account_id, a.username_phone, a.password_hash, a.occupation_id, a.is_active, a.household_member_count,
                     p.first_name, p.last_name, p.dob, p.gender, p.house_no, 
                     o.occupation_name, 
-                    v.village_id, v.village_name, v.headman_lat, v.headman_lng,
+                    v.village_id, v.village_name, v.headman_lat, v.headman_lng, 
+                    v.headman_account_id, -- 🌟 ดึงข้อมูลนี้มาเพื่อเช็คว่าเป็นผู้ใหญ่บ้านไหม
                     hp.first_name AS headman_first_name, 
                     hp.last_name AS headman_last_name,
                     t.tambon_name_th, am.amphure_name_th, pr.province_name_th,
@@ -364,10 +364,7 @@ app.post('/api/login', async (req, res) => {
                     hpm.image_url AS headman_image,
 
                     pos.position_name, 
-                    pos.position_level,
-                    
-                    -- 🌟 เช็คเพิ่มเติมว่าคนนี้เป็นผู้ใหญ่บ้านในตาราง village_committees หรือไม่
-                    (SELECT COUNT(*) FROM village_committees vc WHERE vc.account_id = a.account_id AND vc.is_active = TRUE) AS is_committee
+                    pos.position_level
 
              FROM user_accounts a
              LEFT JOIN user_profiles p ON a.profile_id = p.profile_id
@@ -428,18 +425,17 @@ app.post('/api/login', async (req, res) => {
         const dayNameTh = birthDate ? daysTh[birthDate.getDay()] : '-';
         const genderTh = user.gender === 'MALE' ? 'ชาย' : (user.gender === 'FEMALE' ? 'หญิง' : '-');
 
-        // 🌟🌟 Fallback Logic ที่ครอบคลุมขึ้น 🌟🌟
+        // 🌟🌟 Fallback Logic ด้วย JavaScript 🌟🌟
         let finalPositionName = user.position_name;
         let finalPositionLevel = user.position_level;
 
-        // ถ้าระบบใหม่ไม่มีตำแหน่ง ให้เช็คจากระบบเก่า
         if (!finalPositionName) {
-            // 1. เช็คว่าเป็นผู้ใหญ่บ้านจากตาราง village_committees ไหม?
-            if (parseInt(user.is_committee) > 0) {
+            // 1. ตรวจสอบว่าคนที่ล็อกอิน คือคนเดียวกับที่เป็นผู้ใหญ่บ้านของหมู่บ้านนี้หรือไม่?
+            if (user.account_id && user.headman_account_id && user.account_id === user.headman_account_id) {
                 finalPositionName = 'ผู้ใหญ่บ้าน';
                 finalPositionLevel = 'VILLAGE';
             } 
-            // 2. ถ้าไม่ใช่ผู้ใหญ่บ้าน ให้เช็คจากอาชีพ (sys_occupations)
+            // 2. ถ้าไม่ใช่ เช็คจากชื่ออาชีพ (occupation_name)
             else if (user.occupation_name && user.occupation_name !== 'ประชาชนทั่วไป') {
                 finalPositionName = user.occupation_name;
                 if (finalPositionName.includes('นายอำเภอ')) finalPositionLevel = 'AMPHURE';
