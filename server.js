@@ -339,16 +339,14 @@ app.delete('/api/menus/:id', async (req, res) => {
     res.status(500).json({ message: "ลบไม่ได้" });
   }
 });
-
 // ==========================================
-// API: เข้าสู่ระบบ (Login) อัปเดตตาม DB ใหม่ และดึงข้อมูลหมู่บ้าน+ที่อยู่
+// API: เข้าสู่ระบบ (Login) อัปเดตตาม DB ใหม่ ดึงข้อมูลหมู่บ้าน ที่อยู่ และตำแหน่ง/หน้าที่
 // ==========================================
 app.post('/api/login', async (req, res) => {
     const { username, password } = req.body;
 
     try {
-        // 1. ค้นหาผู้ใช้งาน พร้อมดึงข้อมูลหมู่บ้าน ผู้ใหญ่บ้าน และที่อยู่ (แก้ไขชื่อคอลัมน์เป็น _th ตาม DB)
-      // 1. ค้นหาผู้ใช้งาน พร้อมดึงข้อมูลรูปภาพ
+        // 1. ค้นหาผู้ใช้งาน พร้อมดึงข้อมูลรูปภาพ และ "ตำแหน่งหน้าที่ปัจจุบัน"
         const userQuery = await pgPool.query(
             `SELECT a.account_id, a.username_phone, a.password_hash, a.occupation_id, a.is_active, a.household_member_count,
                     p.first_name, p.last_name, p.dob, p.gender, p.house_no, o.occupation_name,
@@ -363,7 +361,11 @@ app.post('/api/login', async (req, res) => {
                     
                     -- ดึง URL รูปภาพ
                     cpm.image_url AS user_image,
-                    hpm.image_url AS headman_image
+                    hpm.image_url AS headman_image,
+
+                    -- 🌟 ดึงข้อมูลตำแหน่งปัจจุบันจากตาราง user_positions และ sys_positions
+                    pos.position_name,
+                    pos.position_level
 
              FROM user_accounts a
              LEFT JOIN user_profiles p ON a.profile_id = p.profile_id
@@ -375,11 +377,14 @@ app.post('/api/login', async (req, res) => {
              LEFT JOIN sys_amphures am ON t.amphure_id = am.amphure_id
              LEFT JOIN sys_provinces pr ON am.province_id = pr.province_id
              
-             -- JOIN ดึงรูป Profile ของผู้ใช้งาน
+             -- JOIN ดึงรูป Profile
              LEFT JOIN citizen_profiles_media cpm ON p.profile_id = cpm.profile_id AND cpm.is_active = true
-             -- JOIN ดึงรูป Profile ของผู้ใหญ่บ้าน
              LEFT JOIN citizen_profiles_media hpm ON hp.profile_id = hpm.profile_id AND hpm.is_active = true
              
+             -- 🌟 JOIN เพื่อหาว่าผู้ใช้นี้ดำรงตำแหน่งอะไรอยู่ ณ ปัจจุบัน
+             LEFT JOIN user_positions up ON a.account_id = up.account_id AND up.is_active = TRUE AND (up.end_date IS NULL OR up.end_date >= CURRENT_DATE)
+             LEFT JOIN sys_positions pos ON up.position_id = pos.position_id
+
              WHERE a.username_phone = $1`,
             [username]
         );
@@ -390,18 +395,18 @@ app.post('/api/login', async (req, res) => {
 
         const user = userQuery.rows[0];
 
-        // 2. เช็คสถานะว่าได้รับการอนุมัติเปิดใช้งานหรือยัง
+        // 2. เช็คสถานะการอนุมัติ
         if (user.is_active === false) {
             return res.status(403).json({ message: 'บัญชีนี้ยังไม่ได้รับการอนุมัติ กรุณาติดต่อผู้ใหญ่บ้าน' });
         }
 
-        // 3. ตรวจสอบรหัสผ่าน (ใช้ bcrypt)
+        // 3. ตรวจสอบรหัสผ่าน
         const isValidPassword = await bcrypt.compare(password, user.password_hash);
         if (!isValidPassword) {
             return res.status(401).json({ message: 'เบอร์โทรศัพท์หรือรหัสผ่านไม่ถูกต้อง' });
         }
 
-        // 4. ดึงสิทธิ์ (Permissions)
+        // 4. ดึงสิทธิ์ (ปรับให้ดึงจาก occupation_permissions หรือตารางใหม่ก็ได้ตามต้องการ - อันนี้ใช้โครงสร้างเดิมของคุณก่อน)
         const permQuery = await pgPool.query(
             `SELECT sp.permission_code
              FROM occupation_permissions op
@@ -412,19 +417,16 @@ app.post('/api/login', async (req, res) => {
         const permissions = permQuery.rows.map(row => row.permission_code);
 
         // 5. สร้าง Token
-       // 5. สร้าง Token
         const token = jwt.sign(
             { account_id: user.account_id, occupation_id: user.occupation_id, village_id: user.village_id },
             process.env.JWT_SECRET || 'banrao_secret_key',
             { expiresIn: '1d' }
         );
 
-        // แปลงวันที่ (dob) ให้เป็นชื่อวันภาษาไทย (จันทร์, อังคาร, ...)
+        // แปลงวันที่และเพศเป็นภาษาไทย
         const daysTh = ['อาทิตย์', 'จันทร์', 'อังคาร', 'พุธ', 'พฤหัสบดี', 'ศุกร์', 'เสาร์'];
         const birthDate = user.dob ? new Date(user.dob) : null;
         const dayNameTh = birthDate ? daysTh[birthDate.getDay()] : '-';
-        
-        // แปลงเพศ
         const genderTh = user.gender === 'MALE' ? 'ชาย' : (user.gender === 'FEMALE' ? 'หญิง' : '-');
 
         res.json({
@@ -443,16 +445,19 @@ app.post('/api/login', async (req, res) => {
                 amphureName: user.amphure_name_th,
                 provinceName: user.province_name_th,
                 
-                // ข้อมูลที่เพิ่มใหม่
                 gender: genderTh,
-                birthDayName: dayNameTh, // ส่งชื่อวันกลับไป
+                birthDayName: dayNameTh,
                 age_years: user.age_years || 0,
                 age_months: user.age_months || 0,
                 age_days: user.age_days || 0,
                 house_no: user.house_no || '-',
                 household_member_count: user.household_member_count || 0,
                 userImage: user.user_image || 'https://cdn-icons-png.flaticon.com/512/149/149071.png', 
-                headmanImage: user.headman_image || 'https://cdn-icons-png.flaticon.com/512/149/149071.png'
+                headmanImage: user.headman_image || 'https://cdn-icons-png.flaticon.com/512/149/149071.png',
+
+                // 🌟 ส่งค่าตำแหน่งที่ดึงมาใหม่กลับไปให้ Frontend ใช้งาน
+                position_name: user.position_name || null,
+                position_level: user.position_level || null
             }
         });
 
