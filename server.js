@@ -661,20 +661,22 @@ app.post('/api/upload-image', upload.single('image'), async (req, res) => {
             return res.status(400).json({ success: false, message: 'ไม่มีไฟล์รูปภาพถูกส่งมา' });
         }
 
-        // 🌟 ตั้งค่า Cloudflare (คุณต้องเอา Account ID และ API Token ของคุณมาใส่แทนที่)
         const CLOUDFLARE_ACCOUNT_ID = process.env.CLOUDFLARE_ACCOUNT_ID || 'เอา_Account_ID_ของคุณมาใส่ที่นี่'; 
         const CLOUDFLARE_API_TOKEN = process.env.CLOUDFLARE_API_TOKEN || 'เอา_API_Token_ของคุณมาใส่ที่นี่';
 
         const formData = new FormData();
-        formData.append('file', req.file.buffer, {
-            filename: req.file.originalname,
-            contentType: req.file.mimetype,
-        });
+        
+        // 🌟 จุดที่แก้ไข: แปลง Buffer เป็น Blob ก่อนส่งเข้า FormData 🌟
+        const imageBlob = new Blob([req.file.buffer], { type: req.file.mimetype });
+        
+        // แนบไฟล์ Blob ลงไป พร้อมกำหนดชื่อไฟล์เป็น Parameter ที่ 3
+        formData.append('file', imageBlob, req.file.originalname);
 
         const response = await fetch(`https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/images/v1`, {
             method: 'POST',
             headers: {
                 'Authorization': `Bearer ${CLOUDFLARE_API_TOKEN}`
+                // ไม่ต้องใส่ 'Content-Type' ปล่อยให้ FormData จัดการ Boundary เอง
             },
             body: formData
         });
@@ -682,7 +684,7 @@ app.post('/api/upload-image', upload.single('image'), async (req, res) => {
         const data = await response.json();
 
         if (data.success) {
-            // ดึง URL ของรูปภาพที่อัปโหลดสำเร็จ (Variants ปกติจะใช้ 'public' หรือ 'variants[0]')
+            // ดึง URL รูปภาพจาก Cloudflare (ส่วนใหญ่ variants ตัวแรกจะใช้งานได้)
             const imageUrl = data.result.variants[0]; 
             res.json({ success: true, imageUrl: imageUrl });
         } else {
