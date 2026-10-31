@@ -347,7 +347,7 @@ app.post('/api/login', async (req, res) => {
 
     try {
         // 1. ค้นหาผู้ใช้งาน พร้อมดึงข้อมูลรูปภาพ และ "ตำแหน่งหน้าที่ปัจจุบัน"
-        const userQuery = await pgPool.query(
+       const userQuery = await pgPool.query(
             `SELECT a.account_id, a.username_phone, a.password_hash, a.occupation_id, a.is_active, a.household_member_count,
                     p.first_name, p.last_name, p.dob, p.gender, p.house_no, o.occupation_name,
                     v.village_id, v.village_name, v.headman_lat, v.headman_lng,
@@ -359,29 +359,32 @@ app.post('/api/login', async (req, res) => {
                     EXTRACT(MONTH FROM age(CURRENT_DATE, p.dob)) AS age_months,
                     EXTRACT(DAY FROM age(CURRENT_DATE, p.dob)) AS age_days,
                     
-                    -- ดึง URL รูปภาพ
                     cpm.image_url AS user_image,
                     hpm.image_url AS headman_image,
 
-                    -- 🌟 ดึงข้อมูลตำแหน่งปัจจุบันจากตาราง user_positions และ sys_positions
+                    -- 🌟 1. ดึงข้อมูลตำแหน่งปัจจุบันมาให้ครบถ้วน 
                     pos.position_name,
                     pos.position_level
 
              FROM user_accounts a
              LEFT JOIN user_profiles p ON a.profile_id = p.profile_id
              LEFT JOIN sys_occupations o ON a.occupation_id = o.occupation_id
-             LEFT JOIN villages v ON a.village_id = v.village_id
+             
+             -- 🌟 2. ลบเงื่อนไขผูกติดกับหมู่บ้านออกจากการดึงข้อมูล User ทั่วไป
+             -- เพราะนายอำเภออาจไม่ได้ผูกติดกับตาราง villages โดยตรง
+             LEFT JOIN user_identities ui ON p.profile_id = ui.profile_id 
+             LEFT JOIN villages v ON ui.village_id = v.village_id
+             
              LEFT JOIN user_accounts ha ON v.headman_account_id = ha.account_id
              LEFT JOIN user_profiles hp ON ha.profile_id = hp.profile_id
              LEFT JOIN sys_tambons t ON v.tambon_id = t.tambon_id
              LEFT JOIN sys_amphures am ON t.amphure_id = am.amphure_id
              LEFT JOIN sys_provinces pr ON am.province_id = pr.province_id
              
-             -- JOIN ดึงรูป Profile
              LEFT JOIN citizen_profiles_media cpm ON p.profile_id = cpm.profile_id AND cpm.is_active = true
              LEFT JOIN citizen_profiles_media hpm ON hp.profile_id = hpm.profile_id AND hpm.is_active = true
              
-             -- 🌟 JOIN เพื่อหาว่าผู้ใช้นี้ดำรงตำแหน่งอะไรอยู่ ณ ปัจจุบัน
+             -- 🌟 3. JOIN ตารางตำแหน่ง ให้ใช้ account_id จากตารางหลัก (a)
              LEFT JOIN user_positions up ON a.account_id = up.account_id AND up.is_active = TRUE AND (up.end_date IS NULL OR up.end_date >= CURRENT_DATE)
              LEFT JOIN sys_positions pos ON up.position_id = pos.position_id
 
