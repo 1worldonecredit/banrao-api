@@ -767,14 +767,34 @@ app.put('/api/community-places/:id', async (req, res) => {
     }
 });
 
+// ==========================================
+// 1. API: ดึง "หมวดหมู่สินค้า" ตามประเภทร้านค้า
+// ==========================================
+app.get('/api/product-categories/:placeCategoryId', async (req, res) => {
+    try {
+        const { placeCategoryId } = req.params;
+        const query = `SELECT * FROM sys_product_categories WHERE place_category_id = $1 AND is_active = true ORDER BY display_order;`;
+        const result = await pgPool.query(query, [placeCategoryId]);
+        res.json({ success: true, data: result.rows });
+    } catch (error) {
+        console.error('API Get Product Categories Error:', error);
+        res.status(500).json({ success: false, message: 'Internal Server Error' });
+    }
+});
 
 // ==========================================
-// API: ดึงรายการสินค้า/เมนู ของร้านค้านั้นๆ
+// 2. API: ดึงรายการสินค้า (อัปเดตให้ JOIN เอาชื่อหมวดหมู่มาด้วย)
 // ==========================================
 app.get('/api/community-places/:placeId/products', async (req, res) => {
     try {
         const { placeId } = req.params;
-        const query = `SELECT * FROM place_products WHERE place_id = $1 ORDER BY created_at DESC;`;
+        const query = `
+            SELECT pp.*, pc.category_name as prod_cat_name 
+            FROM place_products pp
+            LEFT JOIN sys_product_categories pc ON pp.prod_cat_id = pc.prod_cat_id
+            WHERE pp.place_id = $1 
+            ORDER BY pp.created_at DESC;
+        `;
         const result = await pgPool.query(query, [placeId]);
         res.json({ success: true, data: result.rows });
     } catch (error) {
@@ -784,19 +804,19 @@ app.get('/api/community-places/:placeId/products', async (req, res) => {
 });
 
 // ==========================================
-// API: เพิ่มสินค้า/เมนูใหม่ เข้าร้านค้า
+// 3. API: เพิ่มสินค้า (อัปเดตให้รองรับ หมวดหมู่ และ แกลลอรี่ 6 รูป)
 // ==========================================
 app.post('/api/community-places/:placeId/products', async (req, res) => {
     try {
         const { placeId } = req.params;
-        const { product_name, description, price, image_url } = req.body;
+        const { product_name, description, price, image_url, prod_cat_id, gallery_urls } = req.body;
         
         const insertQuery = `
-            INSERT INTO place_products (place_id, product_name, description, price, image_url)
-            VALUES ($1, $2, $3, $4, $5) RETURNING *;
+            INSERT INTO place_products (place_id, product_name, description, price, image_url, prod_cat_id, gallery_urls)
+            VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *;
         `;
         const result = await pgPool.query(insertQuery, [
-            placeId, product_name, description, price || 0, image_url
+            placeId, product_name, description, price || 0, image_url, prod_cat_id || null, JSON.stringify(gallery_urls || [])
         ]);
         res.json({ success: true, message: 'เพิ่มสินค้าสำเร็จ', data: result.rows[0] });
     } catch (error) {
