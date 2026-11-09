@@ -544,6 +544,81 @@ app.get('/api/sidebar-menus/:accountId', async (req, res) => {
     }
 });
 
+
+// ==========================================
+// API: ดึงรายชื่อตำแหน่งเพื่อไปแสดงเป็น Checkbox (ดึงเฉพาะระดับ VILLAGE)
+// ==========================================
+app.get('/api/positions', async (req, res) => {
+    const client = await pgPool.connect();
+    try {
+        // ดึงเฉพาะตำแหน่งที่อยู่ในระดับหมู่บ้าน (VILLAGE)
+        const result = await client.query(`
+            SELECT position_id, position_name 
+            FROM sys_positions 
+            WHERE position_level = 'VILLAGE' 
+            ORDER BY position_id ASC
+        `);
+        res.json({ success: true, data: result.rows });
+    } catch (error) {
+        console.error("Fetch Positions Error:", error);
+        res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการดึงข้อมูลตำแหน่ง' });
+    } finally {
+        client.release();
+    }
+});
+
+// ==========================================
+// API: บันทึกเมนูใหม่และผูกสิทธิ์ (Save Menu & Assign Roles)
+// ==========================================
+app.post('/api/manage-menu', async (req, res) => {
+    const { menu_name, route_path, icon_name, selected_roles } = req.body;
+    const client = await pgPool.connect();
+
+    try {
+        // เริ่ม Transaction (ถ้ามีอันไหนพัง จะได้ย้อนกลับทั้งหมด ไม่ให้ข้อมูลแหว่ง)
+        await client.query('BEGIN');
+        
+        // 1. สร้างสิทธิ์ (Permission) ใหม่ใน sys_permissions ก่อน
+        const permCode = 'MENU_' + Date.now(); // สร้าง Code ไม่ให้ซ้ำ
+        const permRes = await client.query(
+            `INSERT INTO sys_permissions (permission_code, permission_name) 
+             VALUES ($1, $2) RETURNING permission_id`,
+            [permCode, `สิทธิ์เข้าถึงเมนู: ${menu_name}`]
+        );
+        const newPermId = permRes.rows[0].permission_id;
+
+        // 2. สร้างเมนูใหม่ลงใน sys_menus โดยใช้ permission_id ที่เพิ่งสร้าง
+        await client.query(
+            `INSERT INTO sys_menus (group_id, menu_name, icon_name, route_path, permission_id, display_order, is_active)
+             VALUES (9, $1, $2, $3, $4, 99, true)`, 
+             // ใส่ group_id = 9 ไปก่อน (กลุ่มจัดการชุมชน) คุณสามารถส่งจาก Frontend มาเปลี่ยนได้
+            [menu_name, icon_name, route_path, newPermId]
+        );
+
+        // 3. วนลูปผูกสิทธิ์ (newPermId) เข้ากับตำแหน่งที่ติ๊กเลือกมา (selected_roles)
+        if (selected_roles && selected_roles.length > 0) {
+            for (let positionId of selected_roles) {
+                await client.query(
+                    `INSERT INTO position_permissions (position_id, permission_id) 
+                     VALUES ($1, $2)`,
+                    [positionId, newPermId]
+                );
+            }
+        }
+
+        // ยืนยันการบันทึกข้อมูลทั้งหมด
+        await client.query('COMMIT');
+        res.json({ success: true, message: 'บันทึกเมนูและสิทธิ์สำเร็จ' });
+
+    } catch (error) {
+        await client.query('ROLLBACK'); // ยกเลิกการบันทึกถ้าระหว่างทางเกิด Error
+        console.error("Save Menu Error:", error);
+        res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการบันทึกข้อมูล' });
+    } finally {
+        client.release();
+    }
+});
+
 // ==========================================
 // API: ดึงข้อมูลสถานที่และบริการในชุมชน (Community Places)
 // ==========================================
