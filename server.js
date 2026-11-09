@@ -1151,25 +1151,24 @@ app.post('/api/community-leaders', async (req, res) => {
         client.release();
     }
 });
-
 // ==========================================
 // API: ค้นหาข้อมูลลูกบ้านด้วยเลขบัตรประชาชน
 // ==========================================
 app.get('/api/search-citizen/:citizenId', async (req, res) => {
     const { citizenId } = req.params;
+    console.log("กำลังค้นหาเลขบัตรประชาชน:", JSON.stringify(citizenId)); // เพิ่มบรรทัดนี้เพื่อเช็คค่าที่รับมา
+    
     const client = await pgPool.connect();
     
     try {
-        // แก้ไข: เปลี่ยนจากดึง account_id มาเป็น profile_id แทน
-        // และเอา user_image ออกก่อน เพราะในตาราง user_profiles ไม่มีคอลัมน์นี้
         const result = await client.query(`
             SELECT 
-                profile_id as account_id, -- ใช้ alias แปลงชื่อเป็น account_id เพื่อให้ Frontend เอาไปใช้ต่อได้ง่าย
+                profile_id as account_id, 
                 first_name, 
                 last_name
             FROM user_profiles 
-            WHERE citizen_id = $1
-        `, [citizenId]);
+            WHERE TRIM(citizen_id) = TRIM($1)
+        `, [citizenId]); // ใช้ TRIM() ตัดช่องว่างหัวท้ายเพื่อป้องกันปัญหาข้อมูลไม่ตรงกัน
 
         if (result.rows.length > 0) {
             res.json({ success: true, data: result.rows[0] });
