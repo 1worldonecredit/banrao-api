@@ -479,7 +479,6 @@ app.post('/api/login', async (req, res) => {
         res.status(500).json({ message: 'Internal Server Error', error: error.message });
     }
 });
-
 // ==========================================
 // API: ดึงเมนู Sidebar 
 // ==========================================
@@ -500,15 +499,12 @@ app.get('/api/sidebar-menus/:accountId', async (req, res) => {
                 WHERE account_id = $1
             ),
             UserPermissions AS (
-                -- ค้นหาสิทธิ์จากตาราง user_positions และ position_permissions
                 SELECT pp.permission_id
                 FROM user_positions up
                 JOIN position_permissions pp ON up.position_id = pp.position_id
                 JOIN UserInfo ui ON up.account_id = ui.account_id
                 WHERE up.account_id = $1 
                   AND up.is_active = TRUE 
-                  -- เพิ่มการตรวจสอบหมู่บ้าน
-                  AND (up.village_id = ui.village_id OR up.village_id IS NULL)
             )
             SELECT 
                 mg.group_name, 
