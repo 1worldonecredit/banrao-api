@@ -494,31 +494,17 @@ app.get('/api/sidebar-menus/:accountId', async (req, res) => {
 
     try {
         const query = `
-            WITH UserInfo AS (
-                -- 1. ดึงข้อมูลบัญชี เพื่อดูว่าผู้ใช้คนนี้สังกัดหมู่บ้านอะไร (เพื่อเอามาเทียบ)
+           WITH UserInfo AS (
                 SELECT account_id, village_id 
                 FROM user_accounts 
                 WHERE account_id = $1
             ),
             UserPermissions AS (
-                -- 2. ดึงสิทธิ์จากตำแหน่ง โดยเช็คเงื่อนไขขอบเขต (scope) ให้ถูกต้อง
+                -- ⚠️ เวอร์ชันทดสอบ: ดึงสิทธิ์ทั้งหมดที่คนคนนี้มี โดยไม่ต้องสน scope หรือวันหมดอายุ
                 SELECT pp.permission_id
                 FROM user_positions up
                 JOIN position_permissions pp ON up.position_id = pp.position_id
-                JOIN UserInfo ui ON up.account_id = ui.account_id
                 WHERE up.account_id = $1 
-                  AND up.is_active = TRUE 
-                  -- ตรวจสอบวันที่ดำรงตำแหน่งว่ายังไม่หมดวาระ
-                  AND (up.start_date IS NULL OR up.start_date <= CURRENT_DATE)
-                  AND (up.end_date IS NULL OR up.end_date >= CURRENT_DATE)
-                  -- 🌟 หัวใจสำคัญ: ตรวจสอบ Scope ให้อนุญาตเฉพาะของหมู่บ้านตัวเอง หรือระดับที่สูงกว่า
-                  AND (
-                      -- ถ้าสิทธิ์เป็นระดับ VILLAGE ต้องมี scope_id ตรงกับ village_id ของผู้ใช้
-                      (up.scope_type = 'VILLAGE' AND up.scope_id::text = ui.village_id::text)
-                      -- หรือถ้าเป็นสิทธิ์ระดับประเทศ/จังหวัด/ตำบล ก็อนุญาตให้ผ่าน (เพื่อไปเช็คต่อที่ระดับ Application)
-                      OR up.scope_type != 'VILLAGE'
-                      OR up.scope_type IS NULL
-                  )
             )
             SELECT 
                 mg.group_name, 
