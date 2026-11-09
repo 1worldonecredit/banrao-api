@@ -1023,17 +1023,15 @@ app.get('/api/positions', async (req, res) => {
     }
 });
 
-
 // ==========================================
 // API: ดึงข้อมูลผังผู้นำชุมชน (กรองตามหมู่บ้าน และ วาระ)
 // ==========================================
 app.get('/api/community-leaders/:villageId', async (req, res) => {
     const { villageId } = req.params;
-    const { term_date } = req.query; // รับค่าวันที่เพื่อดูประวัติย้อนหลัง (ถ้ามี)
+    const { term_date } = req.query; 
     
     const client = await pgPool.connect();
     try {
-        // ดึงคนที่มีตำแหน่งในหมู่บ้านนี้ ที่ยัง Active อยู่ในช่วงเวลานั้น
         let query = `
             SELECT 
                 up.id as position_record_id,
@@ -1043,24 +1041,24 @@ app.get('/api/community-leaders/:villageId', async (req, res) => {
                 up.responsibilities,
                 sp.position_name,
                 sp.position_level,
-                ua.first_name,
-                ua.last_name,
-                ua.user_image
+                -- เปลี่ยนมาดึงข้อมูลจากตาราง user_profiles (ใช้ alias 'prof')
+                prof.first_name,
+                prof.last_name,
+                prof.user_image  -- หมายเหตุ: ถ้าใน DB คุณใช้ชื่อ profile_image ให้แก้คำนี้ด้วยนะครับ
             FROM user_positions up
             JOIN sys_positions sp ON up.position_id = sp.position_id
-            JOIN user_accounts ua ON up.account_id = ua.account_id
+            -- เปลี่ยน JOIN มาหาตาราง user_profiles แทน user_accounts
+            JOIN user_profiles prof ON up.account_id = prof.account_id
             WHERE up.scope_type = 'VILLAGE' 
               AND up.scope_id::text = $1
         `;
         
         const queryParams = [villageId];
 
-        // ถ้ามีการเลือกวันที่ (ดูย้อนหลัง) ให้ดึงข้อมูลที่อยู่ในช่วงเวลานั้น
         if (term_date) {
             query += ` AND up.start_date <= $2 AND (up.end_date IS NULL OR up.end_date >= $2)`;
             queryParams.push(term_date);
         } else {
-            // ถ้าไม่เลือก ให้ดึงวาระปัจจุบัน
             query += ` AND up.is_active = TRUE AND (up.end_date IS NULL OR up.end_date >= CURRENT_DATE)`;
         }
 
