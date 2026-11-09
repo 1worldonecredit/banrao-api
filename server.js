@@ -924,7 +924,47 @@ app.get('/api/villages/:villageId', async (req, res) => {
 });
 
 
+// ==========================================
+// API: เพิ่มตำแหน่งใหม่ในชุมชน
+// ==========================================
+app.post('/api/positions', async (req, res) => {
+    const { position_name, position_level } = req.body;
+    const client = await pgPool.connect();
+    try {
+        const result = await client.query(
+            `INSERT INTO sys_positions (position_name, position_level, department_id) 
+             VALUES ($1, $2, 1) RETURNING *`,
+            [position_name, position_level || 'VILLAGE']
+        );
+        res.json({ success: true, data: result.rows[0] });
+    } catch (error) {
+        console.error("Create Position Error:", error);
+        res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการบันทึกตำแหน่ง' });
+    } finally {
+        client.release();
+    }
+});
 
+// ==========================================
+// API: แก้ไขตำแหน่ง
+// ==========================================
+app.put('/api/positions/:id', async (req, res) => {
+    const { id } = req.params;
+    const { position_name } = req.body;
+    const client = await pgPool.connect();
+    try {
+        const result = await client.query(
+            `UPDATE sys_positions SET position_name = $1 WHERE position_id = $2 RETURNING *`,
+            [position_name, id]
+        );
+        res.json({ success: true, data: result.rows[0] });
+    } catch (error) {
+        console.error("Update Position Error:", error);
+        res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการแก้ไขตำแหน่ง' });
+    } finally {
+        client.release();
+    }
+});
 
 
 
