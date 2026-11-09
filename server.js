@@ -1000,6 +1000,29 @@ app.get('/api/menus', async (req, res) => {
     }
 });
 
+
+// ==========================================
+// API: ดึงรายชื่อตำแหน่งเพื่อไปแสดงเป็น Checkbox
+// ==========================================
+app.get('/api/positions', async (req, res) => {
+    const client = await pgPool.connect();
+    try {
+        // ดึงตำแหน่งที่อยู่ในระดับหมู่บ้าน (VILLAGE) และโครงสร้างพื้นฐาน (INFRASTRUCTURE)
+        const result = await client.query(`
+            SELECT position_id, position_name 
+            FROM sys_positions 
+            WHERE position_level IN ('VILLAGE', 'INFRASTRUCTURE')
+            ORDER BY position_id ASC
+        `);
+        res.json({ success: true, data: result.rows });
+    } catch (error) {
+        console.error("Fetch Positions Error:", error);
+        res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการดึงข้อมูลตำแหน่ง' });
+    } finally {
+        client.release();
+    }
+});
+
 app.listen(port, () => {
     console.log(`Server is running on port ${port}`);
 });
