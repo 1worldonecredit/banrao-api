@@ -1023,6 +1023,87 @@ app.get('/api/positions', async (req, res) => {
     }
 });
 
+
+// ==========================================
+// API: ดึงข้อมูลผังผู้นำชุมชน (กรองตามหมู่บ้าน และ วาระ)
+// ==========================================
+app.get('/api/community-leaders/:villageId', async (req, res) => {
+    const { villageId } = req.params;
+    const { term_date } = req.query; // รับค่าวันที่เพื่อดูประวัติย้อนหลัง (ถ้ามี)
+    
+    const client = await pgPool.connect();
+    try {
+        // ดึงคนที่มีตำแหน่งในหมู่บ้านนี้ ที่ยัง Active อยู่ในช่วงเวลานั้น
+        let query = `
+            SELECT 
+                up.id as position_record_id,
+                up.account_id,
+                up.start_date,
+                up.end_date,
+                up.responsibilities,
+                sp.position_name,
+                sp.position_level,
+                ua.first_name,
+                ua.last_name,
+                ua.user_image
+            FROM user_positions up
+            JOIN sys_positions sp ON up.position_id = sp.position_id
+            JOIN user_accounts ua ON up.account_id = ua.account_id
+            WHERE up.scope_type = 'VILLAGE' 
+              AND up.scope_id::text = $1
+        `;
+        
+        const queryParams = [villageId];
+
+        // ถ้ามีการเลือกวันที่ (ดูย้อนหลัง) ให้ดึงข้อมูลที่อยู่ในช่วงเวลานั้น
+        if (term_date) {
+            query += ` AND up.start_date <= $2 AND (up.end_date IS NULL OR up.end_date >= $2)`;
+            queryParams.push(term_date);
+        } else {
+            // ถ้าไม่เลือก ให้ดึงวาระปัจจุบัน
+            query += ` AND up.is_active = TRUE AND (up.end_date IS NULL OR up.end_date >= CURRENT_DATE)`;
+        }
+
+        query += ` ORDER BY sp.position_id ASC;`;
+
+        const result = await client.query(query, queryParams);
+        res.json({ success: true, data: result.rows });
+    } catch (error) {
+        console.error("Fetch Leaders Error:", error);
+        res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการดึงข้อมูลผังผู้นำ' });
+    } finally {
+        client.release();
+    }
+});
+
+// ==========================================
+// API: อัปเดต/เพิ่ม ข้อมูลผู้นำ (รวมถึงหน้าที่และวันที่)
+// ==========================================
+app.put('/api/community-leaders/:recordId', async (req, res) => {
+    const { recordId } = req.params;
+    const { start_date, end_date, responsibilities } = req.body;
+    
+    const client = await pgPool.connect();
+    try {
+        await client.query(`
+            UPDATE user_positions 
+            SET start_date = $1, 
+                end_date = $2, 
+                responsibilities = $3
+            WHERE id = $4
+        `, [start_date, end_date || null, responsibilities, recordId]);
+        
+        res.json({ success: true, message: 'อัปเดตข้อมูลสำเร็จ' });
+    } catch (error) {
+        console.error("Update Leader Error:", error);
+        res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการอัปเดต' });
+    } finally {
+        client.release();
+    }
+});
+
+
+
 app.listen(port, () => {
     console.log(`Server is running on port ${port}`);
 });
