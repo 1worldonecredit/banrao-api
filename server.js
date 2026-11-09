@@ -1023,6 +1023,38 @@ app.get('/api/positions', async (req, res) => {
     }
 });
 
+
+// ==========================================
+// API: ค้นหาข้อมูลลูกบ้านด้วยเลขบัตรประชาชน (สำหรับการแต่งตั้งตำแหน่ง)
+// ==========================================
+app.get('/api/search-citizen/:citizenId', async (req, res) => {
+    const { citizenId } = req.params;
+    const client = await pgPool.connect();
+    
+    try {
+        const result = await client.query(`
+            SELECT 
+                account_id, 
+                first_name, 
+                last_name, 
+                user_image 
+            FROM user_profiles 
+            WHERE citizen_id = $1 -- สมมติว่าคอลัมน์เก็บเลขบัตรชื่อ citizen_id
+        `, [citizenId]);
+
+        if (result.rows.length > 0) {
+            res.json({ success: true, data: result.rows[0] });
+        } else {
+            res.json({ success: false, message: 'ไม่พบข้อมูลลูกบ้านจากเลขบัตรนี้' });
+        }
+    } catch (error) {
+        console.error("Search Citizen Error:", error);
+        res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการค้นหา' });
+    } finally {
+        client.release();
+    }
+});
+
 // ==========================================
 // API: ดึงข้อมูลผังผู้นำชุมชน (กรองตามหมู่บ้าน และ วาระ)
 // ==========================================
@@ -1100,7 +1132,48 @@ app.put('/api/community-leaders/:recordId', async (req, res) => {
     }
 });
 
+// 1. API: เพิ่มข้อมูลตำแหน่งใหม่
+app.post('/api/community-leaders', async (req, res) => {
+    const { village_id, position_id, account_id, start_date, end_date, responsibilities } = req.body;
+    const client = await pgPool.connect();
+    try {
+        await client.query(`
+            INSERT INTO user_positions 
+            (account_id, position_id, scope_type, scope_id, start_date, end_date, responsibilities, is_active) 
+            VALUES ($1, $2, 'VILLAGE', $3, $4, $5, $6, TRUE)
+        `, [account_id, position_id, village_id, start_date, end_date || null, responsibilities]);
+        
+        res.json({ success: true, message: 'เพิ่มตำแหน่งสำเร็จ' });
+    } catch (error) {
+        console.error("Insert Leader Error:", error);
+        res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการเพิ่มข้อมูล' });
+    } finally {
+        client.release();
+    }
+});
 
+// 2. API: ค้นหาลูกบ้านจากเลขบัตรประชาชน
+app.get('/api/search-citizen/:citizenId', async (req, res) => {
+    const { citizenId } = req.params;
+    const client = await pgPool.connect();
+    try {
+        const result = await client.query(`
+            SELECT account_id, first_name, last_name, user_image 
+            FROM user_profiles WHERE citizen_id = $1
+        `, [citizenId]);
+
+        if (result.rows.length > 0) {
+            res.json({ success: true, data: result.rows[0] });
+        } else {
+            res.json({ success: false, message: 'ไม่พบลูกบ้าน' });
+        }
+    } catch (error) {
+        console.error("Search Citizen Error:", error);
+        res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+    } finally {
+        client.release();
+    }
+});
 
 app.listen(port, () => {
     console.log(`Server is running on port ${port}`);
