@@ -1152,24 +1152,33 @@ app.post('/api/community-leaders', async (req, res) => {
     }
 });
 
-// 2. API: ค้นหาลูกบ้านจากเลขบัตรประชาชน
+// ==========================================
+// API: ค้นหาข้อมูลลูกบ้านด้วยเลขบัตรประชาชน
+// ==========================================
 app.get('/api/search-citizen/:citizenId', async (req, res) => {
     const { citizenId } = req.params;
     const client = await pgPool.connect();
+    
     try {
+        // แก้ไข: เปลี่ยนจากดึง account_id มาเป็น profile_id แทน
+        // และเอา user_image ออกก่อน เพราะในตาราง user_profiles ไม่มีคอลัมน์นี้
         const result = await client.query(`
-            SELECT account_id, first_name, last_name, user_image 
-            FROM user_profiles WHERE citizen_id = $1
+            SELECT 
+                profile_id as account_id, -- ใช้ alias แปลงชื่อเป็น account_id เพื่อให้ Frontend เอาไปใช้ต่อได้ง่าย
+                first_name, 
+                last_name
+            FROM user_profiles 
+            WHERE citizen_id = $1
         `, [citizenId]);
 
         if (result.rows.length > 0) {
             res.json({ success: true, data: result.rows[0] });
         } else {
-            res.json({ success: false, message: 'ไม่พบลูกบ้าน' });
+            res.json({ success: false, message: 'ไม่พบข้อมูลลูกบ้านจากเลขบัตรนี้' });
         }
     } catch (error) {
         console.error("Search Citizen Error:", error);
-        res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+        res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการค้นหา' });
     } finally {
         client.release();
     }
