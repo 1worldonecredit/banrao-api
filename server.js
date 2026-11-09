@@ -827,6 +827,31 @@ app.post('/api/community-places/:placeId/products', async (req, res) => {
 // ==========================================
 // API: ดึงข้อมูลสถานที่ของฉัน (My Places)  สิ้นสุด
 // ==========================================
+
+// ==========================================
+// API: ดึงข้อมูลขอบเขตหมู่บ้าน (Boundary) สำหรับแสดงบนแผนที่
+// ==========================================
+app.get('/api/villages/:villageId', async (req, res) => {
+    try {
+        const { villageId } = req.params;
+        const query = `SELECT * FROM sys_villages WHERE village_id = $1;`;
+        const result = await pgPool.query(query, [villageId]);
+        
+        if (result.rows.length === 0) {
+            return res.status(404).json({ success: false, message: 'ไม่พบข้อมูลหมู่บ้าน' });
+        }
+        res.json({ success: true, data: result.rows[0] });
+    } catch (error) {
+        console.error('API Get Village Error:', error);
+        res.status(500).json({ success: false, message: 'Internal Server Error' });
+    }
+});
+
+
+
+
+
+
 app.listen(port, () => {
     console.log(`Server is running on port ${port}`);
 });
