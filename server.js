@@ -479,6 +479,7 @@ app.post('/api/login', async (req, res) => {
         res.status(500).json({ message: 'Internal Server Error', error: error.message });
     }
 });
+
 // ==========================================
 // API: ดึงเมนู Sidebar 
 // ==========================================
@@ -494,17 +495,30 @@ app.get('/api/sidebar-menus/:accountId', async (req, res) => {
     try {
         const query = `
             WITH UserInfo AS (
+                -- 1. ดึงข้อมูลบัญชี เพื่อดูว่าผู้ใช้คนนี้สังกัดหมู่บ้านอะไร (เพื่อเอามาเทียบ)
                 SELECT account_id, village_id 
                 FROM user_accounts 
                 WHERE account_id = $1
             ),
             UserPermissions AS (
+                -- 2. ดึงสิทธิ์จากตำแหน่ง โดยเช็คเงื่อนไขขอบเขต (scope) ให้ถูกต้อง
                 SELECT pp.permission_id
                 FROM user_positions up
                 JOIN position_permissions pp ON up.position_id = pp.position_id
                 JOIN UserInfo ui ON up.account_id = ui.account_id
                 WHERE up.account_id = $1 
                   AND up.is_active = TRUE 
+                  -- ตรวจสอบวันที่ดำรงตำแหน่งว่ายังไม่หมดวาระ
+                  AND (up.start_date IS NULL OR up.start_date <= CURRENT_DATE)
+                  AND (up.end_date IS NULL OR up.end_date >= CURRENT_DATE)
+                  -- 🌟 หัวใจสำคัญ: ตรวจสอบ Scope ให้อนุญาตเฉพาะของหมู่บ้านตัวเอง หรือระดับที่สูงกว่า
+                  AND (
+                      -- ถ้าสิทธิ์เป็นระดับ VILLAGE ต้องมี scope_id ตรงกับ village_id ของผู้ใช้
+                      (up.scope_type = 'VILLAGE' AND up.scope_id::text = ui.village_id::text)
+                      -- หรือถ้าเป็นสิทธิ์ระดับประเทศ/จังหวัด/ตำบล ก็อนุญาตให้ผ่าน (เพื่อไปเช็คต่อที่ระดับ Application)
+                      OR up.scope_type != 'VILLAGE'
+                      OR up.scope_type IS NULL
+                  )
             )
             SELECT 
                 mg.group_name, 
@@ -514,13 +528,14 @@ app.get('/api/sidebar-menus/:accountId', async (req, res) => {
             FROM sys_menus m
             JOIN sys_menu_groups mg ON m.group_id = mg.group_id
             WHERE m.is_active = TRUE 
+              -- เมนูนี้ต้องเป็นแบบ Public (NULL) หรือ ผู้ใช้มีสิทธิ์เข้าถึง (อยู่ใน UserPermissions)
               AND (m.permission_id IS NULL OR m.permission_id IN (SELECT permission_id FROM UserPermissions))
             ORDER BY mg.display_order, m.display_order;
         `;
 
         const result = await client.query(query, [accountId]);
 
-        // จัดกลุ่มข้อมูล
+        // จัดกลุ่มข้อมูล (Group By)
         const groupedMenus = result.rows.reduce((acc, row) => {
             const group = acc.find(g => g.group_name === row.group_name);
             const menuData = { name: row.name, icon: row.icon, path: row.path };
