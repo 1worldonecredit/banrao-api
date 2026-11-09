@@ -479,14 +479,12 @@ app.post('/api/login', async (req, res) => {
         res.status(500).json({ message: 'Internal Server Error', error: error.message });
     }
 });
-// =========================================================
 // ==========================================
-// API: ดึงเมนู Sidebar ตามสิทธิ์ของผู้ใช้งาน (Dynamic Role-Based Menu)
+// API: ดึงเมนู Sidebar ตามสิทธิ์และตรวจสอบว่าตรงกับหมู่บ้านจริง (Strict Village Verification)
 // ==========================================
 app.get('/api/sidebar-menus/:accountId', async (req, res) => {
     const { accountId } = req.params;
     
-    // ดักจับกรณีไม่ได้ส่ง accountId มา (เช่น ยังไม่ได้ Login)
     if (!accountId || accountId === 'undefined') {
         return res.status(400).json({ success: false, message: 'Invalid Account ID' });
     }
@@ -494,16 +492,26 @@ app.get('/api/sidebar-menus/:accountId', async (req, res) => {
     const client = await pgPool.connect();
 
     try {
+        // ใช้ SQL กลับไปเป็นโครงสร้างเดิมของคุณ แต่เพิ่มการ Verify Village
         const query = `
-            WITH UserPermissions AS (
-                -- ค้นหาสิทธิ์จากตาราง user_accounts (หรือ user_positions ตามที่คุณออกแบบ)
-                -- สมมติว่าผูก Role ไว้ที่ sys_roles และ sys_permissions
-                SELECT rp.permission_id
-                FROM user_accounts ua
-                JOIN sys_roles r ON ua.role_id = r.role_id
-                JOIN sys_role_permissions rp ON r.role_id = rp.role_id
-                WHERE ua.account_id = $1 
-                  AND ua.is_active = TRUE 
+            WITH UserInfo AS (
+                -- 1. ค้นหาว่า User คนนี้สังกัดหมู่บ้านอะไร
+                SELECT account_id, village_id 
+                FROM user_accounts 
+                WHERE account_id = $1
+            ),
+            UserPermissions AS (
+                -- 2. ดึงสิทธิ์เฉพาะตำแหน่งที่ Active และ (สำคัญมาก) ต้องตรงกับ Village ของ User เท่านั้น!
+                SELECT pp.permission_id
+                FROM user_positions up
+                JOIN position_permissions pp ON up.position_id = pp.position_id
+                JOIN UserInfo ui ON up.account_id = ui.account_id
+                WHERE up.account_id = $1 
+                  AND up.is_active = TRUE 
+                  AND up.start_date <= CURRENT_DATE 
+                  AND (up.end_date IS NULL OR up.end_date >= CURRENT_DATE)
+                  -- เงื่อนไขป้องกันข้ามหมู่บ้าน: ตำแหน่งนี้ต้องอยู่ในหมู่บ้านเดียวกับที่ User สังกัด
+                  AND (up.village_id = ui.village_id OR up.village_id IS NULL)
             )
             SELECT 
                 mg.group_name, 
@@ -513,7 +521,7 @@ app.get('/api/sidebar-menus/:accountId', async (req, res) => {
             FROM sys_menus m
             JOIN sys_menu_groups mg ON m.group_id = mg.group_id
             WHERE m.is_active = TRUE 
-              -- เงื่อนไข: ถ้า permission_id เป็น NULL คือเมนูสาธารณะ หรือ มีสิทธิ์ตรงกับ Role
+              -- ดึงเมนูที่ไม่มีการล็อกสิทธิ์ (NULL) หรือ เมนูที่ตรงกับสิทธิ์ที่ผ่านการตรวจสอบหมู่บ้านแล้ว
               AND (m.permission_id IS NULL OR m.permission_id IN (SELECT permission_id FROM UserPermissions))
             ORDER BY mg.display_order, m.display_order;
         `;
