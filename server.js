@@ -966,7 +966,39 @@ app.put('/api/positions/:id', async (req, res) => {
     }
 });
 
-
+// ==========================================
+// API: ดึงรายการเมนูทั้งหมดเพื่อนำไปแสดงในหน้าจัดการเมนู
+// ==========================================
+app.get('/api/menus', async (req, res) => {
+    const client = await pgPool.connect();
+    try {
+        // ใช้ JSON_AGG เพื่อดึงว่าเมนูนี้มีใคร (position_id) มีสิทธิ์บ้าง ออกมาเป็น Array
+        const query = `
+            SELECT 
+                m.menu_id as id,
+                m.menu_name,
+                m.icon_name,
+                m.route_path,
+                m.permission_id,
+                COALESCE(
+                    array_agg(p.position_id) FILTER (WHERE p.position_id IS NOT NULL), 
+                    '{}'
+                ) as selected_roles
+            FROM sys_menus m
+            LEFT JOIN position_permissions pp ON m.permission_id = pp.permission_id
+            LEFT JOIN sys_positions p ON pp.position_id = p.position_id
+            GROUP BY m.menu_id, m.menu_name, m.icon_name, m.route_path, m.permission_id
+            ORDER BY m.display_order ASC, m.menu_id ASC;
+        `;
+        const result = await client.query(query);
+        res.json({ success: true, data: result.rows });
+    } catch (error) {
+        console.error("Fetch Menus Error:", error);
+        res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการดึงรายการเมนู' });
+    } finally {
+        client.release();
+    }
+});
 
 app.listen(port, () => {
     console.log(`Server is running on port ${port}`);
