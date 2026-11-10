@@ -1173,6 +1173,30 @@ app.put('/api/community-leaders/:recordId', async (req, res) => {
     }
 });
 
+
+// ==========================================
+// API: ลบข้อมูลผู้นำออกจากตำแหน่ง (Set is_active = false)
+// ==========================================
+app.delete('/api/community-leaders/:recordId', async (req, res) => {
+    const { recordId } = req.params;
+    
+    const client = await pgPool.connect();
+    try {
+        await client.query(`
+            UPDATE user_positions 
+            SET is_active = false 
+            WHERE id = $1
+        `, [recordId]);
+        
+        res.json({ success: true, message: 'ลบข้อมูลบุคลากรออกจากตำแหน่งสำเร็จ' });
+    } catch (error) {
+        console.error("Delete Leader Error:", error);
+        res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการลบข้อมูล' });
+    } finally {
+        client.release();
+    }
+});
+
 // ==========================================
 // API: บันทึกข้อมูลผู้นำชุมชน (แบบ Dynamic รองรับการสร้างตำแหน่งใหม่)
 // ==========================================
