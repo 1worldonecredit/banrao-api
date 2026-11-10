@@ -276,21 +276,17 @@ app.get('/api/tambons', async (req, res) => {
         res.status(500).json({ error: 'เกิดข้อผิดพลาดในการดึงข้อมูลตำบล' });
     }
 });
-
-// ==========================================
-// API สำหรับจัดการเมนูระบบ (Menu Management)
-// ==========================================
-
 // 1. ดึงข้อมูลเมนูทั้งหมด (GET)
 app.get('/api/menus', async (req, res) => {
   try {
+    // แก้ไขคำสั่ง SQL ให้ใช้ display_order ตามโครงสร้างตารางจริง
     const result = await pool.query(
-      'SELECT * FROM sys_menus ORDER BY parent_id NULLS FIRST, sort_order ASC, id ASC'
+      'SELECT * FROM sys_menus ORDER BY display_order ASC, menu_id ASC'
     );
-    res.json(result.rows);
+    res.json({ success: true, data: result.rows }); // ปรับ format ให้ตรงกับที่ frontend รับ
   } catch (err) {
     console.error(err);
-    res.status(500).json({ message: "ไม่สามารถดึงข้อมูลได้" });
+    res.status(500).json({ success: false, message: "ไม่สามารถดึงข้อมูลได้" });
   }
 });
 
