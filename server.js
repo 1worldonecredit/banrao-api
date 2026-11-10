@@ -1098,26 +1098,30 @@ app.get('/api/community-leaders/:villageId', async (req, res) => {
     const { villageId } = req.params;
     const { term_date } = req.query;
 
-    let query = `
-        SELECT 
-            up.id as position_record_id,
-            up.account_id,
-            up.position_id,
-            sp.position_name,
-            up.start_date,
-            up.end_date,
-            up.responsibilities,
-            up.parent_id, /* 🌟 สำคัญ: ถ้าในตารางคุณมีคอลัมน์เก็บ ID ของคนที่เป็นหัวหน้า (parent_id) ให้ดึงมาด้วย */
-            p.first_name,
-            p.last_name,
-            cpm.image_url as user_image
-        FROM user_positions up
-        JOIN sys_positions sp ON up.position_id = sp.position_id
-        JOIN user_accounts a ON up.account_id = a.account_id
-        JOIN user_profiles p ON a.profile_id = p.profile_id
-        LEFT JOIN citizen_profiles_media cpm ON p.profile_id = cpm.profile_id AND cpm.is_active = true
-        WHERE up.scope_type = 'VILLAGE' AND up.scope_id = $1 AND up.is_active = true
-    `;
+    // 🌟 สิ่งที่ขาดไป: ต้องเชื่อมต่อ Database ก่อน
+    const client = await pgPool.connect(); 
+
+    try {
+        let query = `
+            SELECT 
+                up.id as position_record_id,
+                up.account_id,
+                up.position_id,
+                sp.position_name,
+                up.start_date,
+                up.end_date,
+                up.responsibilities,
+                p.first_name,
+                p.last_name,
+                cpm.image_url as user_image
+                /* ตัด parent_id ออกก่อน หากใน Database คุณยังไม่มีคอลัมน์นี้ จะได้ไม่ Error */
+            FROM user_positions up
+            JOIN sys_positions sp ON up.position_id = sp.position_id
+            JOIN user_accounts a ON up.account_id = a.account_id
+            JOIN user_profiles p ON a.profile_id = p.profile_id
+            LEFT JOIN citizen_profiles_media cpm ON p.profile_id = cpm.profile_id AND cpm.is_active = true
+            WHERE up.scope_type = 'VILLAGE' AND up.scope_id = $1 AND up.is_active = true
+        `;
         
         const queryParams = [villageId];
 
@@ -1125,7 +1129,7 @@ app.get('/api/community-leaders/:villageId', async (req, res) => {
             query += ` AND up.start_date <= $2 AND (up.end_date IS NULL OR up.end_date >= $2)`;
             queryParams.push(term_date);
         } else {
-            query += ` AND up.is_active = TRUE AND (up.end_date IS NULL OR up.end_date >= CURRENT_DATE)`;
+            query += ` AND (up.end_date IS NULL OR up.end_date >= CURRENT_DATE)`;
         }
 
         query += ` ORDER BY sp.position_id ASC;`;
@@ -1136,6 +1140,7 @@ app.get('/api/community-leaders/:villageId', async (req, res) => {
         console.error("Fetch Leaders Error:", error);
         res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการดึงข้อมูลผังผู้นำ' });
     } finally {
+        // 🌟 คืนการเชื่อมต่อกลับสู่ Pool
         client.release();
     }
 });
