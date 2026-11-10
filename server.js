@@ -1092,15 +1092,13 @@ app.get('/api/search-citizen/:citizenId', async (req, res) => {
 });
 
 // ==========================================
-// API: ดึงข้อมูลผู้นำชุมชนทั้งหมดในหมู่บ้าน
+// API: ดึงข้อมูลผู้นำชุมชนทั้งหมดในหมู่บ้าน (แยกตามคณะทำงาน)
 // ==========================================
 app.get('/api/community-leaders/:villageId', async (req, res) => {
     const { villageId } = req.params;
-    const { term_date } = req.query;
+    const { term_date, committee_id } = req.query; // 🌟 รับ committee_id มาด้วย
 
-    // 🌟 สิ่งที่ขาดไป: ต้องเชื่อมต่อ Database ก่อน
     const client = await pgPool.connect(); 
-
     try {
         let query = `
             SELECT 
@@ -1114,7 +1112,6 @@ app.get('/api/community-leaders/:villageId', async (req, res) => {
                 p.first_name,
                 p.last_name,
                 cpm.image_url as user_image
-                /* ตัด parent_id ออกก่อน หากใน Database คุณยังไม่มีคอลัมน์นี้ จะได้ไม่ Error */
             FROM user_positions up
             JOIN sys_positions sp ON up.position_id = sp.position_id
             JOIN user_accounts a ON up.account_id = a.account_id
@@ -1124,9 +1121,17 @@ app.get('/api/community-leaders/:villageId', async (req, res) => {
         `;
         
         const queryParams = [villageId];
+        let paramIndex = 2;
+
+        // 🌟 กรองตามคณะทำงาน (ถ้ามีการระบุมา)
+        if (committee_id) {
+            query += ` AND up.committee_id = $${paramIndex}`;
+            queryParams.push(committee_id);
+            paramIndex++;
+        }
 
         if (term_date) {
-            query += ` AND up.start_date <= $2 AND (up.end_date IS NULL OR up.end_date >= $2)`;
+            query += ` AND up.start_date <= $${paramIndex} AND (up.end_date IS NULL OR up.end_date >= $${paramIndex})`;
             queryParams.push(term_date);
         } else {
             query += ` AND (up.end_date IS NULL OR up.end_date >= CURRENT_DATE)`;
@@ -1140,7 +1145,6 @@ app.get('/api/community-leaders/:villageId', async (req, res) => {
         console.error("Fetch Leaders Error:", error);
         res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการดึงข้อมูลผังผู้นำ' });
     } finally {
-        // 🌟 คืนการเชื่อมต่อกลับสู่ Pool
         client.release();
     }
 });
