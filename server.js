@@ -277,12 +277,13 @@ app.get('/api/tambons', async (req, res) => {
     }
 });
 // 1. ดึงข้อมูลเมนูทั้งหมด (GET)
+
 app.get('/api/menus', async (req, res) => {
   try {
-    // แก้ไขคำสั่ง SQL ให้ใช้ display_order ตามโครงสร้างตารางจริง
     const result = await pool.query(
-      'SELECT * FROM sys_menus ORDER BY display_order ASC, menu_id ASC'
+      'SELECT * FROM sys_menus ORDER BY parent_id NULLS FIRST, sort_order ASC, id ASC'
     );
+    // ...
     res.json({ success: true, data: result.rows }); // ปรับ format ให้ตรงกับที่ frontend รับ
   } catch (err) {
     console.error(err);
