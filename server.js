@@ -278,15 +278,16 @@ app.get('/api/tambons', async (req, res) => {
 });
 // 1. ดึงข้อมูลเมนูทั้งหมด (GET)
 
+// 1. ดึงข้อมูลเมนูทั้งหมด (GET)
 app.get('/api/menus', async (req, res) => {
   try {
     const result = await pool.query(
-      'SELECT * FROM sys_menus ORDER BY parent_id NULLS FIRST, sort_order ASC, id ASC'
+      // แก้ไขคำสั่ง SQL ให้ดึงจากคอลัมน์ที่มีอยู่จริง
+      'SELECT * FROM sys_menus ORDER BY display_order ASC, menu_id ASC'
     );
-    // ...
-    res.json({ success: true, data: result.rows }); // ปรับ format ให้ตรงกับที่ frontend รับ
+    res.json({ success: true, data: result.rows });
   } catch (err) {
-    console.error(err);
+    console.error("Error Fetching Menus:", err);
     res.status(500).json({ success: false, message: "ไม่สามารถดึงข้อมูลได้" });
   }
 });
