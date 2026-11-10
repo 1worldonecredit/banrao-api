@@ -1147,17 +1147,19 @@ app.get('/api/community-leaders/:villageId', async (req, res) => {
 // ==========================================
 app.put('/api/community-leaders/:recordId', async (req, res) => {
     const { recordId } = req.params;
-    const { start_date, end_date, responsibilities } = req.body;
+    // 🌟 รับ account_id เข้ามาด้วย เผื่อกรณีที่คุณเปลี่ยนตัวคนในตำแหน่งเดิม
+    const { account_id, start_date, end_date, responsibilities } = req.body; 
     
     const client = await pgPool.connect();
     try {
         await client.query(`
             UPDATE user_positions 
-            SET start_date = $1, 
-                end_date = $2, 
-                responsibilities = $3
-            WHERE id = $4
-        `, [start_date, end_date || null, responsibilities, recordId]);
+            SET account_id = $1,        /* 🌟 เพิ่มการอัปเดตตัวบุคลากร */
+                start_date = $2, 
+                end_date = $3, 
+                responsibilities = $4
+            WHERE id = $5
+        `, [account_id, start_date, end_date || null, responsibilities, recordId]);
         
         res.json({ success: true, message: 'อัปเดตข้อมูลสำเร็จ' });
     } catch (error) {
