@@ -1061,7 +1061,7 @@ app.get('/api/search-citizen/:citizenId', async (req, res) => {
         // ใช้ pgPool.query ตรงๆ เหมือนที่คุณใช้ใน API Login จะได้ไม่เกิด Error
         const result = await pgPool.query(`
             SELECT 
-                p.profile_id as account_id,
+               a.account_id,
                 p.first_name, 
                 p.last_name,
                 p.citizen_id,
