@@ -342,17 +342,19 @@ app.put('/api/menus/:id', async (req, res) => {
     res.status(500).json({ message: "อัปเดตไม่ได้" });
   }
 });
-
 // 4. ลบเมนู (DELETE)
 app.delete('/api/menus/:id', async (req, res) => {
+  const client = await pgPool.connect(); // หรือ pool.connect() ตามที่คุณใช้
   try {
     const { id } = req.params;
-    await pool.query('DELETE FROM sys_menus WHERE parent_id = $1', [id]); // ลบลูกก่อน
-    await pool.query('DELETE FROM sys_menus WHERE id = $1', [id]); // ลบแม่
-    res.json({ message: "ลบสำเร็จ" });
+    // 🛠 ลบข้อมูลโดยอ้างอิงจาก menu_id ให้ตรงกับ Database ของคุณ
+    await client.query('DELETE FROM sys_menus WHERE menu_id = $1', [id]);
+    res.json({ success: true, message: "ลบสำเร็จ" });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: "ลบไม่ได้" });
+    console.error("Delete Menu Error:", err);
+    res.status(500).json({ success: false, message: "ลบไม่ได้" });
+  } finally {
+    client.release();
   }
 });
 // ==========================================
