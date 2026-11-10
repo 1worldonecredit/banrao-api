@@ -1149,6 +1149,25 @@ app.get('/api/community-leaders/:villageId', async (req, res) => {
     }
 });
 
+
+// ==========================================
+// API: เพิ่มคณะทำงาน / โครงการใหม่
+// ==========================================
+app.post('/api/community-committees', async (req, res) => {
+    const { village_id, committee_name, description } = req.body;
+    try {
+        const client = await pgPool.connect();
+        await client.query(
+            'INSERT INTO community_committees (village_id, committee_name, description) VALUES ($1, $2, $3)', 
+            [village_id, committee_name, description]
+        );
+        res.json({ success: true, message: 'สร้างคณะทำงานใหม่สำเร็จ' });
+        client.release();
+    } catch (error) {
+        res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการสร้างคณะทำงาน' });
+    }
+});
+
 // ==========================================
 // API: อัปเดต/เพิ่ม ข้อมูลผู้นำ (รวมถึงหน้าที่และวันที่)
 // ==========================================
