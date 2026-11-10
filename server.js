@@ -1050,27 +1050,18 @@ app.get('/api/positions', async (req, res) => {
     }
 });
 
-// ==========================================
-// API: ค้นหาข้อมูลลูกบ้านด้วยเลขบัตรประชาชน (แบบละเอียด)
-// ==========================================
 app.get('/api/search-citizen/:citizenId', async (req, res) => {
     const { citizenId } = req.params;
-    
-    console.log("กำลังค้นหาเลขบัตรประชาชน (ละเอียด):", citizenId); 
+    const { village_id } = req.query; // 🌟 รับรหัสหมู่บ้านมาจาก Frontend
     
     const client = await pgPool.connect(); 
-    
     try {
         const result = await client.query(`
             SELECT 
                 p.profile_id as account_id,
-                p.first_name, 
-                p.last_name,
-                p.citizen_id,
-                v.village_name,          -- 🌟 ดึงชื่อหมู่บ้าน
-                t.tambon_name_th,        -- 🌟 ดึงชื่อตำบล
-                cpm.image_url as user_image, -- 🌟 ดึงรูปโปรไฟล์
-                o.occupation_name as responsibilities -- 🌟 ดึงหน้าที่/อาชีพปัจจุบัน (ถ้ามี)
+                p.first_name, p.last_name, p.citizen_id,
+                v.village_name, t.tambon_name_th,
+                cpm.image_url as user_image, o.occupation_name as responsibilities
             FROM user_profiles p
             LEFT JOIN user_accounts a ON p.profile_id = a.profile_id
             LEFT JOIN villages v ON a.village_id = v.village_id
@@ -1078,12 +1069,13 @@ app.get('/api/search-citizen/:citizenId', async (req, res) => {
             LEFT JOIN citizen_profiles_media cpm ON p.profile_id = cpm.profile_id AND cpm.is_active = true
             LEFT JOIN sys_occupations o ON a.occupation_id = o.occupation_id
             WHERE TRIM(p.citizen_id::TEXT) = TRIM($1::TEXT)
-        `, [citizenId]);
+            AND a.village_id = $2 -- 🌟 ล็อคให้ค้นหาได้เฉพาะคนในหมู่บ้านเดียวกันเท่านั้น!
+        `, [citizenId, village_id]);
 
         if (result.rows.length > 0) {
             res.json({ success: true, data: result.rows[0] });
         } else {
-            res.json({ success: false, message: 'ไม่พบข้อมูลลูกบ้านจากเลขบัตรประชาชนนี้' });
+            res.json({ success: false, message: 'ไม่พบข้อมูลลูกบ้าน หรือบุคคลนี้ไม่ได้อยู่ในหมู่บ้านของคุณ' });
         }
     } catch (error) {
         console.error("Search Citizen Detail Error:", error);
