@@ -277,37 +277,50 @@ app.get('/api/tambons', async (req, res) => {
     }
 });
 
-
+// 1. ดึงข้อมูลเมนูทั้งหมด (GET)
 app.get('/api/menus', async (req, res) => {
-  // เรียกใช้ตัวเชื่อมต่อฐานข้อมูลให้เหมือนกับ API อื่นๆ
-  const client = await pgPool.connect(); 
   try {
-    const result = await client.query(
+    const result = await pool.query(
       'SELECT * FROM sys_menus ORDER BY display_order ASC, menu_id ASC'
     );
     res.json({ success: true, data: result.rows });
   } catch (err) {
     console.error("Error Fetching Menus:", err);
     res.status(500).json({ success: false, message: "ไม่สามารถดึงข้อมูลได้" });
-  } finally {
-    // อย่าลืมคืน connection
-    client.release();
   }
 });
 
-// 2. สร้างเมนูใหม่ (POST)
-app.post('/api/menus', async (req, res) => {
+// 2. สร้าง/อัปเดตเมนู (ใน React คุณใช้ app.post('/api/manage-menu') รวมทั้งคู่ไว้ด้วยกัน)
+app.post('/api/manage-menu', async (req, res) => {
   try {
-    const { name, path, component, icon, parentId, useBadge } = req.body;
-    const result = await pool.query(
-      `INSERT INTO sys_menus (menu_name, path, component, icon, parent_id, sort_order) 
-       VALUES ($1, $2, $3, $4, $5, 0) RETURNING *`,
-      [name, path || null, component || null, icon || null, parentId || null]
-    );
-    res.status(201).json(result.rows[0]);
+    // 🛠 รับค่า group_id และ selected_roles ที่ส่งมาจาก React เพิ่มด้วย
+    const { menu_id, menu_name, icon_name, route_path, group_id, selected_roles } = req.body;
+    
+    // แปลง array ของ selected_roles ให้เป็น JSON string ก่อนบันทึก
+    const rolesJson = JSON.stringify(selected_roles || []);
+
+    let result;
+    if (menu_id) {
+      // กรณีมี menu_id หมายถึงการอัปเดต (แก้ไข)
+      result = await pool.query(
+        `UPDATE sys_menus 
+         SET menu_name = $1, icon_name = $2, route_path = $3, group_id = $4, selected_roles = $5
+         WHERE menu_id = $6 RETURNING *`,
+        [menu_name, icon_name, route_path, group_id, rolesJson, menu_id]
+      );
+    } else {
+      // กรณีไม่มี menu_id หมายถึงการสร้างใหม่
+      result = await pool.query(
+        `INSERT INTO sys_menus (menu_name, icon_name, route_path, group_id, selected_roles, display_order) 
+         VALUES ($1, $2, $3, $4, $5, 99) RETURNING *`,
+        [menu_name, icon_name, route_path, group_id, rolesJson]
+      );
+    }
+    
+    res.json({ success: true, data: result.rows[0] });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: "บันทึกไม่ได้" });
+    console.error("Manage Menu Error:", err);
+    res.status(500).json({ success: false, message: "บันทึกไม่ได้" });
   }
 });
 
