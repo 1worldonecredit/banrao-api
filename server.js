@@ -1197,6 +1197,21 @@ app.delete('/api/community-leaders/:recordId', async (req, res) => {
     }
 });
 
+
+// ==========================================
+// API: ดึงรายชื่อคณะทำงาน/โครงการ ของหมู่บ้าน
+// ==========================================
+app.get('/api/community-committees/:villageId', async (req, res) => {
+    const { villageId } = req.params;
+    try {
+        const client = await pgPool.connect();
+        const result = await client.query('SELECT * FROM community_committees WHERE village_id = $1 ORDER BY committee_id ASC', [villageId]);
+        res.json({ success: true, data: result.rows });
+        client.release();
+    } catch (error) {
+        res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการดึงข้อมูลคณะทำงาน' });
+    }
+});
 // ==========================================
 // API: บันทึกข้อมูลผู้นำชุมชน (แบบ Dynamic รองรับการสร้างตำแหน่งใหม่)
 // ==========================================
