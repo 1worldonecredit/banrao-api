@@ -446,14 +446,22 @@ app.post('/api/login', async (req, res) => {
         // 🌟🌟 Fallback Logic ด้วย JavaScript 🌟🌟
         let finalPositionName = user.position_name;
         let finalPositionLevel = user.position_level;
+        let isSuperAdmin = false; // 🛠 ประกาศตัวแปรเช็คว่าเป็น Super Admin หรือไม่
 
-        if (!finalPositionName) {
-            // 1. ตรวจสอบว่าคนที่ล็อกอิน คือคนเดียวกับที่เป็นผู้ใหญ่บ้านของหมู่บ้านนี้หรือไม่?
+        // 🛠 1. เช็คว่าเป็นบัญชี Super Admin โดยตรงหรือไม่ (เบอร์ 0000000000)
+        if (user.username_phone === '0000000000') {
+            finalPositionName = 'Super Admin';
+            finalPositionLevel = 'SYSTEM';
+            isSuperAdmin = true;
+        } 
+        // 🛠 2. ถ้าไม่ใช่ Super Admin และยังไม่มีตำแหน่ง ให้เข้าเงื่อนไข Fallback เดิมของคุณ
+        else if (!finalPositionName) {
+            // ตรวจสอบว่าคนที่ล็อกอิน คือคนเดียวกับที่เป็นผู้ใหญ่บ้านของหมู่บ้านนี้หรือไม่?
             if (user.account_id && user.headman_account_id && user.account_id === user.headman_account_id) {
                 finalPositionName = 'ผู้ใหญ่บ้าน';
                 finalPositionLevel = 'VILLAGE';
             } 
-            // 2. ถ้าไม่ใช่ เช็คจากชื่ออาชีพ (occupation_name)
+            // ถ้าไม่ใช่ เช็คจากชื่ออาชีพ (occupation_name)
             else if (user.occupation_name && user.occupation_name !== 'ประชาชนทั่วไป') {
                 finalPositionName = user.occupation_name;
                 if (finalPositionName.includes('นายอำเภอ')) finalPositionLevel = 'AMPHURE';
@@ -488,7 +496,8 @@ app.post('/api/login', async (req, res) => {
                 headmanImage: user.headman_image || 'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=150&q=80',
                 
                 position_name: finalPositionName,
-                position_level: finalPositionLevel
+                position_level: finalPositionLevel,
+                isSuperAdmin: isSuperAdmin // 🛠 ส่งค่าไปให้หน้า Login ฝั่ง React เพื่อใช้แยกหน้า
             }
         });
 
