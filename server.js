@@ -1168,20 +1168,60 @@ app.put('/api/community-leaders/:recordId', async (req, res) => {
     }
 });
 
-// 1. API: เพิ่มข้อมูลตำแหน่งใหม่
+// ==========================================
+// API: บันทึกข้อมูลผู้นำชุมชน (แก้ไขให้ตรงกับโครงสร้าง Database)
+// ==========================================
 app.post('/api/community-leaders', async (req, res) => {
-    const { village_id, position_id, account_id, start_date, end_date, responsibilities } = req.body;
+    const { 
+        village_id, 
+        position_id, 
+        position_name, // กรณี Dynamic Mind Map ที่ส่งชื่อตำแหน่งมาเอง
+        account_id, 
+        start_date, 
+        end_date, 
+        responsibilities 
+    } = req.body;
+
     const client = await pgPool.connect();
+    
     try {
-        await client.query(`
-            INSERT INTO user_positions 
-            (account_id, position_id, scope_type, scope_id, start_date, end_date, responsibilities, is_active) 
-            VALUES ($1, $2, 'VILLAGE', $3, $4, $5, $6, TRUE)
-        `, [account_id, position_id, village_id, start_date, end_date || null, responsibilities]);
+        await client.query('BEGIN'); // เริ่ม Transaction
+
+        // 🌟 แก้ไข: แปลง village_id ให้เป็น scope_type และ scope_id
+        // สมมติว่าหมู่บ้านใช้ scope_type = 'VILLAGE' และ scope_id = village_id
+        const insertQuery = `
+            INSERT INTO user_positions (
+                account_id, 
+                position_id, 
+                scope_type, 
+                scope_id, 
+                start_date, 
+                end_date, 
+                responsibilities,
+                is_active
+            ) 
+            VALUES ($1, $2, $3, $4, $5, $6, $7, true)
+            RETURNING id
+        `;
         
-        res.json({ success: true, message: 'เพิ่มตำแหน่งสำเร็จ' });
+        const values = [
+            account_id, 
+            position_id || 12, // ถ้าไม่ส่งมาให้ใช้ ID 12 (เจ้าหน้าที่อื่นๆ)
+            'VILLAGE',         // scope_type
+            village_id,        // scope_id
+            start_date, 
+            end_date || null, 
+            responsibilities
+        ];
+
+        await client.query(insertQuery, values);
+
+        await client.query('COMMIT'); // ยืนยันการบันทึก
+        res.json({ success: true, message: 'เพิ่มข้อมูลผู้นำสำเร็จ' });
+
     } catch (error) {
-        console.error("Insert Leader Error:", error);
+        await client.query('ROLLBACK'); // ยกเลิกถ้าพัง
+        console.error("Add Leader Error:", error);
         res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการเพิ่มข้อมูล' });
     } finally {
         client.release();
