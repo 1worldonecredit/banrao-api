@@ -1091,12 +1091,9 @@ app.get('/api/search-citizen/:citizenId', async (req, res) => {
     }
 });
 
-// ==========================================
-// API: ดึงข้อมูลผู้นำชุมชนทั้งหมดในหมู่บ้าน (แยกตามคณะทำงาน)
-// ==========================================
 app.get('/api/community-leaders/:villageId', async (req, res) => {
     const { villageId } = req.params;
-    const { term_date, committee_id } = req.query; // 🌟 รับ committee_id มาด้วย
+    const { term_date, committee_id } = req.query;
 
     const client = await pgPool.connect(); 
     try {
@@ -1109,6 +1106,7 @@ app.get('/api/community-leaders/:villageId', async (req, res) => {
                 up.start_date,
                 up.end_date,
                 up.responsibilities,
+                up.parent_id, /* 🌟 สำคัญ: ดึง parent_id ออกมาด้วย */
                 p.first_name,
                 p.last_name,
                 cpm.image_url as user_image
@@ -1123,7 +1121,6 @@ app.get('/api/community-leaders/:villageId', async (req, res) => {
         const queryParams = [villageId];
         let paramIndex = 2;
 
-        // 🌟 กรองตามคณะทำงาน (ถ้ามีการระบุมา)
         if (committee_id) {
             query += ` AND up.committee_id = $${paramIndex}`;
             queryParams.push(committee_id);
@@ -1235,83 +1232,35 @@ app.get('/api/community-committees/:villageId', async (req, res) => {
         res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการดึงข้อมูลคณะทำงาน' });
     }
 });
-// ==========================================
-// API: บันทึกข้อมูลผู้นำชุมชน (แบบ Dynamic รองรับการสร้างตำแหน่งใหม่)
-// ==========================================
+
 app.post('/api/community-leaders', async (req, res) => {
-    const { 
-        village_id, 
-        position_id,      // รับมาจาก Frontend แต่อาจจะเป็นค่าที่ยังไม่มีใน Database
-        position_name,    // ชื่อตำแหน่งที่ผู้ใช้คีย์เข้ามาเอง
-        account_id, 
-        start_date, 
-        end_date, 
-        responsibilities 
-    } = req.body;
+    const { village_id, committee_id, position_name, account_id, start_date, end_date, responsibilities, parent_id } = req.body; // 🌟 เพิ่มรับค่า parent_id
 
     const client = await pgPool.connect();
-    
     try {
-        await client.query('BEGIN'); // เริ่ม Transaction
+        await client.query('BEGIN'); 
 
-        // 1. ตรวจสอบและสร้างตำแหน่งใหม่ (ถ้าจำเป็น)
-        let currentPositionId = position_id;
-
-        // ถ้าไม่มี position_id หรือ ระบบฟ้องว่าไม่มี ID 12 ให้เราจัดการตรงนี้
-        if (!currentPositionId || currentPositionId === 12) { 
-            // ค้นหาตำแหน่งที่มีชื่อตรงกับที่คีย์เข้ามา
-            const findPosQuery = 'SELECT position_id FROM sys_positions WHERE position_name = $1 LIMIT 1';
-            const posResult = await client.query(findPosQuery, [position_name]);
-
-            if (posResult.rows.length > 0) {
-                // เจอตำแหน่งนี้แล้ว ใช้ ID เดิม
-                currentPositionId = posResult.rows[0].position_id;
-            } else {
-                // ยังไม่มีตำแหน่งนี้ ให้สร้างใหม่
-                // หา ID ล่าสุด + 1 มาใช้
-                const maxIdResult = await client.query('SELECT COALESCE(MAX(position_id), 0) + 1 as next_id FROM sys_positions WHERE position_id < 999');
-                currentPositionId = maxIdResult.rows[0].next_id;
-
-                const createPosQuery = `
-                    INSERT INTO sys_positions (position_id, position_name, position_level) 
-                    VALUES ($1, $2, 'VILLAGE') 
-                    RETURNING position_id
-                `;
-                await client.query(createPosQuery, [currentPositionId, position_name]);
-            }
+        let currentPositionId = null;
+        const posResult = await client.query('SELECT position_id FROM sys_positions WHERE position_name = $1 LIMIT 1', [position_name]);
+        if (posResult.rows.length > 0) currentPositionId = posResult.rows[0].position_id;
+        else {
+            const maxIdResult = await client.query('SELECT COALESCE(MAX(position_id), 0) + 1 as next_id FROM sys_positions WHERE position_id < 999');
+            currentPositionId = maxIdResult.rows[0].next_id;
+            await client.query(`INSERT INTO sys_positions (position_id, position_name, position_level) VALUES ($1, $2, 'VILLAGE')`, [currentPositionId, position_name]);
         }
 
-        // 2. บันทึกข้อมูลผู้นำลงใน user_positions
         const insertQuery = `
             INSERT INTO user_positions (
-                account_id, 
-                position_id, 
-                scope_type, 
-                scope_id, 
-                start_date, 
-                end_date, 
-                responsibilities,
-                is_active
-            ) 
-            VALUES ($1, $2, $3, $4, $5, $6, $7, true)
-            RETURNING id
+                account_id, position_id, scope_type, scope_id, start_date, end_date, responsibilities, is_active, committee_id, parent_id
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, true, $8, $9) RETURNING id
         `;
         
-        const values = [
-            account_id, 
-            currentPositionId, // 🌟 ใช้ ID ที่หาได้หรือสร้างใหม่ 🌟
-            'VILLAGE',         
-            village_id,        
-            start_date, 
-            end_date || null, 
-            responsibilities
-        ];
-
-        await client.query(insertQuery, values);
+        await client.query(insertQuery, [
+            account_id, currentPositionId, 'VILLAGE', village_id, start_date, end_date || null, responsibilities, committee_id, parent_id || null // 🌟 บันทึก parent_id
+        ]);
 
         await client.query('COMMIT'); 
-        res.json({ success: true, message: 'เพิ่มข้อมูลผู้นำสำเร็จ' });
-
+        res.json({ success: true, message: 'เพิ่มข้อมูลสำเร็จ' });
     } catch (error) {
         await client.query('ROLLBACK'); 
         console.error("Add Leader Error:", error);
