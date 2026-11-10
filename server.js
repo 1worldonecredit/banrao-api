@@ -1051,37 +1051,42 @@ app.get('/api/positions', async (req, res) => {
 });
 
 // ==========================================
-// API: ค้นหาข้อมูลลูกบ้านด้วยเลขบัตรประชาชน
+// API: ค้นหาข้อมูลลูกบ้านด้วยเลขบัตรประชาชน (แบบละเอียด)
 // ==========================================
 app.get('/api/search-citizen/:citizenId', async (req, res) => {
     const { citizenId } = req.params;
     
-    // พิมพ์ค่า citizenId ออกมาดูใน Log ของ Railway เพื่อความชัวร์
-    console.log("กำลังค้นหาเลขบัตรประชาชน:", citizenId); 
+    console.log("กำลังค้นหาเลขบัตรประชาชน (ละเอียด):", citizenId); 
     
-    const client = await pgPool.connect(); // ใช้ pgPool.connect() ตามที่คุณเคยใช้
+    const client = await pgPool.connect(); 
     
     try {
-        // ใช้ TRIM() เพื่อตัดช่องว่างเผื่อมีติดมา และแปลงเป็น TEXT เพื่อเปรียบเทียบอย่างถูกต้อง
         const result = await client.query(`
             SELECT 
-                profile_id as account_id, -- ส่งกลับในชื่อ account_id เพื่อให้ฝั่ง React ใช้งานต่อได้ง่าย
-                first_name, 
-                last_name,
-                citizen_id 
-            FROM user_profiles 
-            WHERE TRIM(citizen_id::TEXT) = TRIM($1::TEXT)
+                p.profile_id as account_id,
+                p.first_name, 
+                p.last_name,
+                p.citizen_id,
+                v.village_name,          -- 🌟 ดึงชื่อหมู่บ้าน
+                t.tambon_name_th,        -- 🌟 ดึงชื่อตำบล
+                cpm.image_url as user_image, -- 🌟 ดึงรูปโปรไฟล์
+                o.occupation_name as responsibilities -- 🌟 ดึงหน้าที่/อาชีพปัจจุบัน (ถ้ามี)
+            FROM user_profiles p
+            LEFT JOIN user_accounts a ON p.profile_id = a.profile_id
+            LEFT JOIN villages v ON a.village_id = v.village_id
+            LEFT JOIN sys_tambons t ON v.tambon_id = t.tambon_id
+            LEFT JOIN citizen_profiles_media cpm ON p.profile_id = cpm.profile_id AND cpm.is_active = true
+            LEFT JOIN sys_occupations o ON a.occupation_id = o.occupation_id
+            WHERE TRIM(p.citizen_id::TEXT) = TRIM($1::TEXT)
         `, [citizenId]);
 
         if (result.rows.length > 0) {
-            // ถ้าค้นหาเจอ ส่งข้อมูลกลับไป
             res.json({ success: true, data: result.rows[0] });
         } else {
-            // ถ้าไม่เจอ
             res.json({ success: false, message: 'ไม่พบข้อมูลลูกบ้านจากเลขบัตรประชาชนนี้' });
         }
     } catch (error) {
-        console.error("Search Citizen Error:", error);
+        console.error("Search Citizen Detail Error:", error);
         res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการค้นหาข้อมูล' });
     } finally {
         client.release();
