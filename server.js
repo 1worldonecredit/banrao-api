@@ -1092,34 +1092,32 @@ app.get('/api/search-citizen/:citizenId', async (req, res) => {
 });
 
 // ==========================================
-// API: ดึงข้อมูลผังผู้นำชุมชน (กรองตามหมู่บ้าน และ วาระ)
+// API: ดึงข้อมูลผู้นำชุมชนทั้งหมดในหมู่บ้าน
 // ==========================================
 app.get('/api/community-leaders/:villageId', async (req, res) => {
     const { villageId } = req.params;
-    const { term_date } = req.query; 
-    
-    const client = await pgPool.connect();
-    try {
-        let query = `
-            SELECT 
-                up.id as position_record_id,
-                up.account_id,
-                up.start_date,
-                up.end_date,
-                up.responsibilities,
-                sp.position_name,
-                sp.position_level,
-                -- เปลี่ยนมาดึงข้อมูลจากตาราง user_profiles (ใช้ alias 'prof')
-                prof.first_name,
-                prof.last_name,
-                prof.user_image  -- หมายเหตุ: ถ้าใน DB คุณใช้ชื่อ profile_image ให้แก้คำนี้ด้วยนะครับ
-            FROM user_positions up
-            JOIN sys_positions sp ON up.position_id = sp.position_id
-            -- เปลี่ยน JOIN มาหาตาราง user_profiles แทน user_accounts
-            JOIN user_profiles prof ON up.account_id = prof.account_id
-            WHERE up.scope_type = 'VILLAGE' 
-              AND up.scope_id::text = $1
-        `;
+    const { term_date } = req.query;
+
+    let query = `
+        SELECT 
+            up.id as position_record_id,
+            up.account_id,
+            up.position_id,
+            sp.position_name,
+            up.start_date,
+            up.end_date,
+            up.responsibilities,
+            up.parent_id, /* 🌟 สำคัญ: ถ้าในตารางคุณมีคอลัมน์เก็บ ID ของคนที่เป็นหัวหน้า (parent_id) ให้ดึงมาด้วย */
+            p.first_name,
+            p.last_name,
+            cpm.image_url as user_image
+        FROM user_positions up
+        JOIN sys_positions sp ON up.position_id = sp.position_id
+        JOIN user_accounts a ON up.account_id = a.account_id
+        JOIN user_profiles p ON a.profile_id = p.profile_id
+        LEFT JOIN citizen_profiles_media cpm ON p.profile_id = cpm.profile_id AND cpm.is_active = true
+        WHERE up.scope_type = 'VILLAGE' AND up.scope_id = $1 AND up.is_active = true
+    `;
         
         const queryParams = [villageId];
 
