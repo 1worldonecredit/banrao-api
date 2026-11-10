@@ -1183,6 +1183,25 @@ app.get('/api/search-citizen/:citizenId', async (req, res) => {
     }
 });
 
+
+// 🌟 API ดึงข้อมูลกลุ่มเมนู (เพิ่มใหม่)
+app.get('/api/menu-groups', async (req, res) => {
+    const client = await pgPool.connect();
+    try {
+        const result = await client.query(`
+            SELECT group_id, group_name 
+            FROM sys_menu_groups 
+            ORDER BY display_order ASC
+        `);
+        res.json({ success: true, data: result.rows });
+    } catch (error) {
+        console.error("Fetch Menu Groups Error:", error);
+        res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการดึงกลุ่มเมนู' });
+    } finally {
+        client.release();
+    }
+});
+
 app.listen(port, () => {
     console.log(`Server is running on port ${port}`);
 });
