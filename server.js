@@ -1050,33 +1050,39 @@ app.get('/api/positions', async (req, res) => {
     }
 });
 
-
 // ==========================================
-// API: ค้นหาข้อมูลลูกบ้านด้วยเลขบัตรประชาชน (สำหรับการแต่งตั้งตำแหน่ง)
+// API: ค้นหาข้อมูลลูกบ้านด้วยเลขบัตรประชาชน
 // ==========================================
 app.get('/api/search-citizen/:citizenId', async (req, res) => {
     const { citizenId } = req.params;
-    const client = await pgPool.connect();
+    
+    // พิมพ์ค่า citizenId ออกมาดูใน Log ของ Railway เพื่อความชัวร์
+    console.log("กำลังค้นหาเลขบัตรประชาชน:", citizenId); 
+    
+    const client = await pgPool.connect(); // ใช้ pgPool.connect() ตามที่คุณเคยใช้
     
     try {
+        // ใช้ TRIM() เพื่อตัดช่องว่างเผื่อมีติดมา และแปลงเป็น TEXT เพื่อเปรียบเทียบอย่างถูกต้อง
         const result = await client.query(`
             SELECT 
-                account_id, 
+                profile_id as account_id, -- ส่งกลับในชื่อ account_id เพื่อให้ฝั่ง React ใช้งานต่อได้ง่าย
                 first_name, 
-                last_name, 
-                user_image 
+                last_name,
+                citizen_id 
             FROM user_profiles 
-            WHERE citizen_id = $1 -- สมมติว่าคอลัมน์เก็บเลขบัตรชื่อ citizen_id
+            WHERE TRIM(citizen_id::TEXT) = TRIM($1::TEXT)
         `, [citizenId]);
 
         if (result.rows.length > 0) {
+            // ถ้าค้นหาเจอ ส่งข้อมูลกลับไป
             res.json({ success: true, data: result.rows[0] });
         } else {
-            res.json({ success: false, message: 'ไม่พบข้อมูลลูกบ้านจากเลขบัตรนี้' });
+            // ถ้าไม่เจอ
+            res.json({ success: false, message: 'ไม่พบข้อมูลลูกบ้านจากเลขบัตรประชาชนนี้' });
         }
     } catch (error) {
         console.error("Search Citizen Error:", error);
-        res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการค้นหา' });
+        res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการค้นหาข้อมูล' });
     } finally {
         client.release();
     }
