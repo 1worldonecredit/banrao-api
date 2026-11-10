@@ -1171,13 +1171,13 @@ app.put('/api/community-leaders/:recordId', async (req, res) => {
 });
 
 // ==========================================
-// API: บันทึกข้อมูลผู้นำชุมชน (แก้ไขให้ตรงกับโครงสร้าง Database)
+// API: บันทึกข้อมูลผู้นำชุมชน (แบบ Dynamic รองรับการสร้างตำแหน่งใหม่)
 // ==========================================
 app.post('/api/community-leaders', async (req, res) => {
     const { 
         village_id, 
-        position_id, 
-        position_name, // กรณี Dynamic Mind Map ที่ส่งชื่อตำแหน่งมาเอง
+        position_id,      // รับมาจาก Frontend แต่อาจจะเป็นค่าที่ยังไม่มีใน Database
+        position_name,    // ชื่อตำแหน่งที่ผู้ใช้คีย์เข้ามาเอง
         account_id, 
         start_date, 
         end_date, 
@@ -1189,8 +1189,34 @@ app.post('/api/community-leaders', async (req, res) => {
     try {
         await client.query('BEGIN'); // เริ่ม Transaction
 
-        // 🌟 แก้ไข: แปลง village_id ให้เป็น scope_type และ scope_id
-        // สมมติว่าหมู่บ้านใช้ scope_type = 'VILLAGE' และ scope_id = village_id
+        // 1. ตรวจสอบและสร้างตำแหน่งใหม่ (ถ้าจำเป็น)
+        let currentPositionId = position_id;
+
+        // ถ้าไม่มี position_id หรือ ระบบฟ้องว่าไม่มี ID 12 ให้เราจัดการตรงนี้
+        if (!currentPositionId || currentPositionId === 12) { 
+            // ค้นหาตำแหน่งที่มีชื่อตรงกับที่คีย์เข้ามา
+            const findPosQuery = 'SELECT position_id FROM sys_positions WHERE position_name = $1 LIMIT 1';
+            const posResult = await client.query(findPosQuery, [position_name]);
+
+            if (posResult.rows.length > 0) {
+                // เจอตำแหน่งนี้แล้ว ใช้ ID เดิม
+                currentPositionId = posResult.rows[0].position_id;
+            } else {
+                // ยังไม่มีตำแหน่งนี้ ให้สร้างใหม่
+                // หา ID ล่าสุด + 1 มาใช้
+                const maxIdResult = await client.query('SELECT COALESCE(MAX(position_id), 0) + 1 as next_id FROM sys_positions WHERE position_id < 999');
+                currentPositionId = maxIdResult.rows[0].next_id;
+
+                const createPosQuery = `
+                    INSERT INTO sys_positions (position_id, position_name, position_level) 
+                    VALUES ($1, $2, 'VILLAGE') 
+                    RETURNING position_id
+                `;
+                await client.query(createPosQuery, [currentPositionId, position_name]);
+            }
+        }
+
+        // 2. บันทึกข้อมูลผู้นำลงใน user_positions
         const insertQuery = `
             INSERT INTO user_positions (
                 account_id, 
@@ -1208,9 +1234,9 @@ app.post('/api/community-leaders', async (req, res) => {
         
         const values = [
             account_id, 
-            position_id || 12, // ถ้าไม่ส่งมาให้ใช้ ID 12 (เจ้าหน้าที่อื่นๆ)
-            'VILLAGE',         // scope_type
-            village_id,        // scope_id
+            currentPositionId, // 🌟 ใช้ ID ที่หาได้หรือสร้างใหม่ 🌟
+            'VILLAGE',         
+            village_id,        
             start_date, 
             end_date || null, 
             responsibilities
@@ -1218,11 +1244,11 @@ app.post('/api/community-leaders', async (req, res) => {
 
         await client.query(insertQuery, values);
 
-        await client.query('COMMIT'); // ยืนยันการบันทึก
+        await client.query('COMMIT'); 
         res.json({ success: true, message: 'เพิ่มข้อมูลผู้นำสำเร็จ' });
 
     } catch (error) {
-        await client.query('ROLLBACK'); // ยกเลิกถ้าพัง
+        await client.query('ROLLBACK'); 
         console.error("Add Leader Error:", error);
         res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการเพิ่มข้อมูล' });
     } finally {
