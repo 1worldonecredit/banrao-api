@@ -277,16 +277,20 @@ app.get('/api/tambons', async (req, res) => {
     }
 });
 
-// 1. ดึงข้อมูลเมนูทั้งหมด (GET)
 app.get('/api/menus', async (req, res) => {
+  // เรียกใช้ตัวเชื่อมต่อฐานข้อมูลให้เหมือนกับ API อื่นๆ
+  const client = await pgPool.connect(); 
   try {
-    const result = await pool.query(
+    const result = await client.query(
       'SELECT * FROM sys_menus ORDER BY display_order ASC, menu_id ASC'
     );
     res.json({ success: true, data: result.rows });
   } catch (err) {
     console.error("Error Fetching Menus:", err);
     res.status(500).json({ success: false, message: "ไม่สามารถดึงข้อมูลได้" });
+  } finally {
+    // อย่าลืมคืน connection
+    client.release();
   }
 });
 
