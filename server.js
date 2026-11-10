@@ -1052,16 +1052,15 @@ app.get('/api/positions', async (req, res) => {
 
 
 // ==========================================
-// API: ค้นหาข้อมูลลูกบ้านด้วยเลขบัตรประชาชน (แก้ไขให้ปลอดภัย 100%)
+// API: ค้นหาข้อมูลลูกบ้านด้วยเลขบัตรประชาชน
 // ==========================================
 app.get('/api/search-citizen/:citizenId', async (req, res) => {
     const { citizenId } = req.params;
     
     try {
-        // ใช้ pgPool.query ตรงๆ เหมือนที่คุณใช้ใน API Login จะได้ไม่เกิด Error
         const result = await pgPool.query(`
             SELECT 
-               a.account_id,
+                a.account_id,    /* 🌟 แก้ตรงนี้: เปลี่ยนจาก p.profile_id เป็น a.account_id ของจริง */
                 p.first_name, 
                 p.last_name,
                 p.citizen_id,
@@ -1078,14 +1077,16 @@ app.get('/api/search-citizen/:citizenId', async (req, res) => {
             WHERE TRIM(p.citizen_id::TEXT) = TRIM($1::TEXT)
         `, [citizenId]);
 
-        if (result.rows.length > 0) {
+        if (result.rows.length > 0 && result.rows[0].account_id) {
             res.json({ success: true, data: result.rows[0] });
+        } else if (result.rows.length > 0 && !result.rows[0].account_id) {
+            // กรณีมีชื่อในระบบทะเบียนราษฎร์ แต่ยังไม่เคยสมัครสมาชิก (ไม่มีบัญชี)
+            res.status(404).json({ success: false, message: 'บุคคลนี้ยังไม่มีบัญชีผู้ใช้งานในระบบ' });
         } else {
             res.status(404).json({ success: false, message: 'ไม่พบข้อมูลลูกบ้านจากเลขบัตรประชาชนนี้' });
         }
     } catch (error) {
         console.error("Search Citizen Error:", error);
-        // ถ้าขึ้นบรรทัดนี้ แสดงว่าชื่อ Column ในตารางบางอันอาจจะไม่ตรงกับใน Database
         res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการค้นหาข้อมูล' });
     }
 });
