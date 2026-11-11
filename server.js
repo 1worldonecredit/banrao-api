@@ -1399,6 +1399,53 @@ app.delete('/api/community-committees/:id', async (req, res) => {
     }
 });
 
+// ==========================================
+// 🌟 API แต่งตั้งตำแหน่ง (เช่น แต่งตั้งผู้ใหญ่บ้าน)
+// ==========================================
+app.post('/api/assign-role', async (req, res) => {
+    const { 
+        target_account_id, // รหัสบัญชีประชาชนที่จะถูกแต่งตั้ง
+        position_id,       // ID ตำแหน่ง (เช่น 6 = ผู้ใหญ่บ้าน)
+        scope_type,        // 'VILLAGE'
+        scope_id,          // ID ของหมู่บ้าน
+        assigner_account_id // รหัสบัญชีของคนแต่งตั้ง (เช่น นายอำเภอ) เพื่อเก็บ Log
+    } = req.body;
+
+    if (!target_account_id || !position_id || !scope_type || !scope_id) {
+        return res.status(400).json({ success: false, message: 'ข้อมูลไม่ครบถ้วน' });
+    }
+
+    try {
+        await pgPool.query('BEGIN'); // เริ่ม Transaction
+
+        // 1. เพิ่มข้อมูลการรับตำแหน่งลงใน user_positions
+        const insertPositionQuery = `
+            INSERT INTO user_positions (account_id, position_id, scope_type, scope_id, start_date)
+            VALUES ($1, $2, $3, $4, CURRENT_DATE)
+            RETURNING id;
+        `;
+        await pgPool.query(insertPositionQuery, [target_account_id, position_id, scope_type, scope_id]);
+
+        // 2. ถ้าเป็นการแต่งตั้ง "ผู้ใหญ่บ้าน" (scope_type = 'VILLAGE') ให้อัปเดตตาราง villages ด้วย
+        if (scope_type === 'VILLAGE') {
+            const updateVillageQuery = `
+                UPDATE villages 
+                SET headman_account_id = $1 
+                WHERE village_id = $2;
+            `;
+            await pgPool.query(updateVillageQuery, [target_account_id, scope_id]);
+        }
+
+        await pgPool.query('COMMIT');
+        res.json({ success: true, message: 'แต่งตั้งตำแหน่งสำเร็จ' });
+
+    } catch (error) {
+        await pgPool.query('ROLLBACK');
+        console.error('Error assigning role:', error);
+        res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการแต่งตั้งตำแหน่ง' });
+    }
+});
+
 app.listen(port, () => {
     console.log(`Server is running on port ${port}`);
 });
