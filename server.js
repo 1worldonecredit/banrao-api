@@ -1464,6 +1464,33 @@ app.post('/api/assign-role', async (req, res) => {
     }
 });
 
+// ==========================================
+// 🌟 API ดึงรายการหมู่บ้านทั้งหมดสำหรับให้เลือกตอนแต่งตั้ง
+// ==========================================
+app.get('/api/villages-list', async (req, res) => {
+    try {
+        // ดึงข้อมูลหมู่บ้านทั้งหมด (ในระบบจริงอาจจะกรองตามตำบล/อำเภอของนายอำเภอที่กำลังล็อกอิน)
+        const query = `
+            SELECT village_id, village_no, village_name 
+            FROM villages 
+            ORDER BY village_no ASC;
+        `;
+        const result = await pgPool.query(query);
+        
+        // จัด Format ข้อมูลส่งกลับไปให้ Frontend
+        const formattedVillages = result.rows.map(v => ({
+            village_id: v.village_id,
+            name: `${v.village_no} ${v.village_name}`
+        }));
+
+        res.json({ success: true, data: formattedVillages });
+    } catch (error) {
+        console.error('Error fetching villages list:', error);
+        res.status(500).json({ success: false, message: 'ไม่สามารถดึงข้อมูลหมู่บ้านได้' });
+    }
+});
+
+
 
 app.listen(port, () => {
     console.log(`Server is running on port ${port}`);
