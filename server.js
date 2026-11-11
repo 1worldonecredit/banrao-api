@@ -13,6 +13,10 @@ const app = express();
 const bcrypt = require('bcrypt');
 // เปิดใช้งาน CORS เพื่อให้ Frontend (พอร์ต 5173) เรียกใช้งานได้
 
+
+
+
+// ------------------------------
 // ตั้งค่า Secret Key สำหรับสร้าง Token (ในระบบจริงควรเก็บไว้ในไฟล์ .env)
 const JWT_SECRET = process.env.JWT_SECRET || 'mySuperSecretKeyForBookingApp2026';
 app.use(cors());
@@ -1317,6 +1321,25 @@ app.get('/api/menu-groups', async (req, res) => {
         res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการดึงกลุ่มเมนู' });
     } finally {
         client.release();
+    }
+});
+
+
+// ดึงรายการคณะทำงานของหมู่บ้านนั้นๆ
+app.get('/api/committees', async (req, res) => {
+    // สมมติว่าดึง village_id จาก token ที่แนบมา หรือจาก req.query
+    const { village_id } = req.query; 
+
+    try {
+        const query = `
+            SELECT * FROM community_committees 
+            WHERE village_id = $1 
+            ORDER BY created_at ASC
+        `;
+        const result = await pgPool.query(query, [village_id]);
+        res.json(result.rows);
+    } catch (error) {
+        res.status(500).json({ error: error.message });
     }
 });
 
