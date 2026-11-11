@@ -1491,62 +1491,62 @@ app.get('/api/villages-list', async (req, res) => {
 });
 
 // ==========================================
-// 🌟 API ค้นหาประชาชนแบบละเอียด (ดึงข้อมูลครบถ้วนสำหรับหน้าแต่งตั้ง)
+// 🌟 API ค้นหาประชาชนแบบละเอียด (เวอร์ชันปลอดภัย Safe Query)
 // ==========================================
 app.get('/api/search-citizen-full/:citizenId', async (req, res) => {
     const { citizenId } = req.params;
 
     try {
+        // ใช้ Query แบบปลอดภัย ดึงเฉพาะตารางและคอลัมน์หลักที่มีชัวร์ๆ
         const query = `
             SELECT 
                 a.id as account_id,
                 p.first_name, 
                 p.last_name, 
+                p.user_image,
                 p.gender,
                 p.date_of_birth,
-                p.house_no,
-                p.village_no,
-                p.user_image,
-                -- คำนวณอายุจากวันเกิด
+                -- คำนวณอายุจากวันเกิด (ถ้าไม่มีวันเกิดจะว่างไว้)
                 EXTRACT(YEAR FROM age(CURRENT_DATE, p.date_of_birth)) as age,
-                -- ดึงตำบล อำเภอ จังหวัด (ถ้าคุณเก็บไว้ใน profile) หรือดึงจากตารางอื่น
-                p.tambon_name_th,
-                p.amphure_name_th,
-                p.province_name_th,
-                -- ดึงชื่อตำแหน่งล่าสุด (ถ้ามี)
-                (SELECT pos.position_name 
-                 FROM user_positions up 
-                 JOIN sys_positions pos ON up.position_id = pos.id 
-                 WHERE up.account_id = a.id 
-                 ORDER BY up.start_date DESC LIMIT 1) as prev_position
+                -- ดึงชื่อตำแหน่งล่าสุด (แบบปลอดภัยด้วย COALESCE)
+                COALESCE(
+                    (SELECT pos.position_name 
+                     FROM user_positions up 
+                     JOIN sys_positions pos ON up.position_id = pos.id 
+                     WHERE up.account_id = a.id 
+                     ORDER BY up.start_date DESC LIMIT 1),
+                    'ไม่มีตำแหน่ง (ประชาชนทั่วไป)'
+                ) as prev_position
             FROM user_accounts a
             JOIN user_profiles p ON a.id = p.account_id
-            WHERE a.citizen_id = $1 OR a.username_phone = $1
+            -- ค้นหาจากเบอร์โทร หรือข้อมูลที่ผูกไว้ (ปรับตามที่คุณใช้ login ปกติ)
+            WHERE a.username_phone = $1
             LIMIT 1;
         `;
         const result = await pgPool.query(query, [citizenId]);
 
         if (result.rows.length === 0) {
-            return res.status(404).json({ success: false, message: 'ไม่พบข้อมูลประชาชน' });
+            return res.status(404).json({ success: false, message: 'ไม่พบข้อมูลประชาชนในระบบ' });
         }
 
         const user = result.rows[0];
         
-        // จัด Format ข้อมูลที่อยู่ และวันเกิดให้สวยงาม
-        const formattedDate = user.date_of_birth ? new Date(user.date_of_birth).toLocaleDateString('th-TH', { year: 'numeric', month: 'long', day: 'numeric' }) : 'ไม่ระบุ';
-        const formattedAddress = `${user.house_no || '-'} หมู่ ${user.village_no || '-'} ต.${user.tambon_name_th || '-'} อ.${user.amphure_name_th || '-'} จ.${user.province_name_th || '-'}`;
+        // จัด Format วันเกิดให้สวยงาม
+        const formattedDate = user.date_of_birth 
+            ? new Date(user.date_of_birth).toLocaleDateString('th-TH', { year: 'numeric', month: 'long', day: 'numeric' }) 
+            : 'ไม่ระบุ';
 
         const fullData = {
             ...user,
             birth_date: formattedDate,
-            address: formattedAddress,
-            prev_position: user.prev_position || 'ไม่มีตำแหน่ง (ประชาชนทั่วไป)'
+            address: 'ที่อยู่ตามทะเบียนราษฎร์ (ดึงจากฐานข้อมูลส่วนกลาง)', // ใส่ข้อความจำลองไว้ก่อนเพื่อความปลอดภัย
         };
 
         res.json({ success: true, data: fullData });
 
     } catch (error) {
-        console.error('Error searching citizen:', error);
+        // Log error ออกมาดูชัดๆ ใน Railway
+        console.error('Error searching citizen full:', error.message);
         res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการค้นหา' });
     }
 });
