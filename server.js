@@ -1343,6 +1343,46 @@ app.get('/api/committees', async (req, res) => {
     }
 });
 
+app.put('/api/committees/:id', async (req, res) => {
+    const { id } = req.params;
+    const { committee_name, description } = req.body;
+
+    try {
+        const query = `
+            UPDATE community_committees 
+            SET committee_name = $1, description = $2, updated_at = CURRENT_TIMESTAMP
+            WHERE committee_id = $3
+            RETURNING *
+        `;
+        const result = await pgPool.query(query, [committee_name, description, id]);
+        res.json({ message: 'อัปเดตสำเร็จ', committee: result.rows[0] });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.delete('/api/committees/:id', async (req, res) => {
+    const { id } = req.params;
+    
+    // ข้อควรระวัง: ต้องลบหรือจัดการข้อมูลใน user_positions ที่ผูกกับ committee_id นี้ก่อน
+    // แนะนำให้ใช้ ON DELETE CASCADE ใน Database หรือลบแบบ manual ในโค้ด
+    try {
+        await pgPool.query('BEGIN'); // เริ่ม Transaction
+        
+        // ทางเลือกที่ 1: ลบคนออกจากผังของคณะนี้ด้วย
+        await pgPool.query('DELETE FROM user_positions WHERE committee_id = $1', [id]);
+        
+        // ทางเลือกที่ 2: ลบตัวคณะทำงาน
+        await pgPool.query('DELETE FROM community_committees WHERE committee_id = $1', [id]);
+        
+        await pgPool.query('COMMIT');
+        res.json({ message: 'ลบคณะทำงานและข้อมูลที่เกี่ยวข้องสำเร็จ' });
+    } catch (error) {
+        await pgPool.query('ROLLBACK');
+        res.status(500).json({ error: error.message });
+    }
+});
+
 app.listen(port, () => {
     console.log(`Server is running on port ${port}`);
 });
