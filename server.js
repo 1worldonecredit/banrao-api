@@ -1491,33 +1491,36 @@ app.get('/api/villages-list', async (req, res) => {
 });
 
 // ==========================================
-// 🌟 API ค้นหาประชาชนแบบละเอียด (Safe Query Version 3 - ดึงจาก Profile โดยตรง)
+// 🌟 API ค้นหาประชาชนแบบละเอียด (ใช้โครงสร้างเดียวกับ Login ของคุณ 100%)
 // ==========================================
 app.get('/api/search-citizen-full/:citizenId', async (req, res) => {
     const { citizenId } = req.params;
 
     try {
-        // ดึงจากตาราง user_profiles เป็นหลักไปเลย ลดปัญหาการ Join ผิดคอลัมน์
         const query = `
             SELECT 
-                account_id, 
-                first_name, 
-                last_name, 
-                user_image,
-                gender,
-                date_of_birth,
-                EXTRACT(YEAR FROM age(CURRENT_DATE, date_of_birth)) as age,
-                COALESCE(
-                    (SELECT pos.position_name 
-                     FROM user_positions up 
-                     JOIN sys_positions pos ON up.position_id = pos.id 
-                     WHERE up.account_id = user_profiles.account_id 
-                     ORDER BY up.start_date DESC LIMIT 1),
-                    'ไม่มีตำแหน่ง (ประชาชนทั่วไป)'
-                ) as prev_position
-            FROM user_profiles 
-            -- ค้นหาโดยเช็คจากเบอร์โทร (แก้เป็น citizen_id ได้ถ้าคุณเก็บเป็นเลขบัตร)
-            WHERE phone_number = $1 OR account_id::text = $1
+                a.account_id, 
+                p.first_name, 
+                p.last_name, 
+                p.gender,
+                p.dob,
+                p.house_no,
+                EXTRACT(YEAR FROM age(CURRENT_DATE, p.dob)) as age_years,
+                cpm.image_url AS user_image,
+                t.tambon_name_th, 
+                am.amphure_name_th, 
+                pr.province_name_th,
+                pos.position_name as prev_position
+            FROM user_accounts a
+            LEFT JOIN user_profiles p ON a.profile_id = p.profile_id
+            LEFT JOIN villages v ON a.village_id = v.village_id
+            LEFT JOIN sys_tambons t ON v.tambon_id = t.tambon_id
+            LEFT JOIN sys_amphures am ON t.amphure_id = am.amphure_id
+            LEFT JOIN sys_provinces pr ON am.province_id = pr.province_id
+            LEFT JOIN citizen_profiles_media cpm ON p.profile_id = cpm.profile_id AND cpm.is_active = true
+            LEFT JOIN user_positions up ON a.account_id = up.account_id AND up.is_active = TRUE AND (up.end_date IS NULL OR up.end_date >= CURRENT_DATE)
+            LEFT JOIN sys_positions pos ON up.position_id = pos.position_id
+            WHERE a.username_phone = $1
             LIMIT 1;
         `;
         const result = await pgPool.query(query, [citizenId]);
@@ -1528,14 +1531,22 @@ app.get('/api/search-citizen-full/:citizenId', async (req, res) => {
 
         const user = result.rows[0];
         
-        const formattedDate = user.date_of_birth 
-            ? new Date(user.date_of_birth).toLocaleDateString('th-TH', { year: 'numeric', month: 'long', day: 'numeric' }) 
-            : 'ไม่ระบุ';
+        // แปลงวันที่เกิดและจัดรูปแบบที่อยู่
+        const daysTh = ['อาทิตย์', 'จันทร์', 'อังคาร', 'พุธ', 'พฤหัสบดี', 'ศุกร์', 'เสาร์'];
+        const birthDate = user.dob ? new Date(user.dob) : null;
+        const formattedDate = birthDate ? birthDate.toLocaleDateString('th-TH', { year: 'numeric', month: 'long', day: 'numeric' }) : 'ไม่ระบุ';
+        const formattedAddress = `บ้านเลขที่ ${user.house_no || '-'} ต.${user.tambon_name_th || '-'} อ.${user.amphure_name_th || '-'} จ.${user.province_name_th || '-'}`;
 
         const fullData = {
-            ...user,
+            account_id: user.account_id,
+            first_name: user.first_name,
+            last_name: user.last_name,
+            gender: user.gender === 'MALE' ? 'ชาย' : (user.gender === 'FEMALE' ? 'หญิง' : '-'),
+            age: user.age_years || 0,
             birth_date: formattedDate,
-            address: 'ที่อยู่ตามทะเบียนราษฎร์',
+            address: formattedAddress,
+            prev_position: user.prev_position || 'ไม่มีตำแหน่ง (ประชาชนทั่วไป)',
+            user_image: user.user_image || '/profile-img.jpg'
         };
 
         res.json({ success: true, data: fullData });
