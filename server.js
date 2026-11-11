@@ -1491,7 +1491,7 @@ app.get('/api/villages-list', async (req, res) => {
 });
 
 // ==========================================
-// 🌟 API ค้นหาประชาชนแบบละเอียด (แก้ไขชื่อคอลัมน์ a.account_id ให้ตรงกับ DB)
+// 🌟 API ค้นหาประชาชนแบบละเอียด (แก้ไขเงื่อนไข JOIN ให้ถูกต้อง)
 // ==========================================
 app.get('/api/search-citizen-full/:citizenId', async (req, res) => {
     const { citizenId } = req.params;
@@ -1499,7 +1499,7 @@ app.get('/api/search-citizen-full/:citizenId', async (req, res) => {
     try {
         const query = `
             SELECT 
-                a.account_id, -- 🌟 แก้ตรงนี้ (จาก a.id เป็น a.account_id)
+                a.account_id, 
                 p.first_name, 
                 p.last_name, 
                 p.user_image,
@@ -1510,12 +1510,14 @@ app.get('/api/search-citizen-full/:citizenId', async (req, res) => {
                     (SELECT pos.position_name 
                      FROM user_positions up 
                      JOIN sys_positions pos ON up.position_id = pos.id 
-                     WHERE up.account_id = a.account_id -- 🌟 แก้ตรงนี้ด้วย
+                     WHERE up.account_id = a.account_id 
                      ORDER BY up.start_date DESC LIMIT 1),
                     'ไม่มีตำแหน่ง (ประชาชนทั่วไป)'
                 ) as prev_position
             FROM user_accounts a
-            JOIN user_profiles p ON a.account_id = p.account_id -- 🌟 และแก้ตรงเงื่อนไข JOIN ตรงนี้
+            -- 🌟 แก้เงื่อนไข JOIN ตรงนี้ (สมมติว่า p.id เชื่อมกับ a.account_id)
+            -- หากตาราง user_profiles ใช้คอลัมน์อื่นในการเชื่อมโยง ให้แก้ไขตรงนี้ให้ตรงกัน
+            JOIN user_profiles p ON a.account_id = p.id 
             WHERE a.username_phone = $1
             LIMIT 1;
         `;
