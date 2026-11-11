@@ -1342,44 +1342,60 @@ app.get('/api/committees', async (req, res) => {
         res.status(500).json({ error: error.message });
     }
 });
-
-app.put('/api/committees/:id', async (req, res) => {
+// ==========================================
+// 🌟 API สำหรับแก้ไขชื่อ/รายละเอียดคณะทำงาน (PUT)
+// ==========================================
+app.put('/api/community-committees/:id', async (req, res) => {
     const { id } = req.params;
     const { committee_name, description } = req.body;
 
     try {
         const query = `
             UPDATE community_committees 
-            SET committee_name = $1, description = $2, updated_at = CURRENT_TIMESTAMP
-            WHERE committee_id = $3
-            RETURNING *
+            SET committee_name = $1, description = $2 
+            WHERE committee_id = $3 
+            RETURNING *;
         `;
         const result = await pgPool.query(query, [committee_name, description, id]);
-        res.json({ message: 'อัปเดตสำเร็จ', committee: result.rows[0] });
+        
+        if (result.rowCount === 0) {
+            return res.status(404).json({ success: false, message: 'ไม่พบข้อมูลคณะทำงานที่ต้องการแก้ไข' });
+        }
+
+        res.json({ success: true, message: 'แก้ไขข้อมูลสำเร็จ', data: result.rows[0] });
     } catch (error) {
-        res.status(500).json({ error: error.message });
+        console.error('Error updating committee:', error);
+        res.status(500).json({ success: false, message: error.message });
     }
 });
 
-app.delete('/api/committees/:id', async (req, res) => {
+// ==========================================
+// 🌟 API สำหรับลบคณะทำงาน (DELETE)
+// ==========================================
+app.delete('/api/community-committees/:id', async (req, res) => {
     const { id } = req.params;
-    
-    // ข้อควรระวัง: ต้องลบหรือจัดการข้อมูลใน user_positions ที่ผูกกับ committee_id นี้ก่อน
-    // แนะนำให้ใช้ ON DELETE CASCADE ใน Database หรือลบแบบ manual ในโค้ด
+
     try {
-        await pgPool.query('BEGIN'); // เริ่ม Transaction
-        
-        // ทางเลือกที่ 1: ลบคนออกจากผังของคณะนี้ด้วย
+        // ใช้ Transaction เพื่อความปลอดภัย (ลบข้อมูลบุคลากรในผังของคณะนี้ก่อน แล้วค่อยลบตัวคณะ)
+        await pgPool.query('BEGIN');
+
+        // 1. ลบความสัมพันธ์ตำแหน่งบุคลากรที่ผูกกับ committee_id นี้ก่อน (ป้องกันติด Foreign Key)
         await pgPool.query('DELETE FROM user_positions WHERE committee_id = $1', [id]);
-        
-        // ทางเลือกที่ 2: ลบตัวคณะทำงาน
-        await pgPool.query('DELETE FROM community_committees WHERE committee_id = $1', [id]);
-        
+
+        // 2. ลบตัวคณะทำงานออกจากตาราง
+        const result = await pgPool.query('DELETE FROM community_committees WHERE committee_id = $1 RETURNING *;', [id]);
+
+        if (result.rowCount === 0) {
+            await pgPool.query('ROLLBACK');
+            return res.status(404).json({ success: false, message: 'ไม่พบข้อมูลคณะทำงานที่ต้องการลบ' });
+        }
+
         await pgPool.query('COMMIT');
-        res.json({ message: 'ลบคณะทำงานและข้อมูลที่เกี่ยวข้องสำเร็จ' });
+        res.json({ success: true, message: 'ลบคณะทำงานสำเร็จ' });
     } catch (error) {
         await pgPool.query('ROLLBACK');
-        res.status(500).json({ error: error.message });
+        console.error('Error deleting committee:', error);
+        res.status(500).json({ success: false, message: error.message });
     }
 });
 
