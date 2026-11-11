@@ -1400,44 +1400,66 @@ app.delete('/api/community-committees/:id', async (req, res) => {
 });
 
 // ==========================================
-// 🌟 API แต่งตั้งตำแหน่ง (เช่น แต่งตั้งผู้ใหญ่บ้าน)
+// 🌟 API แต่งตั้งตำแหน่ง พร้อมตรวจสอบรหัสผ่านชุดที่ 2 (E-Signature) และรองรับ UUID
 // ==========================================
 app.post('/api/assign-role', async (req, res) => {
     const { 
-        target_account_id, // รหัสบัญชีประชาชนที่จะถูกแต่งตั้ง
-        position_id,       // ID ตำแหน่ง (เช่น 6 = ผู้ใหญ่บ้าน)
-        scope_type,        // 'VILLAGE'
-        scope_id,          // ID ของหมู่บ้าน
-        assigner_account_id // รหัสบัญชีของคนแต่งตั้ง (เช่น นายอำเภอ) เพื่อเก็บ Log
+        target_account_id, 
+        position_id, 
+        scope_type, 
+        scope_id, 
+        assigner_account_id, 
+        approval_pin // รับรหัสผ่านชุดที่ 2 มาจาก Frontend
     } = req.body;
 
-    if (!target_account_id || !position_id || !scope_type || !scope_id) {
+    // ตรวจสอบข้อมูลเบื้องต้น
+    if (!target_account_id || !assigner_account_id || !approval_pin) {
         return res.status(400).json({ success: false, message: 'ข้อมูลไม่ครบถ้วน' });
     }
 
     try {
-        await pgPool.query('BEGIN'); // เริ่ม Transaction
+        // 1. ตรวจสอบรหัสผ่านชุดที่ 2 ของผู้แต่งตั้ง (นายอำเภอ) จากตาราง user_e_signatures
+        const pinQuery = await pgPool.query('SELECT pin_hash FROM user_e_signatures WHERE account_id = $1', [assigner_account_id]);
+        if (pinQuery.rowCount === 0) {
+            return res.status(401).json({ success: false, message: 'คุณยังไม่ได้ตั้งค่ารหัสผ่านสำหรับอนุมัติ (รหัสชุดที่ 2)' });
+        }
 
-        // 1. เพิ่มข้อมูลการรับตำแหน่งลงใน user_positions
+        const isPinValid = await bcrypt.compare(approval_pin, pinQuery.rows[0].pin_hash);
+        if (!isPinValid) {
+            return res.status(401).json({ success: false, message: 'รหัสอนุมัติไม่ถูกต้อง' });
+        }
+
+        // 2. รหัสถูกต้อง เริ่มกระบวนการบันทึก (Transaction)
+        await pgPool.query('BEGIN');
+
+        // จัดการ scope_id ถ้าเป็น UUID ให้ใส่ null ในตาราง user_positions ก่อน (แก้ปัญหา invalid input syntax)
+        let finalScopeId = null;
+        if (scope_type === 'VILLAGE' && isNaN(scope_id)) {
+            finalScopeId = null; 
+        } else {
+            finalScopeId = scope_id;
+        }
+
+        // เพิ่มข้อมูลการรับตำแหน่งลงใน user_positions
         const insertPositionQuery = `
             INSERT INTO user_positions (account_id, position_id, scope_type, scope_id, start_date)
-            VALUES ($1, $2, $3, $4, CURRENT_DATE)
-            RETURNING id;
+            VALUES ($1, $2, $3, $4, CURRENT_DATE) RETURNING id;
         `;
-        await pgPool.query(insertPositionQuery, [target_account_id, position_id, scope_type, scope_id]);
+        await pgPool.query(insertPositionQuery, [target_account_id, position_id, scope_type, finalScopeId]);
 
-        // 2. ถ้าเป็นการแต่งตั้ง "ผู้ใหญ่บ้าน" (scope_type = 'VILLAGE') ให้อัปเดตตาราง villages ด้วย
+        // อัปเดตข้อมูลผู้ใหญ่บ้านในตาราง villages
         if (scope_type === 'VILLAGE') {
-            const updateVillageQuery = `
-                UPDATE villages 
-                SET headman_account_id = $1 
-                WHERE village_id = $2;
-            `;
-            await pgPool.query(updateVillageQuery, [target_account_id, scope_id]);
+            await pgPool.query('UPDATE villages SET headman_account_id = $1 WHERE village_id = $2', [target_account_id, scope_id]);
         }
 
         await pgPool.query('COMMIT');
-        res.json({ success: true, message: 'แต่งตั้งตำแหน่งสำเร็จ' });
+        
+        // ส่งข้อมูลกลับไปให้ Frontend เพื่อแสดงหน้าสร้าง PDF
+        res.json({ 
+            success: true, 
+            message: 'แต่งตั้งตำแหน่งและประทับตราลายเซ็นอิเล็กทรอนิกส์สำเร็จ',
+            assigned_date: new Date().toISOString()
+        });
 
     } catch (error) {
         await pgPool.query('ROLLBACK');
