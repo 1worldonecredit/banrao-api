@@ -1507,7 +1507,7 @@ app.get('/api/villages-list', async (req, res) => {
 });
 
 // ==========================================
-// 🌟 API ค้นหาประชาชนแบบละเอียด (เพิ่มการดึงหมู่บ้านของประชาชน)
+// 🌟 API ค้นหาประชาชนแบบละเอียด 
 // ==========================================
 app.get('/api/search-citizen-full/:citizenId', async (req, res) => {
     const { citizenId } = req.params;
@@ -1516,7 +1516,8 @@ app.get('/api/search-citizen-full/:citizenId', async (req, res) => {
     try {
         const query = `
             SELECT 
-                a.account_id, 
+                a.account_id AS real_account_id, -- 🌟 ดึง account_id ของจริงมาด้วย
+                p.profile_id as account_id,      -- (ส่งชื่อเดิมเผื่อไว้กันระบบพัง)
                 p.first_name, 
                 p.last_name, 
                 p.gender,
@@ -1528,7 +1529,6 @@ app.get('/api/search-citizen-full/:citizenId', async (req, res) => {
                 am.amphure_name_th, 
                 pr.province_name_th,
                 pos.position_name as prev_position,
-                -- 🌟 ดึงข้อมูลหมู่บ้านของประชาชนคนนี้มาด้วย
                 v.village_id,
                 v.village_name
             FROM user_profiles p
@@ -1546,13 +1546,13 @@ app.get('/api/search-citizen-full/:citizenId', async (req, res) => {
         const result = await client.query(query, [citizenId]);
 
         if (result.rows.length === 0) {
-            return res.status(404).json({ success: false, message: 'ไม่พบข้อมูลลูกบ้านจากเลขบัตรนี้ หรือยังไม่ได้เปิดใช้งานบัญชี' });
+            return res.status(404).json({ success: false, message: 'ไม่พบข้อมูลลูกบ้าน หรือยังไม่ได้เปิดบัญชี' });
         }
 
         const user = result.rows[0];
         
-        if (!user.account_id) {
-            return res.status(400).json({ success: false, message: 'ประชาชนท่านนี้ยังมีแค่โปรไฟล์ แต่ยังไม่ได้สร้างบัญชีผู้ใช้ (Account)' });
+        if (!user.real_account_id && !user.account_id) {
+            return res.status(400).json({ success: false, message: 'ประชาชนท่านนี้ยังมีแค่โปรไฟล์ แต่ยังไม่ได้สร้างบัญชีผู้ใช้' });
         }
         
         const birthDate = user.dob ? new Date(user.dob) : null;
@@ -1560,7 +1560,8 @@ app.get('/api/search-citizen-full/:citizenId', async (req, res) => {
         const formattedAddress = `บ้านเลขที่ ${user.house_no || '-'} ต.${user.tambon_name_th || '-'} อ.${user.amphure_name_th || '-'} จ.${user.province_name_th || '-'}`;
 
         const fullData = {
-            account_id: user.account_id,
+            real_account_id: user.real_account_id, // 🌟 ส่งค่านี้กลับไปให้ Frontend
+            account_id: user.account_id, 
             first_name: user.first_name,
             last_name: user.last_name,
             gender: user.gender === 'MALE' ? 'ชาย' : (user.gender === 'FEMALE' ? 'หญิง' : '-'),
@@ -1569,7 +1570,6 @@ app.get('/api/search-citizen-full/:citizenId', async (req, res) => {
             address: formattedAddress,
             prev_position: user.prev_position || 'ไม่มีตำแหน่ง (ประชาชนทั่วไป)',
             user_image: user.user_image || '/profile-img.jpg',
-            // 🌟 ส่งข้อมูลหมู่บ้านกลับไปให้ Frontend
             village_id: user.village_id,
             village_name: user.village_name
         };
