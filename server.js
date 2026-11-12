@@ -364,7 +364,7 @@ app.delete('/api/menus/:id', async (req, res) => {
 
 
 // ==========================================
-// API: เข้าสู่ระบบ (Login) + ระบบ Fallback แบบปลอดภัย 100%
+// API: เข้าสู่ระบบ (Login) + ระบบ Fallback แบบปลอดภัย 100% (แก้ไขเงื่อนไขผู้ใหญ่บ้าน)
 // ==========================================
 app.post('/api/login', async (req, res) => {
     const { username, password } = req.body;
@@ -389,8 +389,8 @@ app.post('/api/login', async (req, res) => {
 
                     pos.position_name, 
                     pos.position_level,
-                    up.start_date AS term_start_date, -- 🌟 เพิ่มส่วนนี้
-                    up.end_date AS term_end_date      -- 🌟 เพิ่มส่วนนี้
+                    up.start_date AS term_start_date, -- 🌟 ข้อมูลวาระ
+                    up.end_date AS term_end_date      -- 🌟 ข้อมูลวาระ
 
              FROM user_accounts a
              LEFT JOIN user_profiles p ON a.profile_id = p.profile_id
@@ -454,28 +454,25 @@ app.post('/api/login', async (req, res) => {
         // 🌟🌟 Fallback Logic ด้วย JavaScript 🌟🌟
         let finalPositionName = user.position_name;
         let finalPositionLevel = user.position_level;
-        let isSuperAdmin = false; // 🛠 ประกาศตัวแปรเช็คว่าเป็น Super Admin หรือไม่
+        let isSuperAdmin = false; 
 
-        // 🛠 1. เช็คว่าเป็นบัญชี Super Admin โดยตรงหรือไม่ (เบอร์ 0000000000)
+        // 🛠 1. เช็คว่าเป็นบัญชี Super Admin โดยตรงหรือไม่
         if (user.username_phone === '0000000000') {
             finalPositionName = 'Super Admin';
             finalPositionLevel = 'SYSTEM';
             isSuperAdmin = true;
         } 
-        // 🛠 2. ถ้าไม่ใช่ Super Admin และยังไม่มีตำแหน่ง ให้เข้าเงื่อนไข Fallback เดิมของคุณ
-        else if (!finalPositionName) {
-            // ตรวจสอบว่าคนที่ล็อกอิน คือคนเดียวกับที่เป็นผู้ใหญ่บ้านของหมู่บ้านนี้หรือไม่?
-           if (user.account_id && user.headman_account_id && user.account_id === user.headman_account_id) {
-                finalPositionName = 'ผู้ใหญ่บ้าน';
-                finalPositionLevel = 'VILLAGE';
-            }
-            // ถ้าไม่ใช่ เช็คจากชื่ออาชีพ (occupation_name)
-            else if (user.occupation_name && user.occupation_name !== 'ประชาชนทั่วไป') {
-                finalPositionName = user.occupation_name;
-                if (finalPositionName.includes('นายอำเภอ')) finalPositionLevel = 'AMPHURE';
-                else if (finalPositionName.includes('ผู้ใหญ่บ้าน') || finalPositionName.includes('อสม.')) finalPositionLevel = 'VILLAGE';
-                else if (finalPositionName.includes('อบต.') || finalPositionName.includes('นายก')) finalPositionLevel = 'TAMBON';
-            }
+        // 🛠 2. ตรวจสอบ "ผู้ใหญ่บ้าน" เป็นลำดับแรกสุด (ถ้า account_id ตรงกับ headman_account_id ของหมู่บ้าน ถือเป็นผู้ใหญ่บ้านทันที)
+        else if (user.account_id && user.headman_account_id && user.account_id === user.headman_account_id) {
+            finalPositionName = 'ผู้ใหญ่บ้าน';
+            finalPositionLevel = 'VILLAGE';
+        } 
+        // 🛠 3. ถ้าไม่ใช่ทั้งคู่ และยังไม่มีตำแหน่งจากตาราง user_positions ค่อยเช็คจาก occupation_name
+        else if (!finalPositionName && user.occupation_name && user.occupation_name !== 'ประชาชนทั่วไป') {
+            finalPositionName = user.occupation_name;
+            if (finalPositionName.includes('นายอำเภอ')) finalPositionLevel = 'AMPHURE';
+            else if (finalPositionName.includes('ผู้ใหญ่บ้าน') || finalPositionName.includes('อสม.')) finalPositionLevel = 'VILLAGE';
+            else if (finalPositionName.includes('อบต.') || finalPositionName.includes('นายก')) finalPositionLevel = 'TAMBON';
         }
 
         res.json({
@@ -505,9 +502,9 @@ app.post('/api/login', async (req, res) => {
                 
                 position_name: finalPositionName,
                 position_level: finalPositionLevel,
-                isSuperAdmin: isSuperAdmin,// 🛠 ส่งค่าไปให้หน้า Login ฝั่ง React เพื่อใช้แยกหน้า
-                term_start_date: user.term_start_date, // 🌟 เพิ่มส่วนนี้
-                term_end_date: user.term_end_date      // 🌟 เพิ่มส่วนนี้
+                isSuperAdmin: isSuperAdmin,
+                term_start_date: user.term_start_date, // 🌟 ส่งข้อมูลวาระไป Frontend
+                term_end_date: user.term_end_date      // 🌟 ส่งข้อมูลวาระไป Frontend
             }
         });
 
