@@ -1584,6 +1584,81 @@ app.get('/api/search-citizen-full/:citizenId', async (req, res) => {
     }
 });
 
+
+// ==========================================
+// 🌟 API บริหารจัดการข้อมูลบ้านและประชากร (Households & Members)
+// ==========================================
+
+// 1. API เพิ่มข้อมูลบ้านพร้อมรายชื่อสมาชิก (ใช้ Transaction เพื่อความปลอดภัย)
+app.post('/api/households', async (req, res) => {
+    const {
+        village_id, house_no, latitude, longitude, occupancy_status, map_image_url, created_by, members
+    } = req.body;
+
+    // ตรวจสอบข้อมูลเบื้องต้น
+    if (!village_id || !house_no) {
+        return res.status(400).json({ success: false, message: 'กรุณาระบุพื้นที่หมู่บ้านและบ้านเลขที่' });
+    }
+
+    const client = await pgPool.connect();
+    try {
+        await client.query('BEGIN'); // เริ่มการทำงานแบบผูกมัด (ถ้าพังจะย้อนกลับทั้งหมด)
+
+        // 1.1 บันทึกข้อมูลบ้านลงตาราง households
+        const insertHouseQuery = `
+            INSERT INTO households (village_id, house_no, latitude, longitude, occupancy_status, map_image_url, created_by)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            RETURNING household_id;
+        `;
+        const houseResult = await client.query(insertHouseQuery, [
+            village_id, 
+            house_no, 
+            latitude || null, 
+            longitude || null, 
+            occupancy_status || 'OWNER_OCCUPIED', 
+            map_image_url || null, 
+            created_by || null
+        ]);
+        
+        const newHouseholdId = houseResult.rows[0].household_id;
+
+        // 1.2 วนลูปบันทึกรายชื่อคนในบ้าน (ถ้ามีการส่ง array ของ members มาด้วย)
+        if (members && Array.isArray(members) && members.length > 0) {
+            const insertMemberQuery = `
+                INSERT INTO household_members (
+                    household_id, citizen_id, first_name, last_name, is_head_of_household,
+                    resident_type, living_status, nationality, origin_location
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9);
+            `;
+            
+            for (const member of members) {
+                await client.query(insertMemberQuery, [
+                    newHouseholdId,
+                    member.citizen_id || null,
+                    member.first_name,
+                    member.last_name,
+                    member.is_head_of_household || false,
+                    member.resident_type || 'REGISTERED',
+                    member.living_status || 'LIVING_HERE',
+                    member.nationality || 'THAI',
+                    member.origin_location || null
+                ]);
+            }
+        }
+
+        await client.query('COMMIT'); // ยืนยันการบันทึกข้อมูลทั้ง 2 ตารางลง Database
+        res.json({ 
+            success: true, 
+            message: 'บันทึกข้อมูลบ้านและประชากรเรียบร้อยแล้ว', 
+            household_id: newHouseholdId 
+        });
+
+    } catch (error) {
+        await client.query('ROLLBACK'); // ถอยกลับหากเกิด Error ระหว่างทาง
+        console.error('Error creating household:', error);
+        res.status(500).json({ success: false, message: 'เกิด
+
+
 app.listen(port, () => {
     console.log(`Server is running on port ${port}`);
 });
