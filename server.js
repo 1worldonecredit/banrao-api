@@ -1621,26 +1621,32 @@ app.post('/api/households', async (req, res) => {
         
         const newHouseholdId = houseResult.rows[0].household_id;
 
-        // 1.2 วนลูปบันทึกรายชื่อคนในบ้าน (ถ้ามีการส่ง array ของ members มาด้วย)
         if (members && Array.isArray(members) && members.length > 0) {
             const insertMemberQuery = `
                 INSERT INTO household_members (
                     household_id, citizen_id, first_name, last_name, is_head_of_household,
-                    resident_type, living_status, nationality, origin_location
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9);
+                    resident_type, living_status, nationality, origin_location,
+                    nickname, date_of_birth, gender -- 🌟 เพิ่มฟิลด์ใหม่
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12);
             `;
             
             for (const member of members) {
+                // 🌟 แกะขีดออกก่อนบันทึกลงฐานข้อมูล เพื่อความเป็นระเบียบ
+                const cleanCitizenId = member.is_foreigner ? member.citizen_id : (member.citizen_id || '').replace(/-/g, '');
+                
                 await client.query(insertMemberQuery, [
                     newHouseholdId,
-                    member.citizen_id || null,
+                    cleanCitizenId || null,
                     member.first_name,
                     member.last_name,
                     member.is_head_of_household || false,
                     member.resident_type || 'REGISTERED',
                     member.living_status || 'LIVING_HERE',
                     member.nationality || 'THAI',
-                    member.origin_location || null
+                    member.origin_location || null,
+                    member.nickname || null,             // 🌟
+                    member.date_of_birth || null,        // 🌟
+                    member.gender || null                // 🌟
                 ]);
             }
         }
