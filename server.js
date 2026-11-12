@@ -1406,7 +1406,7 @@ app.delete('/api/community-committees/:id', async (req, res) => {
 });
 
 // ==========================================
-// 🌟 API แต่งตั้งตำแหน่ง พร้อมตรวจสอบรหัสผ่านชุดที่ 2 (แบบจำลองการเช็ค)
+// 🌟 API แต่งตั้งตำแหน่ง พร้อมตรวจสอบรหัสผ่านชุดที่ 2 และบันทึกวาระ (Start/End Date)
 // ==========================================
 app.post('/api/assign-role', async (req, res) => {
     const { 
@@ -1415,7 +1415,9 @@ app.post('/api/assign-role', async (req, res) => {
         scope_type, 
         scope_id, 
         assigner_account_id, 
-        approval_pin // รับรหัสผ่านชุดที่ 2 มาจาก Frontend
+        approval_pin, // รับรหัสผ่านชุดที่ 2 มาจาก Frontend
+        start_date,   // 🌟 เพิ่ม: รับวันที่เริ่มวาระจาก Frontend
+        end_date      // 🌟 เพิ่ม: รับวันที่สิ้นสุดวาระจาก Frontend
     } = req.body;
 
     // ตรวจสอบข้อมูลเบื้องต้น
@@ -1425,7 +1427,6 @@ app.post('/api/assign-role', async (req, res) => {
 
     try {
         // --- ส่วนแก้ไขชั่วคราว: ตรวจสอบรหัสแบบ Hardcode เพื่อให้ผ่านการทดสอบ ---
-        // ในระบบจริงต้อง query จาก db ตามโค้ดเดิม
         if (approval_pin !== '123456') {
             return res.status(401).json({ success: false, message: 'รหัสอนุมัติไม่ถูกต้อง' });
         }
@@ -1442,12 +1443,24 @@ app.post('/api/assign-role', async (req, res) => {
             finalScopeId = scope_id;
         }
 
-        // เพิ่มข้อมูลการรับตำแหน่งลงใน user_positions
+        // 🌟 แก้ไข: เพิ่ม start_date และ end_date ลงในการ INSERT
         const insertPositionQuery = `
-            INSERT INTO user_positions (account_id, position_id, scope_type, scope_id, start_date)
-            VALUES ($1, $2, $3, $4, CURRENT_DATE) RETURNING id;
+            INSERT INTO user_positions (account_id, position_id, scope_type, scope_id, start_date, end_date, is_active)
+            VALUES ($1, $2, $3, $4, $5, $6, true) RETURNING id;
         `;
-        await pgPool.query(insertPositionQuery, [target_account_id, position_id, scope_type, finalScopeId]);
+        
+        // กรณีไม่มีค่าส่งมา ให้ใช้วันที่ปัจจุบันแทน
+        const sDate = start_date ? start_date : new Date().toISOString().split('T')[0];
+        const eDate = end_date ? end_date : null;
+
+        await pgPool.query(insertPositionQuery, [
+            target_account_id, 
+            position_id, 
+            scope_type, 
+            finalScopeId, 
+            sDate, 
+            eDate
+        ]);
 
         // อัปเดตข้อมูลผู้ใหญ่บ้านในตาราง villages
         if (scope_type === 'VILLAGE') {
@@ -1456,7 +1469,7 @@ app.post('/api/assign-role', async (req, res) => {
 
         await pgPool.query('COMMIT');
         
-        // ส่งข้อมูลกลับไปให้ Frontend เพื่อแสดงหน้าสร้าง PDF
+        // ส่งข้อมูลกลับไปให้ Frontend
         res.json({ 
             success: true, 
             message: 'แต่งตั้งตำแหน่งและประทับตราลายเซ็นอิเล็กทรอนิกส์สำเร็จ',
