@@ -1491,8 +1491,7 @@ app.get('/api/villages-list', async (req, res) => {
 });
 
 // ==========================================
-// 🌟 API ค้นหาประชาชนแบบละเอียด (สำหรับหน้าแต่งตั้งตำแหน่ง)
-// อิงตามโครงสร้างการดึงข้อมูลจาก citizen_id ในตาราง user_profiles
+// 🌟 API ค้นหาประชาชนแบบละเอียด (แก้ไขให้ส่ง account_id ที่ถูกต้อง)
 // ==========================================
 app.get('/api/search-citizen-full/:citizenId', async (req, res) => {
     const { citizenId } = req.params;
@@ -1501,7 +1500,7 @@ app.get('/api/search-citizen-full/:citizenId', async (req, res) => {
     try {
         const query = `
             SELECT 
-                p.profile_id as account_id, -- ใช้ profile_id แทน account_id ตามโครงสร้างต้นแบบ
+                a.account_id, -- 🌟 เปลี่ยนมาดึง account_id จริงๆ จากตาราง user_accounts
                 p.first_name, 
                 p.last_name, 
                 p.gender,
@@ -1514,7 +1513,7 @@ app.get('/api/search-citizen-full/:citizenId', async (req, res) => {
                 pr.province_name_th,
                 pos.position_name as prev_position
             FROM user_profiles p
-            LEFT JOIN user_accounts a ON p.profile_id = a.profile_id -- เชื่อมไปหา account เพื่อเอาไปดึงหมู่บ้าน/ตำแหน่ง
+            LEFT JOIN user_accounts a ON p.profile_id = a.profile_id
             LEFT JOIN villages v ON a.village_id = v.village_id
             LEFT JOIN sys_tambons t ON v.tambon_id = t.tambon_id
             LEFT JOIN sys_amphures am ON t.amphure_id = am.amphure_id
@@ -1522,24 +1521,28 @@ app.get('/api/search-citizen-full/:citizenId', async (req, res) => {
             LEFT JOIN citizen_profiles_media cpm ON p.profile_id = cpm.profile_id AND cpm.is_active = true
             LEFT JOIN user_positions up ON a.account_id = up.account_id AND up.is_active = TRUE AND (up.end_date IS NULL OR up.end_date >= CURRENT_DATE)
             LEFT JOIN sys_positions pos ON up.position_id = pos.position_id
-            WHERE TRIM(p.citizen_id) = TRIM($1) -- ค้นหาด้วยเลขบัตรประชาชน และใช้ TRIM ตาม API ต้นแบบ
+            WHERE TRIM(p.citizen_id) = TRIM($1)
             LIMIT 1;
         `;
         const result = await client.query(query, [citizenId]);
 
         if (result.rows.length === 0) {
-            return res.status(404).json({ success: false, message: 'ไม่พบข้อมูลลูกบ้านจากเลขบัตรนี้' });
+            return res.status(404).json({ success: false, message: 'ไม่พบข้อมูลลูกบ้านจากเลขบัตรนี้ หรือยังไม่ได้เปิดใช้งานบัญชี' });
         }
 
         const user = result.rows[0];
         
-        const daysTh = ['อาทิตย์', 'จันทร์', 'อังคาร', 'พุธ', 'พฤหัสบดี', 'ศุกร์', 'เสาร์'];
+        // ถ้าค้นหาเจอโปรไฟล์ แต่ยังไม่มี Account (account_id เป็น null)
+        if (!user.account_id) {
+            return res.status(400).json({ success: false, message: 'ประชาชนท่านนี้ยังมีแค่โปรไฟล์ แต่ยังไม่ได้สร้างบัญชีผู้ใช้ (Account)' });
+        }
+        
         const birthDate = user.dob ? new Date(user.dob) : null;
         const formattedDate = birthDate ? birthDate.toLocaleDateString('th-TH', { year: 'numeric', month: 'long', day: 'numeric' }) : 'ไม่ระบุ';
         const formattedAddress = `บ้านเลขที่ ${user.house_no || '-'} ต.${user.tambon_name_th || '-'} อ.${user.amphure_name_th || '-'} จ.${user.province_name_th || '-'}`;
 
         const fullData = {
-            account_id: user.account_id, // ค่านี้จะถูกส่งไปเป็น target_account_id ตอนแต่งตั้ง
+            account_id: user.account_id, // 🌟 ตอนนี้ค่านี้คือ account_id จริงๆ แล้ว เอาไปบันทึกได้เลย
             first_name: user.first_name,
             last_name: user.last_name,
             gender: user.gender === 'MALE' ? 'ชาย' : (user.gender === 'FEMALE' ? 'หญิง' : '-'),
