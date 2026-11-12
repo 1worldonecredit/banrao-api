@@ -1491,7 +1491,7 @@ app.get('/api/villages-list', async (req, res) => {
 });
 
 // ==========================================
-// 🌟 API ค้นหาประชาชนแบบละเอียด (แก้ไขให้ส่ง account_id ที่ถูกต้อง)
+// 🌟 API ค้นหาประชาชนแบบละเอียด (เพิ่มการดึงหมู่บ้านของประชาชน)
 // ==========================================
 app.get('/api/search-citizen-full/:citizenId', async (req, res) => {
     const { citizenId } = req.params;
@@ -1500,7 +1500,7 @@ app.get('/api/search-citizen-full/:citizenId', async (req, res) => {
     try {
         const query = `
             SELECT 
-                a.account_id, -- 🌟 เปลี่ยนมาดึง account_id จริงๆ จากตาราง user_accounts
+                a.account_id, 
                 p.first_name, 
                 p.last_name, 
                 p.gender,
@@ -1511,7 +1511,10 @@ app.get('/api/search-citizen-full/:citizenId', async (req, res) => {
                 t.tambon_name_th, 
                 am.amphure_name_th, 
                 pr.province_name_th,
-                pos.position_name as prev_position
+                pos.position_name as prev_position,
+                -- 🌟 ดึงข้อมูลหมู่บ้านของประชาชนคนนี้มาด้วย
+                v.village_id,
+                v.village_name
             FROM user_profiles p
             LEFT JOIN user_accounts a ON p.profile_id = a.profile_id
             LEFT JOIN villages v ON a.village_id = v.village_id
@@ -1532,7 +1535,6 @@ app.get('/api/search-citizen-full/:citizenId', async (req, res) => {
 
         const user = result.rows[0];
         
-        // ถ้าค้นหาเจอโปรไฟล์ แต่ยังไม่มี Account (account_id เป็น null)
         if (!user.account_id) {
             return res.status(400).json({ success: false, message: 'ประชาชนท่านนี้ยังมีแค่โปรไฟล์ แต่ยังไม่ได้สร้างบัญชีผู้ใช้ (Account)' });
         }
@@ -1542,7 +1544,7 @@ app.get('/api/search-citizen-full/:citizenId', async (req, res) => {
         const formattedAddress = `บ้านเลขที่ ${user.house_no || '-'} ต.${user.tambon_name_th || '-'} อ.${user.amphure_name_th || '-'} จ.${user.province_name_th || '-'}`;
 
         const fullData = {
-            account_id: user.account_id, // 🌟 ตอนนี้ค่านี้คือ account_id จริงๆ แล้ว เอาไปบันทึกได้เลย
+            account_id: user.account_id,
             first_name: user.first_name,
             last_name: user.last_name,
             gender: user.gender === 'MALE' ? 'ชาย' : (user.gender === 'FEMALE' ? 'หญิง' : '-'),
@@ -1550,7 +1552,10 @@ app.get('/api/search-citizen-full/:citizenId', async (req, res) => {
             birth_date: formattedDate,
             address: formattedAddress,
             prev_position: user.prev_position || 'ไม่มีตำแหน่ง (ประชาชนทั่วไป)',
-            user_image: user.user_image || '/profile-img.jpg'
+            user_image: user.user_image || '/profile-img.jpg',
+            // 🌟 ส่งข้อมูลหมู่บ้านกลับไปให้ Frontend
+            village_id: user.village_id,
+            village_name: user.village_name
         };
 
         res.json({ success: true, data: fullData });
