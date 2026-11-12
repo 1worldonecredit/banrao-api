@@ -361,6 +361,8 @@ app.delete('/api/menus/:id', async (req, res) => {
     client.release();
   }
 });
+
+
 // ==========================================
 // API: เข้าสู่ระบบ (Login) + ระบบ Fallback แบบปลอดภัย 100%
 // ==========================================
@@ -386,7 +388,9 @@ app.post('/api/login', async (req, res) => {
                     hpm.image_url AS headman_image,
 
                     pos.position_name, 
-                    pos.position_level
+                    pos.position_level,
+                    up.start_date AS term_start_date, -- 🌟 เพิ่มส่วนนี้
+                    up.end_date AS term_end_date      -- 🌟 เพิ่มส่วนนี้
 
              FROM user_accounts a
              LEFT JOIN user_profiles p ON a.profile_id = p.profile_id
@@ -501,7 +505,9 @@ app.post('/api/login', async (req, res) => {
                 
                 position_name: finalPositionName,
                 position_level: finalPositionLevel,
-                isSuperAdmin: isSuperAdmin // 🛠 ส่งค่าไปให้หน้า Login ฝั่ง React เพื่อใช้แยกหน้า
+                isSuperAdmin: isSuperAdmin,// 🛠 ส่งค่าไปให้หน้า Login ฝั่ง React เพื่อใช้แยกหน้า
+                term_start_date: user.term_start_date, // 🌟 เพิ่มส่วนนี้
+                term_end_date: user.term_end_date      // 🌟 เพิ่มส่วนนี้
             }
         });
 
