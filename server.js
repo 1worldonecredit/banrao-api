@@ -465,10 +465,10 @@ app.post('/api/login', async (req, res) => {
         // 🛠 2. ถ้าไม่ใช่ Super Admin และยังไม่มีตำแหน่ง ให้เข้าเงื่อนไข Fallback เดิมของคุณ
         else if (!finalPositionName) {
             // ตรวจสอบว่าคนที่ล็อกอิน คือคนเดียวกับที่เป็นผู้ใหญ่บ้านของหมู่บ้านนี้หรือไม่?
-            if (user.account_id && user.headman_account_id && user.account_id === user.headman_account_id) {
+           if (user.account_id && user.headman_account_id && user.account_id === user.headman_account_id) {
                 finalPositionName = 'ผู้ใหญ่บ้าน';
                 finalPositionLevel = 'VILLAGE';
-            } 
+            }
             // ถ้าไม่ใช่ เช็คจากชื่ออาชีพ (occupation_name)
             else if (user.occupation_name && user.occupation_name !== 'ประชาชนทั่วไป') {
                 finalPositionName = user.occupation_name;
