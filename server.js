@@ -1491,15 +1491,17 @@ app.get('/api/villages-list', async (req, res) => {
 });
 
 // ==========================================
-// 🌟 API ค้นหาประชาชนแบบละเอียด (ใช้โครงสร้างเดียวกับ Login ของคุณ 100%)
+// 🌟 API ค้นหาประชาชนแบบละเอียด (สำหรับหน้าแต่งตั้งตำแหน่ง)
+// อิงตามโครงสร้างการดึงข้อมูลจาก citizen_id ในตาราง user_profiles
 // ==========================================
 app.get('/api/search-citizen-full/:citizenId', async (req, res) => {
     const { citizenId } = req.params;
+    const client = await pgPool.connect();
 
     try {
         const query = `
             SELECT 
-                a.account_id, 
+                p.profile_id as account_id, -- ใช้ profile_id แทน account_id ตามโครงสร้างต้นแบบ
                 p.first_name, 
                 p.last_name, 
                 p.gender,
@@ -1511,8 +1513,8 @@ app.get('/api/search-citizen-full/:citizenId', async (req, res) => {
                 am.amphure_name_th, 
                 pr.province_name_th,
                 pos.position_name as prev_position
-            FROM user_accounts a
-            LEFT JOIN user_profiles p ON a.profile_id = p.profile_id
+            FROM user_profiles p
+            LEFT JOIN user_accounts a ON p.profile_id = a.profile_id -- เชื่อมไปหา account เพื่อเอาไปดึงหมู่บ้าน/ตำแหน่ง
             LEFT JOIN villages v ON a.village_id = v.village_id
             LEFT JOIN sys_tambons t ON v.tambon_id = t.tambon_id
             LEFT JOIN sys_amphures am ON t.amphure_id = am.amphure_id
@@ -1520,25 +1522,24 @@ app.get('/api/search-citizen-full/:citizenId', async (req, res) => {
             LEFT JOIN citizen_profiles_media cpm ON p.profile_id = cpm.profile_id AND cpm.is_active = true
             LEFT JOIN user_positions up ON a.account_id = up.account_id AND up.is_active = TRUE AND (up.end_date IS NULL OR up.end_date >= CURRENT_DATE)
             LEFT JOIN sys_positions pos ON up.position_id = pos.position_id
-            WHERE a.username_phone = $1
+            WHERE TRIM(p.citizen_id) = TRIM($1) -- ค้นหาด้วยเลขบัตรประชาชน และใช้ TRIM ตาม API ต้นแบบ
             LIMIT 1;
         `;
-        const result = await pgPool.query(query, [citizenId]);
+        const result = await client.query(query, [citizenId]);
 
         if (result.rows.length === 0) {
-            return res.status(404).json({ success: false, message: 'ไม่พบข้อมูลประชาชนในระบบ' });
+            return res.status(404).json({ success: false, message: 'ไม่พบข้อมูลลูกบ้านจากเลขบัตรนี้' });
         }
 
         const user = result.rows[0];
         
-        // แปลงวันที่เกิดและจัดรูปแบบที่อยู่
         const daysTh = ['อาทิตย์', 'จันทร์', 'อังคาร', 'พุธ', 'พฤหัสบดี', 'ศุกร์', 'เสาร์'];
         const birthDate = user.dob ? new Date(user.dob) : null;
         const formattedDate = birthDate ? birthDate.toLocaleDateString('th-TH', { year: 'numeric', month: 'long', day: 'numeric' }) : 'ไม่ระบุ';
         const formattedAddress = `บ้านเลขที่ ${user.house_no || '-'} ต.${user.tambon_name_th || '-'} อ.${user.amphure_name_th || '-'} จ.${user.province_name_th || '-'}`;
 
         const fullData = {
-            account_id: user.account_id,
+            account_id: user.account_id, // ค่านี้จะถูกส่งไปเป็น target_account_id ตอนแต่งตั้ง
             first_name: user.first_name,
             last_name: user.last_name,
             gender: user.gender === 'MALE' ? 'ชาย' : (user.gender === 'FEMALE' ? 'หญิง' : '-'),
@@ -1554,6 +1555,8 @@ app.get('/api/search-citizen-full/:citizenId', async (req, res) => {
     } catch (error) {
         console.error('Error searching citizen full:', error.message);
         res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการค้นหา' });
+    } finally {
+        client.release();
     }
 });
 
