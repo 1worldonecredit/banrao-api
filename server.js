@@ -1584,7 +1584,6 @@ app.get('/api/search-citizen-full/:citizenId', async (req, res) => {
     }
 });
 
-
 // ==========================================
 // 🌟 API บริหารจัดการข้อมูลบ้านและประชากร (Households & Members)
 // ==========================================
@@ -1656,8 +1655,35 @@ app.post('/api/households', async (req, res) => {
     } catch (error) {
         await client.query('ROLLBACK'); // ถอยกลับหากเกิด Error ระหว่างทาง
         console.error('Error creating household:', error);
-        res.status(500).json({ success: false, message: 'เกิด
+        res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการบันทึกข้อมูลเข้าฐานข้อมูล' });
+    } finally {
+        client.release();
+    }
+});
 
+// 2. API ดึงรายชื่อบ้านทั้งหมดในเขตรับผิดชอบ (สำหรับหน้าแดชบอร์ดของผู้ใหญ่บ้าน)
+app.get('/api/households/village/:villageId', async (req, res) => {
+    const { villageId } = req.params;
+    
+    try {
+        // ดึงบ้านเลขที่ พิกัด สถานะ และนับจำนวนคนในบ้านนั้นๆ
+        const query = `
+            SELECT h.household_id, h.house_no, h.occupancy_status, h.latitude, h.longitude,
+                   COUNT(hm.member_id) AS total_members
+            FROM households h
+            LEFT JOIN household_members hm ON h.household_id = hm.household_id
+            WHERE h.village_id = $1
+            GROUP BY h.household_id
+            ORDER BY h.house_no ASC;
+        `;
+        const result = await pgPool.query(query, [villageId]);
+        
+        res.json({ success: true, data: result.rows });
+    } catch (error) {
+        console.error('Error fetching households:', error);
+        res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการดึงข้อมูลบ้าน' });
+    }
+});
 
 app.listen(port, () => {
     console.log(`Server is running on port ${port}`);
