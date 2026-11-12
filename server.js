@@ -1691,6 +1691,96 @@ app.get('/api/households/village/:villageId', async (req, res) => {
     }
 });
 
+// ==========================================
+// 🌟 API สำหรับระบบ "ค้นหา -> บันทึกบ้าน -> เพิ่มประชากรต่อเนื่อง"
+// ==========================================
+
+// 1. ดึงความคืบหน้า (Progress) เทียบกับเป้าหมายจากภาครัฐ
+app.get('/api/villages/:villageId/progress', async (req, res) => {
+    const { villageId } = req.params;
+    try {
+        const query = `
+            SELECT
+                v.household_count AS target_houses,
+                v.population_count AS target_population,
+                (SELECT COUNT(*) FROM households WHERE village_id = $1) AS actual_houses,
+                (SELECT COUNT(*) FROM household_members hm JOIN households h ON hm.household_id = h.household_id WHERE h.village_id = $1) AS actual_population
+            FROM villages v WHERE v.village_id = $1;
+        `;
+        const result = await pgPool.query(query, [villageId]);
+        if (result.rows.length > 0) res.json({ success: true, data: result.rows[0] });
+        else res.json({ success: false, message: 'ไม่พบข้อมูลหมู่บ้าน' });
+    } catch (error) {
+        res.status(500).json({ success: false, message: 'Server Error' });
+    }
+});
+
+// 2. ค้นหาบ้านเลขที่ในหมู่บ้าน (เช็คว่ามีบันทึกหรือยัง)
+app.get('/api/households/search', async (req, res) => {
+    const { village_id, house_no } = req.query;
+    try {
+        const query = `SELECT * FROM households WHERE village_id = $1 AND house_no = $2 LIMIT 1`;
+        const result = await pgPool.query(query, [village_id, house_no]);
+        if (result.rows.length > 0) res.json({ success: true, data: result.rows[0] });
+        else res.json({ success: true, data: null }); // ยังไม่มีบ้านนี้
+    } catch (error) {
+        res.status(500).json({ success: false, message: 'Server Error' });
+    }
+});
+
+// 3. ดึงรายชื่อคนในบ้าน (กรณีค้นหาเจอบ้านแล้ว จะได้โชว์ว่ามีใครอยู่บ้าง)
+app.get('/api/households/:householdId/members', async (req, res) => {
+    const { householdId } = req.params;
+    try {
+        const query = `SELECT * FROM household_members WHERE household_id = $1 ORDER BY created_at ASC`;
+        const result = await pgPool.query(query, [householdId]);
+        res.json({ success: true, data: result.rows });
+    } catch (error) {
+        res.status(500).json({ success: false, message: 'Server Error' });
+    }
+});
+
+// 4. บันทึกบ้านอย่างเดียว (แยกปุ่มบันทึก)
+app.post('/api/households/single', async (req, res) => {
+    const { village_id, house_no, latitude, longitude, occupancy_status, created_by } = req.body;
+    try {
+        const query = `
+            INSERT INTO households (village_id, house_no, latitude, longitude, occupancy_status, created_by)
+            VALUES ($1, $2, $3, $4, $5, $6) RETURNING *;
+        `;
+        const result = await pgPool.query(query, [village_id, house_no, latitude, longitude, occupancy_status, created_by]);
+        res.json({ success: true, data: result.rows[0], message: 'บันทึกบ้านสำเร็จ' });
+    } catch (error) {
+        res.status(500).json({ success: false, message: 'บันทึกบ้านล้มเหลว อาจมีข้อมูลซ้ำ' });
+    }
+});
+
+// 5. บันทึกประชากรเข้าบ้าน 1 คน (กดเพิ่มทีละคนต่อเนื่อง)
+app.post('/api/households/:householdId/members', async (req, res) => {
+    const { householdId } = req.params;
+    const member = req.body;
+    try {
+        const cleanCitizenId = member.is_foreigner ? member.citizen_id : (member.citizen_id || '').replace(/-/g, '');
+        const query = `
+            INSERT INTO household_members (
+                household_id, citizen_id, first_name, last_name, nickname, date_of_birth, gender,
+                is_head_of_household, resident_type, living_status, nationality, origin_location
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING *;
+        `;
+        const result = await pgPool.query(query, [
+            householdId, cleanCitizenId || null, member.first_name, member.last_name, member.nickname || null,
+            member.date_of_birth || null, member.gender || null, member.is_head_of_household || false,
+            member.resident_type || 'REGISTERED', member.living_status || 'LIVING_HERE',
+            member.nationality || 'THAI', member.origin_location || null
+        ]);
+        res.json({ success: true, data: result.rows[0], message: 'เพิ่มประชากรสำเร็จ' });
+    } catch (error) {
+        res.status(500).json({ success: false, message: 'บันทึกประชากรล้มเหลว' });
+    }
+});
+
+
+
 app.listen(port, () => {
     console.log(`Server is running on port ${port}`);
 });
