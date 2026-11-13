@@ -12,7 +12,7 @@ const app = express();
 
 const bcrypt = require('bcrypt');
 // เปิดใช้งาน CORS เพื่อให้ Frontend (พอร์ต 5173) เรียกใช้งานได้
-
+const saltRounds = 10;
 
 
 
@@ -1871,8 +1871,10 @@ app.post('/api/villages/register', async (req, res) => {
            // throw e; 
         }
 
-        // 3. สร้าง User Account (ลำดับ Parameter ตรงตาราง + ระบบผู้แนะนำ + สิทธิ์ HEADMAN)
-        // $1 = phone_number, $2 = password, $3 = area_code ('100000'), $4 = profile_id, $5 = referrer_id
+        // เข้ารหัสผ่านก่อนบันทึก
+        const hashedPassword = await bcrypt.hash(password, saltRounds);
+
+        // 3. สร้าง User Account
         const insertUserQuery = `
             INSERT INTO user_accounts (
                 account_id, 
@@ -1896,10 +1898,12 @@ app.post('/api/villages/register', async (req, res) => {
             )
             RETURNING account_id;
         `;
+        
+        // 🌟 เปลี่ยนจากการใส่ password ตรงๆ เป็น hashedPassword
         const userResult = await client.query(insertUserQuery, [
             phone_number,
-            password,
-            '100000', // ใช้ 100000 แทน +66 ให้ตรงกับ format ข้อมูลเดิมในฐานข้อมูลของคุณ
+            hashedPassword, // ใช้รหัสผ่านที่ Hash แล้ว
+            '100000', 
             newProfileId,
             referrer_account_id || null
         ]); 
