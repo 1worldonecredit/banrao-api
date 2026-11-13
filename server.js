@@ -1779,7 +1779,37 @@ app.post('/api/households/:householdId/members', async (req, res) => {
     }
 });
 
+// 6. อัปเดตสถานะลูกบ้าน (ย้ายออก / เสียชีวิต)
+app.put('/api/members/:memberId/status', async (req, res) => {
+    const { memberId } = req.params;
+    const { living_status } = req.body; // 'MOVED_AWAY' หรือ 'DECEASED'
+    try {
+        const query = `UPDATE household_members SET living_status = $1 WHERE member_id = $2 RETURNING *`;
+        const result = await pgPool.query(query, [living_status, memberId]);
+        res.json({ success: true, data: result.rows[0], message: 'อัปเดตสถานะสำเร็จ' });
+    } catch (error) {
+        res.status(500).json({ success: false, message: 'อัปเดตสถานะล้มเหลว' });
+    }
+});
 
+// 7. ดึงรายการทะเบียนบ้านทั้งหมด (จำกัด 10 รายการล่าสุด) สำหรับ Card ข้อมูล
+app.get('/api/villages/:villageId/households', async (req, res) => {
+    const { villageId } = req.params;
+    try {
+        const query = `
+            SELECT h.household_id, h.house_no, h.occupancy_status,
+                   (SELECT COUNT(*) FROM household_members WHERE household_id = h.household_id) as total_members
+            FROM households h
+            WHERE h.village_id = $1
+            ORDER BY h.created_at DESC
+            LIMIT 10;
+        `;
+        const result = await pgPool.query(query, [villageId]);
+        res.json({ success: true, data: result.rows });
+    } catch (error) {
+        res.status(500).json({ success: false, message: 'ดึงข้อมูลทะเบียนบ้านล้มเหลว' });
+    }
+});
 
 app.listen(port, () => {
     console.log(`Server is running on port ${port}`);
