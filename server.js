@@ -363,10 +363,9 @@ app.delete('/api/menus/:id', async (req, res) => {
 });
 
 // ==========================================
-// 🌟 API เข้าสู่ระบบ (Login) + ระบบ Fallback (ผสานโครงสร้างเก่าและใหม่)
+// 🌟 API เข้าสู่ระบบ (Login) - โครงสร้างสมบูรณ์อิงตาม Schema จริง 100%
 // ==========================================
 app.post('/api/login', async (req, res) => {
-    // 💡 เปลี่ยนกลับมาใช้ username หรือ phone_number ก็ได้ตามแต่ frontend จะส่งมา
     const usernameInput = req.body.username || req.body.phone_number;
     const password = req.body.password;
 
@@ -378,14 +377,17 @@ app.post('/api/login', async (req, res) => {
         const userQuery = await pgPool.query(
             `SELECT 
                 a.account_id, a.username_phone, a.password_hash, a.occupation_id, a.is_active, a.household_member_count, a.role,
-                p.first_name, p.last_name, p.nickname, p.dob, p.citizen_id,
-                -- ⚠️ สังเกตว่าผมไม่ได้เรียก p.gender และ p.house_no เพราะก่อนหน้านี้คุณบอกว่าตาราง user_profiles ไม่มีบางคอลัมน์
-                -- ⚠️ ถ้ามีแล้ว ให้เติมเข้าไปใน SELECT list นี้ได้เลยครับ
-
+                p.first_name, p.last_name, p.nickname, p.dob, p.citizen_id, p.gender, p.house_no,
                 o.occupation_name, 
                 
                 v.village_id, v.village_no, v.village_name, v.headman_lat, v.headman_lng, 
                 v.headman_account_id,
+                
+                -- ดึงสถิติประชากรจากตารางจริง
+                v.household_count AS target_household_count, 
+                v.population_count AS target_population_count,
+                (SELECT COUNT(*) FROM households h WHERE h.village_id = v.village_id) AS actual_household_count,
+                (SELECT COUNT(*) FROM household_members hm JOIN households hs ON hm.house_id = hs.house_id WHERE hs.village_id = v.village_id) AS actual_population_count,
                 
                 hp.first_name AS headman_first_name, 
                 hp.last_name AS headman_last_name,
@@ -396,9 +398,6 @@ app.post('/api/login', async (req, res) => {
                 EXTRACT(MONTH FROM age(CURRENT_DATE, p.dob)) AS age_months,
                 EXTRACT(DAY FROM age(CURRENT_DATE, p.dob)) AS age_days,
                 
-                -- cpm.image_url AS user_image,
-                -- hpm.image_url AS headman_image,
-
                 pos.position_name, 
                 pos.position_level,
                 up.start_date AS term_start_date,
@@ -414,9 +413,6 @@ app.post('/api/login', async (req, res) => {
              LEFT JOIN sys_tambons t ON v.tambon_id = t.tambon_id
              LEFT JOIN sys_amphures am ON t.amphure_id = am.amphure_id
              LEFT JOIN sys_provinces pr ON am.province_id = pr.province_id
-             
-             -- LEFT JOIN citizen_profiles_media cpm ON p.profile_id = cpm.profile_id AND cpm.is_active = true
-             -- LEFT JOIN citizen_profiles_media hpm ON hp.profile_id = hpm.profile_id AND hpm.is_active = true
              
              LEFT JOIN user_positions up ON a.account_id = up.account_id AND up.is_active = TRUE AND (up.end_date IS NULL OR up.end_date >= CURRENT_DATE)
              LEFT JOIN sys_positions pos ON up.position_id = pos.position_id
@@ -435,67 +431,66 @@ app.post('/api/login', async (req, res) => {
             return res.status(403).json({ success: false, message: 'บัญชีนี้ถูกระงับหรือยังไม่ได้รับการอนุมัติ' });
         }
 
-        // 🌟 ตรวจสอบรหัสผ่านด้วย bcrypt (โค้ดใหม่)
         const isValidPassword = await bcrypt.compare(password, user.password_hash);
         if (!isValidPassword) {
             return res.status(401).json({ success: false, message: 'เบอร์โทรศัพท์หรือรหัสผ่านไม่ถูกต้อง' });
         }
 
-        // --- ส่วนตรวจสอบ Permissions เดิมของคุณ ---
+        // ดึงสิทธิ์ (Permissions) จากตาราง sys_permissions ผ่าน occupation_permissions (ถ้าตารางนี้ยังมีอยู่)
         let permissions = [];
         if (user.occupation_id) {
-            const permQuery = await pgPool.query(
-                `SELECT sp.permission_code
-                 FROM occupation_permissions op
-                 JOIN sys_permissions sp ON op.permission_id = sp.permission_id
-                 WHERE op.occupation_id = $1`,
-                [user.occupation_id]
-            );
-            permissions = permQuery.rows.map(row => row.permission_code);
+             try {
+                const permQuery = await pgPool.query(
+                    `SELECT sp.permission_code
+                     FROM occupation_permissions op
+                     JOIN sys_permissions sp ON op.permission_id = sp.permission_id
+                     WHERE op.occupation_id = $1`,
+                    [user.occupation_id]
+                );
+                permissions = permQuery.rows.map(row => row.permission_code);
+             } catch(e) {
+                console.log("ไม่มีตาราง Permissions หรือข้อผิดพลาดในการดึงสิทธิ์:", e.message);
+             }
         }
-        // ----------------------------------------
 
-        // --- สร้าง Token ---
-        // (คุณจะต้องประกาศ const jwt = require('jsonwebtoken'); ไว้ด้านบนไฟล์ด้วย)
         const token = jwt.sign(
             { account_id: user.account_id, occupation_id: user.occupation_id, village_id: user.village_id },
             process.env.JWT_SECRET || 'banrao_secret_key',
             { expiresIn: '1d' }
         );
 
-        // --- แปลงวันเกิดและเพศ ---
         const daysTh = ['อาทิตย์', 'จันทร์', 'อังคาร', 'พุธ', 'พฤหัสบดี', 'ศุกร์', 'เสาร์'];
         const birthDate = user.dob ? new Date(user.dob) : null;
-        // ป้องกันค่า 1900-01-01 แสดงผลแปลกๆ
         const isDummyDate = birthDate && birthDate.getFullYear() === 1900;
         const dayNameTh = (birthDate && !isDummyDate) ? daysTh[birthDate.getDay()] : '-';
-        // const genderTh = user.gender === 'MALE' ? 'ชาย' : (user.gender === 'FEMALE' ? 'หญิง' : '-');
+        const genderTh = user.gender === 'MALE' ? 'ชาย' : (user.gender === 'FEMALE' ? 'หญิง' : '-');
 
-        // 🌟🌟 Fallback Logic เพื่อกำหนด Position 🌟🌟
-        let finalPositionName = user.position_name;
-        let finalPositionLevel = user.position_level;
+        // 🌟🌟 Logic ตำแหน่งใหม่ อิงจากตารางเป็นหลัก 🌟🌟
+        let finalPositionName = null;
+        let finalPositionLevel = null;
         let isSuperAdmin = false; 
 
-        // 1. Super Admin
         if (user.username_phone === '0000000000') {
             finalPositionName = 'Super Admin';
             finalPositionLevel = 'SYSTEM';
             isSuperAdmin = true;
         } 
-        // 2. เช็คว่าเป็นผู้ใหญ่บ้านหรือไม่ (ผสานการเช็ค role ใหม่ เข้ากับการเช็คแบบเก่า)
+        // 1. ให้ความสำคัญกับตำแหน่งแต่งตั้งทางการ (user_positions + sys_positions) มากที่สุด
+        else if (user.position_name && user.position_level) {
+            finalPositionName = user.position_name;
+            finalPositionLevel = user.position_level;
+        }
+        // 2. ถ้าเป็นผู้สร้างหมู่บ้าน (role HEADMAN) และเชื่อมกับตาราง villages
         else if (user.role === 'HEADMAN' || (user.account_id && user.headman_account_id && user.account_id === user.headman_account_id)) {
             finalPositionName = 'ผู้ใหญ่บ้าน';
             finalPositionLevel = 'VILLAGE';
-        } 
-        // 3. Fallback จาก Occupation
-        else if (!finalPositionName && user.occupation_name && user.occupation_name !== 'ประชาชนทั่วไป') {
-            finalPositionName = user.occupation_name;
-            if (finalPositionName.includes('นายอำเภอ')) finalPositionLevel = 'AMPHURE';
-            else if (finalPositionName.includes('ผู้ใหญ่บ้าน') || finalPositionName.includes('อสม.')) finalPositionLevel = 'VILLAGE';
-            else if (finalPositionName.includes('อบต.') || finalPositionName.includes('นายก')) finalPositionLevel = 'TAMBON';
+        }
+        // 3. ถ้าไม่มีตำแหน่งทางการ ให้ใช้ข้อมูล occupation_name พื้นฐาน
+        else {
+            finalPositionName = user.occupation_name || 'ประชาชนทั่วไป';
+            finalPositionLevel = null;
         }
 
-        // จัดเตรียมข้อมูลที่จะส่งกลับให้ Frontend (โครงสร้างแบบเดิมที่ Dashboard ต้องการ)
         const responseData = {
             id: user.account_id,
             username: user.username_phone,
@@ -504,7 +499,7 @@ app.post('/api/login', async (req, res) => {
             nickname: user.nickname,
             occupation: user.occupation_name,
             permissions: permissions,
-            role: user.role, // ส่ง role ไปให้ Frontend เผื่อใช้
+            role: user.role,
             
             village_id: user.village_id,
             village_no: user.village_no,
@@ -514,16 +509,22 @@ app.post('/api/login', async (req, res) => {
             amphureName: user.amphure_name_th,
             provinceName: user.province_name_th,
             
-            // gender: genderTh,
+            gender: genderTh,
             birthDayName: dayNameTh,
             age_years: isDummyDate ? '-' : (user.age_years || 0),
             age_months: isDummyDate ? '-' : (user.age_months || 0),
             age_days: isDummyDate ? '-' : (user.age_days || 0),
-            // house_no: user.house_no || '-',
+            house_no: user.house_no || '-',
             household_member_count: user.household_member_count || 0,
             
-            userImage: user.user_image || '/profile-img.jpg', 
-            headmanImage: user.headman_image || 'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=150&q=80',
+            target_household_count: user.target_household_count || 0,
+            target_population_count: user.target_population_count || 0,
+            actual_household_count: user.actual_household_count || 0,
+            actual_population_count: user.actual_population_count || 0,
+            
+            // ใช้ default image เพราะไม่มีตาราง media แล้ว
+            userImage: '/profile-img.jpg', 
+            headmanImage: 'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=150&q=80',
             
             position_name: finalPositionName,
             position_level: finalPositionLevel,
@@ -533,11 +534,11 @@ app.post('/api/login', async (req, res) => {
         };
 
         res.json({
-            success: true, // เพิ่ม success flag
+            success: true,
             message: 'เข้าสู่ระบบสำเร็จ',
             token,
             user: responseData, 
-            userData: responseData // ส่งซ้ำในชื่อ userData ด้วย เผื่อ frontend เก่าคุณอ้างอิงชื่อนี้
+            userData: responseData 
         });
 
     } catch (error) {
