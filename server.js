@@ -1830,7 +1830,7 @@ app.put('/api/villages/:villageId/targets', async (req, res) => {
 });
 
 // ==========================================
-// 🌟 API สำหรับลงทะเบียนหมู่บ้านและผู้ใหญ่บ้าน (Register Village & Headman)
+// 🌟 API สำหรับลงทะเบียนหมู่บ้านและผู้ใหญ่บ้าน (แก้ไขให้ตรงกับ Schema จริง)
 // ==========================================
 app.post('/api/villages/register', async (req, res) => {
     const {
@@ -1846,46 +1846,50 @@ app.post('/api/villages/register', async (req, res) => {
 
     const client = await pgPool.connect();
     try {
-        await client.query('BEGIN'); // เริ่ม Transaction
+        await client.query('BEGIN'); 
 
-        // 1. ตรวจสอบว่าเลขบัตรนี้ลงทะเบียนไปแล้วหรือยัง (ป้องกันซ้ำ)
-        const checkUser = await client.query('SELECT * FROM user_accounts WHERE citizen_id = $1', [citizen_id]);
+        // 1. เช็คว่ามี Username (เบอร์โทรหรือบัตรประชาชน) นี้ในระบบหรือยัง
+        const checkUser = await client.query('SELECT account_id FROM user_accounts WHERE username_phone = $1', [citizen_id]);
         if (checkUser.rows.length > 0) {
             await client.query('ROLLBACK');
             return res.status(400).json({ success: false, message: 'เลขบัตรประชาชนนี้มีการลงทะเบียนแล้ว' });
         }
 
-        // 2. สร้างบัญชีผู้ใหญ่บ้าน (user_accounts) ก่อน
-        // สมมติว่าในตาราง user_accounts ของคุณมีคอลัมน์เหล่านี้ (ปรับแก้ให้ตรงกับ Schema จริงของคุณได้ครับ)
+        // 2. สร้างบัญชีผู้ใช้งานใน user_accounts 
+        // อ้างอิงคอลัมน์จริง: username_phone, password_hash
         const insertUserQuery = `
-            INSERT INTO user_accounts (citizen_id, first_name, last_name, nickname, phone, password, role)
-            VALUES ($1, $2, $3, $4, $5, $6, 'HEADMAN')
+            INSERT INTO user_accounts (username_phone, password_hash, is_active)
+            VALUES ($1, $2, true)
             RETURNING account_id;
         `;
-        // หมายเหตุ: ในระบบจริง password ควรถูก Hash ก่อนบันทึก แต่เพื่อความง่ายในการทดสอบตอนนี้จะบันทึกตรงๆ ไปก่อน
-        const userResult = await client.query(insertUserQuery, [citizen_id, first_name, last_name, nickname, phone_number, password]);
+        const userResult = await client.query(insertUserQuery, [citizen_id, password]); // บันทึกพาสเวิร์ดตรงๆ ไปก่อนเพื่อทดสอบ
         const newAccountId = userResult.rows[0].account_id;
 
-        // 3. สร้างข้อมูลหมู่บ้าน (villages) และเชื่อมกับผู้ใหญ่บ้าน
+        // 3. สร้างข้อมูลหมู่บ้านในตาราง villages
+        // อ้างอิงคอลัมน์จริง: village_no, village_name, headman_account_id, headman_lat, headman_lng
+        // (หมายเหตุ: ในตาราง villages ของคุณไม่มี province, district เราจึงเก็บแค่ชื่อและพิกัดตาม Schema ที่มี)
         const insertVillageQuery = `
-            INSERT INTO villages (village_no, village_name, province, district, sub_district, latitude, longitude, headman_account_id)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            INSERT INTO villages (village_no, village_name, headman_account_id, headman_lat, headman_lng)
+            VALUES ($1, $2, $3, $4, $5)
             RETURNING village_id;
         `;
         const villageResult = await client.query(insertVillageQuery, [
-            village_no, village_name, province, district, sub_district, latitude, longitude, newAccountId
+            village_no, village_name, newAccountId, latitude, longitude
         ]);
         const newVillageId = villageResult.rows[0].village_id;
 
-        // 4. (ทางเลือก) อัปเดต user_accounts ให้รู้ว่าดูแล village_id ไหน
-        // await client.query('UPDATE user_accounts SET village_id = $1 WHERE account_id = $2', [newVillageId, newAccountId]);
+        // 4. ผูก village_id กลับไปที่ user_accounts (เพราะใน Schema คุณมีคอลัมน์ village_id ในตาราง user_accounts ด้วย)
+        await client.query('UPDATE user_accounts SET village_id = $1 WHERE account_id = $2', [newVillageId, newAccountId]);
+
+        // หมายเหตุ: ข้อมูล first_name, last_name ปัจจุบันยังไม่ได้ถูกบันทึก 
+        // เนื่องจากต้องไปสร้างในตาราง profiles (ซึ่งคุณต้องเพิ่ม logic ส่วนนี้ในภายหลัง หรือสร้างตาราง user_profiles เพิ่ม)
 
         await client.query('COMMIT');
         res.json({ success: true, message: 'ลงทะเบียนหมู่บ้านและผู้ใหญ่บ้านสำเร็จ', village_id: newVillageId, account_id: newAccountId });
     } catch (error) {
         await client.query('ROLLBACK');
         console.error('Registration Error:', error);
-        res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการลงทะเบียน' });
+        res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด: ' + error.message });
     } finally {
         client.release();
     }
