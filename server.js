@@ -1830,7 +1830,7 @@ app.put('/api/villages/:villageId/targets', async (req, res) => {
 });
 
 // ==========================================
-// 🌟 API สำหรับลงทะเบียนหมู่บ้านและผู้ใหญ่บ้าน (บันทึกครบทั้ง Account, Profile, Village)
+// 🌟 API สำหรับลงทะเบียนหมู่บ้านและผู้ใหญ่บ้าน (รองรับโครงสร้าง UUID อย่างสมบูรณ์)
 // ==========================================
 app.post('/api/villages/register', async (req, res) => {
     const {
@@ -1847,43 +1847,42 @@ app.post('/api/villages/register', async (req, res) => {
     try {
         await client.query('BEGIN'); 
 
-        // 1. เช็คว่ามี Username (เบอร์โทร) นี้ในระบบหรือยัง
+        // 1. ตรวจสอบว่าเบอร์โทรนี้ลงทะเบียนแล้วหรือยัง
         const checkUser = await client.query('SELECT account_id FROM user_accounts WHERE username_phone = $1', [phone_number]);
         if (checkUser.rows.length > 0) {
             await client.query('ROLLBACK');
             return res.status(400).json({ success: false, message: 'เบอร์โทรศัพท์นี้มีการลงทะเบียนแล้ว' });
         }
 
-        // 2. สร้าง Profile ก่อน เพื่อเก็บ ชื่อ, นามสกุล, บัตรประชาชน (สมมติชื่อตารางคือ user_profiles)
-        // ** สำคัญ: หากตาราง Profile ของคุณชื่ออื่น ให้แก้ชื่อตารางด้านล่างให้ตรงนะครับ **
+        // 2. สร้าง Profile โดยจัดการสร้าง UUID ขึ้นมาเอง
         const insertProfileQuery = `
-            INSERT INTO user_profiles (first_name, last_name, nickname, citizen_id)
-            VALUES ($1, $2, $3, $4)
+            INSERT INTO user_profiles (profile_id, first_name, last_name, nickname, citizen_id)
+            VALUES (gen_random_uuid(), $1, $2, $3, $4)
             RETURNING profile_id;
         `;
-        // ถ้าไม่มีตาราง user_profiles ให้คอมเมนต์ส่วนนี้ทิ้งไปก่อนครับ
         let newProfileId = null;
         try {
            const profileResult = await client.query(insertProfileQuery, [first_name, last_name, nickname, citizen_id]);
            newProfileId = profileResult.rows[0].profile_id;
         } catch(e) {
-           console.log("ไม่มีตาราง user_profiles หรือบันทึกไม่ได้ ข้ามการสร้าง Profile");
+           console.log("บันทึก Profile ไม่สำเร็จ (อาจไม่มีตารางหรือ schema ไม่ตรง):", e.message);
+           // หากต้องการให้ระบบลงทะเบียนล้มเหลวเลยเมื่อสร้าง Profile ไม่ได้ ให้ Uncomment บรรทัดล่างนี้:
+           // throw new Error("ไม่สามารถสร้างโปรไฟล์ผู้ใช้งานได้");
         }
 
-        // 3. สร้างบัญชีผู้ใช้งานใน user_accounts (เรียงลำดับ $1, $2 ให้ถูกต้อง)
+        // 3. สร้าง User Account (รองรับกรณี newProfileId เป็น null ได้ ถ้าคอลัมน์อนุญาต)
         const insertUserQuery = `
-            INSERT INTO user_accounts (username_phone, password_hash, is_active, area_code, profile_id)
-            VALUES ($1, $2, true, '+66', $3)
+            INSERT INTO user_accounts (account_id, username_phone, password_hash, is_active, area_code, profile_id)
+            VALUES (gen_random_uuid(), $1, $2, true, '+66', $3)
             RETURNING account_id;
         `;
-        // สังเกตการเรียงลำดับ: $1=phone_number, $2=password, $3=profile_id
         const userResult = await client.query(insertUserQuery, [phone_number, password, newProfileId]); 
         const newAccountId = userResult.rows[0].account_id;
 
-        // 4. สร้างข้อมูลหมู่บ้านในตาราง villages
+        // 4. สร้าง ข้อมูลหมู่บ้าน (Village)
         const insertVillageQuery = `
-            INSERT INTO villages (village_no, village_name, headman_account_id, headman_lat, headman_lng)
-            VALUES ($1, $2, $3, $4, $5)
+            INSERT INTO villages (village_id, village_no, village_name, headman_account_id, headman_lat, headman_lng)
+            VALUES (gen_random_uuid(), $1, $2, $3, $4, $5)
             RETURNING village_id;
         `;
         const villageResult = await client.query(insertVillageQuery, [
@@ -1891,7 +1890,7 @@ app.post('/api/villages/register', async (req, res) => {
         ]);
         const newVillageId = villageResult.rows[0].village_id;
 
-        // 5. ผูก village_id กลับไปที่ user_accounts
+        // 5. อัปเดต village_id กลับไปที่ user_accounts
         await client.query('UPDATE user_accounts SET village_id = $1 WHERE account_id = $2', [newVillageId, newAccountId]);
 
         await client.query('COMMIT');
@@ -1899,7 +1898,7 @@ app.post('/api/villages/register', async (req, res) => {
     } catch (error) {
         await client.query('ROLLBACK');
         console.error('Registration Error:', error);
-        res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด: ' + error.message });
+        res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการลงทะเบียน โปรดลองอีกครั้ง' });
     } finally {
         client.release();
     }
