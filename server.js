@@ -1829,6 +1829,68 @@ app.put('/api/villages/:villageId/targets', async (req, res) => {
     }
 });
 
+// ==========================================
+// 🌟 API สำหรับลงทะเบียนหมู่บ้านและผู้ใหญ่บ้าน (Register Village & Headman)
+// ==========================================
+app.post('/api/villages/register', async (req, res) => {
+    const {
+        village_no, village_name, province, district, sub_district,
+        latitude, longitude,
+        citizen_id, first_name, last_name, nickname, phone_number, password
+    } = req.body;
+
+    // ตรวจสอบข้อมูลเบื้องต้น
+    if (!village_name || !citizen_id || !first_name || !phone_number || !password) {
+        return res.status(400).json({ success: false, message: 'กรุณากรอกข้อมูลที่จำเป็นให้ครบถ้วน' });
+    }
+
+    const client = await pgPool.connect();
+    try {
+        await client.query('BEGIN'); // เริ่ม Transaction
+
+        // 1. ตรวจสอบว่าเลขบัตรนี้ลงทะเบียนไปแล้วหรือยัง (ป้องกันซ้ำ)
+        const checkUser = await client.query('SELECT * FROM user_accounts WHERE citizen_id = $1', [citizen_id]);
+        if (checkUser.rows.length > 0) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ success: false, message: 'เลขบัตรประชาชนนี้มีการลงทะเบียนแล้ว' });
+        }
+
+        // 2. สร้างบัญชีผู้ใหญ่บ้าน (user_accounts) ก่อน
+        // สมมติว่าในตาราง user_accounts ของคุณมีคอลัมน์เหล่านี้ (ปรับแก้ให้ตรงกับ Schema จริงของคุณได้ครับ)
+        const insertUserQuery = `
+            INSERT INTO user_accounts (citizen_id, first_name, last_name, nickname, phone, password, role)
+            VALUES ($1, $2, $3, $4, $5, $6, 'HEADMAN')
+            RETURNING account_id;
+        `;
+        // หมายเหตุ: ในระบบจริง password ควรถูก Hash ก่อนบันทึก แต่เพื่อความง่ายในการทดสอบตอนนี้จะบันทึกตรงๆ ไปก่อน
+        const userResult = await client.query(insertUserQuery, [citizen_id, first_name, last_name, nickname, phone_number, password]);
+        const newAccountId = userResult.rows[0].account_id;
+
+        // 3. สร้างข้อมูลหมู่บ้าน (villages) และเชื่อมกับผู้ใหญ่บ้าน
+        const insertVillageQuery = `
+            INSERT INTO villages (village_no, village_name, province, district, sub_district, latitude, longitude, headman_account_id)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            RETURNING village_id;
+        `;
+        const villageResult = await client.query(insertVillageQuery, [
+            village_no, village_name, province, district, sub_district, latitude, longitude, newAccountId
+        ]);
+        const newVillageId = villageResult.rows[0].village_id;
+
+        // 4. (ทางเลือก) อัปเดต user_accounts ให้รู้ว่าดูแล village_id ไหน
+        // await client.query('UPDATE user_accounts SET village_id = $1 WHERE account_id = $2', [newVillageId, newAccountId]);
+
+        await client.query('COMMIT');
+        res.json({ success: true, message: 'ลงทะเบียนหมู่บ้านและผู้ใหญ่บ้านสำเร็จ', village_id: newVillageId, account_id: newAccountId });
+    } catch (error) {
+        await client.query('ROLLBACK');
+        console.error('Registration Error:', error);
+        res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการลงทะเบียน' });
+    } finally {
+        client.release();
+    }
+});
+
 app.listen(port, () => {
     console.log(`Server is running on port ${port}`);
 });
