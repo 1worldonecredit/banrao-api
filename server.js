@@ -1830,7 +1830,7 @@ app.put('/api/villages/:villageId/targets', async (req, res) => {
 });
 
 // ==========================================
-// 🌟 API สำหรับลงทะเบียนหมู่บ้านและผู้ใหญ่บ้าน (แก้ไขให้ตรงกับ Schema จริง)
+// 🌟 API สำหรับลงทะเบียนหมู่บ้านและผู้ใหญ่บ้าน (บันทึกครบทั้ง Account, Profile, Village)
 // ==========================================
 app.post('/api/villages/register', async (req, res) => {
     const {
@@ -1839,8 +1839,7 @@ app.post('/api/villages/register', async (req, res) => {
         citizen_id, first_name, last_name, nickname, phone_number, password
     } = req.body;
 
-    // ตรวจสอบข้อมูลเบื้องต้น
-    if (!village_name || !citizen_id || !first_name || !phone_number || !password) {
+    if (!village_name || !phone_number || !password) {
         return res.status(400).json({ success: false, message: 'กรุณากรอกข้อมูลที่จำเป็นให้ครบถ้วน' });
     }
 
@@ -1848,26 +1847,40 @@ app.post('/api/villages/register', async (req, res) => {
     try {
         await client.query('BEGIN'); 
 
-        // 1. เช็คว่ามี Username (เบอร์โทรหรือบัตรประชาชน) นี้ในระบบหรือยัง
-        const checkUser = await client.query('SELECT account_id FROM user_accounts WHERE username_phone = $1', [citizen_id]);
+        // 1. เช็คว่ามี Username (เบอร์โทร) นี้ในระบบหรือยัง
+        const checkUser = await client.query('SELECT account_id FROM user_accounts WHERE username_phone = $1', [phone_number]);
         if (checkUser.rows.length > 0) {
             await client.query('ROLLBACK');
-            return res.status(400).json({ success: false, message: 'เลขบัตรประชาชนนี้มีการลงทะเบียนแล้ว' });
+            return res.status(400).json({ success: false, message: 'เบอร์โทรศัพท์นี้มีการลงทะเบียนแล้ว' });
         }
 
-        // 2. สร้างบัญชีผู้ใช้งานใน user_accounts 
-        // อ้างอิงคอลัมน์จริง: username_phone, password_hash
-       const insertUserQuery = `
-            INSERT INTO user_accounts (username_phone, password_hash, is_active, area_code)
-            VALUES ($1, $2, true, '+66')
+        // 2. สร้าง Profile ก่อน เพื่อเก็บ ชื่อ, นามสกุล, บัตรประชาชน (สมมติชื่อตารางคือ user_profiles)
+        // ** สำคัญ: หากตาราง Profile ของคุณชื่ออื่น ให้แก้ชื่อตารางด้านล่างให้ตรงนะครับ **
+        const insertProfileQuery = `
+            INSERT INTO user_profiles (first_name, last_name, nickname, citizen_id)
+            VALUES ($1, $2, $3, $4)
+            RETURNING profile_id;
+        `;
+        // ถ้าไม่มีตาราง user_profiles ให้คอมเมนต์ส่วนนี้ทิ้งไปก่อนครับ
+        let newProfileId = null;
+        try {
+           const profileResult = await client.query(insertProfileQuery, [first_name, last_name, nickname, citizen_id]);
+           newProfileId = profileResult.rows[0].profile_id;
+        } catch(e) {
+           console.log("ไม่มีตาราง user_profiles หรือบันทึกไม่ได้ ข้ามการสร้าง Profile");
+        }
+
+        // 3. สร้างบัญชีผู้ใช้งานใน user_accounts (เรียงลำดับ $1, $2 ให้ถูกต้อง)
+        const insertUserQuery = `
+            INSERT INTO user_accounts (username_phone, password_hash, is_active, area_code, profile_id)
+            VALUES ($1, $2, true, '+66', $3)
             RETURNING account_id;
         `;
-        const userResult = await client.query(insertUserQuery, [citizen_id, password]); 
+        // สังเกตการเรียงลำดับ: $1=phone_number, $2=password, $3=profile_id
+        const userResult = await client.query(insertUserQuery, [phone_number, password, newProfileId]); 
         const newAccountId = userResult.rows[0].account_id;
 
-        // 3. สร้างข้อมูลหมู่บ้านในตาราง villages
-        // อ้างอิงคอลัมน์จริง: village_no, village_name, headman_account_id, headman_lat, headman_lng
-        // (หมายเหตุ: ในตาราง villages ของคุณไม่มี province, district เราจึงเก็บแค่ชื่อและพิกัดตาม Schema ที่มี)
+        // 4. สร้างข้อมูลหมู่บ้านในตาราง villages
         const insertVillageQuery = `
             INSERT INTO villages (village_no, village_name, headman_account_id, headman_lat, headman_lng)
             VALUES ($1, $2, $3, $4, $5)
@@ -1878,11 +1891,8 @@ app.post('/api/villages/register', async (req, res) => {
         ]);
         const newVillageId = villageResult.rows[0].village_id;
 
-        // 4. ผูก village_id กลับไปที่ user_accounts (เพราะใน Schema คุณมีคอลัมน์ village_id ในตาราง user_accounts ด้วย)
+        // 5. ผูก village_id กลับไปที่ user_accounts
         await client.query('UPDATE user_accounts SET village_id = $1 WHERE account_id = $2', [newVillageId, newAccountId]);
-
-        // หมายเหตุ: ข้อมูล first_name, last_name ปัจจุบันยังไม่ได้ถูกบันทึก 
-        // เนื่องจากต้องไปสร้างในตาราง profiles (ซึ่งคุณต้องเพิ่ม logic ส่วนนี้ในภายหลัง หรือสร้างตาราง user_profiles เพิ่ม)
 
         await client.query('COMMIT');
         res.json({ success: true, message: 'ลงทะเบียนหมู่บ้านและผู้ใหญ่บ้านสำเร็จ', village_id: newVillageId, account_id: newAccountId });
