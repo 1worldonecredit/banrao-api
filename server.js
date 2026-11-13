@@ -1893,13 +1893,8 @@ app.post('/api/villages/register', async (req, res) => {
             VALUES (gen_random_uuid(), $1, $2, $3, $4, '1900-01-01')
             RETURNING profile_id;
         `;
-        let newProfileId = null;
-        try {
-           const profileResult = await client.query(insertProfileQuery, [first_name, last_name, nickname, citizen_id]);
-           newProfileId = profileResult.rows[0].profile_id;
-        } catch(e) {
-           console.log("บันทึก Profile ไม่สำเร็จ (ตรวจสอบ schema):", e.message);
-        }
+        const profileResult = await client.query(insertProfileQuery, [first_name, last_name, nickname, citizen_id]);
+        const newProfileId = profileResult.rows[0].profile_id;
 
         // เข้ารหัสผ่านก่อนบันทึก
         const hashedPassword = await bcrypt.hash(password, saltRounds);
@@ -1942,18 +1937,13 @@ app.post('/api/villages/register', async (req, res) => {
             VALUES ($1, $2, $3)
             RETURNING committee_id;
         `;
-        let newCommitteeId = null;
-        try {
-            // สร้างแท็บชื่อ "คณะกรรมการหมู่บ้าน"
-            const committeeResult = await client.query(insertCommitteeQuery, [
-                'คณะกรรมการหมู่บ้าน', 
-                'บริหารจัดการและดูแลความเรียบร้อยโดยรวมของหมู่บ้าน', 
-                newVillageId
-            ]);
-            newCommitteeId = committeeResult.rows[0].committee_id;
-        } catch (e) {
-            console.log("สร้างแท็บคณะทำงานไม่สำเร็จ (ตรวจสอบตาราง village_committees):", e.message);
-        }
+        // ตรวจสอบชื่อตารางให้ถูกต้อง ถ้าเป็น community_committees ให้แก้ตรง INSERT INTO
+        const committeeResult = await client.query(insertCommitteeQuery, [
+            'คณะกรรมการหมู่บ้าน', 
+            'บริหารจัดการและดูแลความเรียบร้อยโดยรวมของหมู่บ้าน', 
+            newVillageId
+        ]);
+        const newCommitteeId = committeeResult.rows[0].committee_id;
         // ==============================================
 
         await client.query('COMMIT');
@@ -1962,12 +1952,12 @@ app.post('/api/villages/register', async (req, res) => {
             message: 'ลงทะเบียนหมู่บ้านและผู้ใหญ่บ้านสำเร็จ', 
             village_id: newVillageId, 
             account_id: newAccountId,
-            committee_id: newCommitteeId // ส่งกลับไปเผื่อต้องใช้
+            committee_id: newCommitteeId
         });
     } catch (error) {
         await client.query('ROLLBACK');
         console.error('Registration Error:', error);
-        res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการลงทะเบียน โปรดลองอีกครั้ง' });
+        res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการลงทะเบียน โปรดตรวจสอบข้อมูลอีกครั้ง' });
     } finally {
         client.release();
     }
