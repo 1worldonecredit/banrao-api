@@ -1862,7 +1862,7 @@ app.put('/api/villages/:villageId/targets', async (req, res) => {
 });
 
 // ==========================================
-// 🌟 API สำหรับลงทะเบียนหมู่บ้านและผู้ใหญ่บ้าน (ฉบับสมบูรณ์: UUID, ผู้แนะนำ, สิทธิ์, และวันเกิด)
+// 🌟 API สำหรับลงทะเบียนหมู่บ้านและผู้ใหญ่บ้าน (เพิ่มการสร้างผังอัตโนมัติ)
 // ==========================================
 app.post('/api/villages/register', async (req, res) => {
     const {
@@ -1899,8 +1899,6 @@ app.post('/api/villages/register', async (req, res) => {
            newProfileId = profileResult.rows[0].profile_id;
         } catch(e) {
            console.log("บันทึก Profile ไม่สำเร็จ (ตรวจสอบ schema):", e.message);
-           // ถ้าตาราง profile มีแน่นอน และไม่อยากให้ข้าม error ให้เปิดบรรทัดล่างนี้
-           // throw e; 
         }
 
         // เข้ารหัสผ่านก่อนบันทึก
@@ -1909,35 +1907,16 @@ app.post('/api/villages/register', async (req, res) => {
         // 3. สร้าง User Account
         const insertUserQuery = `
             INSERT INTO user_accounts (
-                account_id, 
-                username_phone, 
-                password_hash, 
-                is_active, 
-                area_code, 
-                profile_id, 
-                referrer_id, 
-                role
+                account_id, username_phone, password_hash, is_active, area_code, profile_id, referrer_id, role
             )
             VALUES (
-                gen_random_uuid(), 
-                $1, 
-                $2, 
-                true, 
-                $3, 
-                $4, 
-                $5, 
-                'HEADMAN'
+                gen_random_uuid(), $1, $2, true, $3, $4, $5, 'HEADMAN'
             )
             RETURNING account_id;
         `;
         
-        // 🌟 เปลี่ยนจากการใส่ password ตรงๆ เป็น hashedPassword
         const userResult = await client.query(insertUserQuery, [
-            phone_number,
-            hashedPassword, // ใช้รหัสผ่านที่ Hash แล้ว
-            '100000', 
-            newProfileId,
-            referrer_account_id || null
+            phone_number, hashedPassword, '100000', newProfileId, referrer_account_id || null
         ]); 
         const newAccountId = userResult.rows[0].account_id;
 
@@ -1955,8 +1934,36 @@ app.post('/api/villages/register', async (req, res) => {
         // 5. อัปเดต village_id กลับไปที่ user_accounts
         await client.query('UPDATE user_accounts SET village_id = $1 WHERE account_id = $2', [newVillageId, newAccountId]);
 
+        // ==============================================
+        // 🌟 6. สร้าง "แท็บคณะทำงาน" เริ่มต้น ให้หมู่บ้านใหม่
+        // ==============================================
+        const insertCommitteeQuery = `
+            INSERT INTO village_committees (committee_name, description, village_id)
+            VALUES ($1, $2, $3)
+            RETURNING committee_id;
+        `;
+        let newCommitteeId = null;
+        try {
+            // สร้างแท็บชื่อ "คณะกรรมการหมู่บ้าน"
+            const committeeResult = await client.query(insertCommitteeQuery, [
+                'คณะกรรมการหมู่บ้าน', 
+                'บริหารจัดการและดูแลความเรียบร้อยโดยรวมของหมู่บ้าน', 
+                newVillageId
+            ]);
+            newCommitteeId = committeeResult.rows[0].committee_id;
+        } catch (e) {
+            console.log("สร้างแท็บคณะทำงานไม่สำเร็จ (ตรวจสอบตาราง village_committees):", e.message);
+        }
+        // ==============================================
+
         await client.query('COMMIT');
-        res.json({ success: true, message: 'ลงทะเบียนหมู่บ้านและผู้ใหญ่บ้านสำเร็จ', village_id: newVillageId, account_id: newAccountId });
+        res.json({ 
+            success: true, 
+            message: 'ลงทะเบียนหมู่บ้านและผู้ใหญ่บ้านสำเร็จ', 
+            village_id: newVillageId, 
+            account_id: newAccountId,
+            committee_id: newCommitteeId // ส่งกลับไปเผื่อต้องใช้
+        });
     } catch (error) {
         await client.query('ROLLBACK');
         console.error('Registration Error:', error);
@@ -1965,6 +1972,7 @@ app.post('/api/villages/register', async (req, res) => {
         client.release();
     }
 });
+
 
 app.listen(port, () => {
     console.log(`Server is running on port ${port}`);
