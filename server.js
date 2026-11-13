@@ -1856,10 +1856,11 @@ app.post('/api/villages/register', async (req, res) => {
 
         // 2. สร้าง Profile โดยจัดการสร้าง UUID ขึ้นมาเอง
         const insertProfileQuery = `
-            INSERT INTO user_profiles (profile_id, first_name, last_name, nickname, citizen_id)
-            VALUES (gen_random_uuid(), $1, $2, $3, $4)
-            RETURNING profile_id;
-        `;
+        INSERT INTO user_profiles (profile_id, first_name, last_name, nickname, citizen_id, dob)
+         VALUES (gen_random_uuid(), $1, $2, $3, $4, '1900-01-01')
+        RETURNING profile_id;
+`;
+    // ... ส่วนที่เหลือเหมือนเดิม
         let newProfileId = null;
         try {
            const profileResult = await client.query(insertProfileQuery, [first_name, last_name, nickname, citizen_id]);
