@@ -1857,12 +1857,12 @@ app.post('/api/villages/register', async (req, res) => {
 
         // 2. สร้างบัญชีผู้ใช้งานใน user_accounts 
         // อ้างอิงคอลัมน์จริง: username_phone, password_hash
-        const insertUserQuery = `
-            INSERT INTO user_accounts (username_phone, password_hash, is_active)
-            VALUES ($1, $2, true)
+       const insertUserQuery = `
+            INSERT INTO user_accounts (username_phone, password_hash, is_active, area_code)
+            VALUES ($1, $2, true, '+66')
             RETURNING account_id;
         `;
-        const userResult = await client.query(insertUserQuery, [citizen_id, password]); // บันทึกพาสเวิร์ดตรงๆ ไปก่อนเพื่อทดสอบ
+        const userResult = await client.query(insertUserQuery, [citizen_id, password]); 
         const newAccountId = userResult.rows[0].account_id;
 
         // 3. สร้างข้อมูลหมู่บ้านในตาราง villages
