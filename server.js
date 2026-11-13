@@ -387,7 +387,7 @@ app.post('/api/login', async (req, res) => {
                 v.household_count AS target_household_count, 
                 v.population_count AS target_population_count,
                 (SELECT COUNT(*) FROM households h WHERE h.village_id = v.village_id) AS actual_household_count,
-                (SELECT COUNT(*) FROM household_members hm JOIN households hs ON hm.house_id = hs.house_id WHERE hs.village_id = v.village_id) AS actual_population_count,
+                (SELECT COUNT(*) FROM household_members hm JOIN households hs ON hm.household_id = hs.household_id WHERE hs.village_id = v.village_id) AS actual_population_count,
                 
                 hp.first_name AS headman_first_name, 
                 hp.last_name AS headman_last_name,
