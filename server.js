@@ -1811,6 +1811,24 @@ app.get('/api/villages/:villageId/households', async (req, res) => {
     }
 });
 
+// 8. บันทึก/อัปเดตข้อมูลเป้าหมาย (บ้านและประชากร) ของหมู่บ้าน
+app.put('/api/villages/:villageId/targets', async (req, res) => {
+    const { villageId } = req.params;
+    const { target_houses, target_population } = req.body;
+    try {
+        const query = `
+            UPDATE villages 
+            SET household_count = $1, population_count = $2 
+            WHERE village_id = $3 
+            RETURNING *;
+        `;
+        const result = await pgPool.query(query, [target_houses, target_population, villageId]);
+        res.json({ success: true, data: result.rows[0], message: 'อัปเดตเป้าหมายสำเร็จ' });
+    } catch (error) {
+        res.status(500).json({ success: false, message: 'อัปเดตเป้าหมายล้มเหลว' });
+    }
+});
+
 app.listen(port, () => {
     console.log(`Server is running on port ${port}`);
 });
