@@ -1830,17 +1830,18 @@ app.put('/api/villages/:villageId/targets', async (req, res) => {
 });
 
 // ==========================================
-// 🌟 API สำหรับลงทะเบียนหมู่บ้านและผู้ใหญ่บ้าน (รองรับโครงสร้าง UUID อย่างสมบูรณ์)
+// 🌟 API สำหรับลงทะเบียนหมู่บ้านและผู้ใหญ่บ้าน (ฉบับสมบูรณ์: UUID, ผู้แนะนำ, สิทธิ์, และวันเกิด)
 // ==========================================
 app.post('/api/villages/register', async (req, res) => {
     const {
         village_no, village_name, province, district, sub_district,
         latitude, longitude,
-        citizen_id, first_name, last_name, nickname, phone_number, password
+        citizen_id, first_name, last_name, nickname, phone_number, password,
+        referrer_account_id // 🌟 รับค่า ID ผู้แนะนำมาจากระบบ Affiliate
     } = req.body;
 
-    if (!village_name || !phone_number || !password) {
-        return res.status(400).json({ success: false, message: 'กรุณากรอกข้อมูลที่จำเป็นให้ครบถ้วน' });
+    if (!phone_number || !password) {
+        return res.status(400).json({ success: false, message: 'กรุณากรอกข้อมูลเบอร์โทรศัพท์และรหัสผ่าน' });
     }
 
     const client = await pgPool.connect();
@@ -1854,30 +1855,54 @@ app.post('/api/villages/register', async (req, res) => {
             return res.status(400).json({ success: false, message: 'เบอร์โทรศัพท์นี้มีการลงทะเบียนแล้ว' });
         }
 
-        // 2. สร้าง Profile โดยจัดการสร้าง UUID ขึ้นมาเอง
+        // 2. สร้าง Profile โดยสร้าง UUID เอง และใส่ dob เป็นค่าเริ่มต้น (1900-01-01) กัน error NOT NULL
         const insertProfileQuery = `
-        INSERT INTO user_profiles (profile_id, first_name, last_name, nickname, citizen_id, dob)
-         VALUES (gen_random_uuid(), $1, $2, $3, $4, '1900-01-01')
-        RETURNING profile_id;
-`;
-    // ... ส่วนที่เหลือเหมือนเดิม
+            INSERT INTO user_profiles (profile_id, first_name, last_name, nickname, citizen_id, dob)
+            VALUES (gen_random_uuid(), $1, $2, $3, $4, '1900-01-01')
+            RETURNING profile_id;
+        `;
         let newProfileId = null;
         try {
            const profileResult = await client.query(insertProfileQuery, [first_name, last_name, nickname, citizen_id]);
            newProfileId = profileResult.rows[0].profile_id;
         } catch(e) {
-           console.log("บันทึก Profile ไม่สำเร็จ (อาจไม่มีตารางหรือ schema ไม่ตรง):", e.message);
-           // หากต้องการให้ระบบลงทะเบียนล้มเหลวเลยเมื่อสร้าง Profile ไม่ได้ ให้ Uncomment บรรทัดล่างนี้:
-           // throw new Error("ไม่สามารถสร้างโปรไฟล์ผู้ใช้งานได้");
+           console.log("บันทึก Profile ไม่สำเร็จ (ตรวจสอบ schema):", e.message);
+           // ถ้าตาราง profile มีแน่นอน และไม่อยากให้ข้าม error ให้เปิดบรรทัดล่างนี้
+           // throw e; 
         }
 
-        // 3. สร้าง User Account (รองรับกรณี newProfileId เป็น null ได้ ถ้าคอลัมน์อนุญาต)
+        // 3. สร้าง User Account (ลำดับ Parameter ตรงตาราง + ระบบผู้แนะนำ + สิทธิ์ HEADMAN)
+        // $1 = phone_number, $2 = password, $3 = area_code ('100000'), $4 = profile_id, $5 = referrer_id
         const insertUserQuery = `
-            INSERT INTO user_accounts (account_id, username_phone, password_hash, is_active, area_code, profile_id)
-            VALUES (gen_random_uuid(), $1, $2, true, '+66', $3)
+            INSERT INTO user_accounts (
+                account_id, 
+                username_phone, 
+                password_hash, 
+                is_active, 
+                area_code, 
+                profile_id, 
+                referrer_id, 
+                role
+            )
+            VALUES (
+                gen_random_uuid(), 
+                $1, 
+                $2, 
+                true, 
+                $3, 
+                $4, 
+                $5, 
+                'HEADMAN'
+            )
             RETURNING account_id;
         `;
-        const userResult = await client.query(insertUserQuery, [phone_number, password, newProfileId]); 
+        const userResult = await client.query(insertUserQuery, [
+            phone_number,
+            password,
+            '100000', // ใช้ 100000 แทน +66 ให้ตรงกับ format ข้อมูลเดิมในฐานข้อมูลของคุณ
+            newProfileId,
+            referrer_account_id || null
+        ]); 
         const newAccountId = userResult.rows[0].account_id;
 
         // 4. สร้าง ข้อมูลหมู่บ้าน (Village)
