@@ -2242,6 +2242,33 @@ app.put('/api/household-members/:member_id', async (req, res) => {
     }
 });
 
+// ==========================================
+// API: ดึงข้อมูลพื้นที่แบบเต็ม (หมู่บ้าน -> ตำบล -> อำเภอ -> จังหวัด)
+// ==========================================
+app.get('/api/location-context/:village_id', async (req, res) => {
+    try {
+        const { village_id } = req.params;
+        const result = await pgPool.query(`
+            SELECT v.village_no, v.village_name, 
+                   t.tambon_name_th, a.amphure_name_th, p.province_name_th
+            FROM villages v
+            JOIN sys_tambons t ON v.tambon_id = t.tambon_id
+            JOIN sys_amphures a ON t.amphure_code = a.amphure_code
+            JOIN sys_provinces p ON a.province_code = p.province_code
+            WHERE v.village_id = $1
+        `, [village_id]);
+        
+        if (result.rows.length > 0) {
+            res.json({ success: true, data: result.rows[0] });
+        } else {
+            res.json({ success: false, message: 'ไม่พบข้อมูลพื้นที่' });
+        }
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+    }
+});
+
+
 app.listen(port, () => {
     console.log(`Server is running on port ${port}`);
 });
