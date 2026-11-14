@@ -105,6 +105,24 @@ app.get('/api/villages/by-tambon', async (req, res) => {
     }
 });
 
+
+// ==========================================
+// API: ดึงรายชื่อหมู่บ้านตาม ID ตำบล (สำหรับแสดงตารางหน้า Master Data)
+// ==========================================
+app.get('/api/villages/by-tambon-id/:tambonId', async (req, res) => {
+    try {
+        const { tambonId } = req.params;
+        // เรียงลำดับหมู่บ้านตามตัวอักษร
+        const result = await pgPool.query(
+            'SELECT village_no, village_name FROM villages WHERE tambon_id = $1 ORDER BY village_no ASC',
+            [tambonId]
+        );
+        res.json(result.rows);
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
 app.get('/api/users/referrer/:phone', async (req, res) => {
     try {
         // ต้อง JOIN ตาราง villages เพื่อเอา village_no และ village_name มาแสดงบนหน้าเว็บ
