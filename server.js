@@ -123,6 +123,9 @@ app.get('/api/villages/by-tambon-id/:tambonId', async (req, res) => {
     }
 });
 
+
+
+
 app.get('/api/users/referrer/:phone', async (req, res) => {
     try {
         // ต้อง JOIN ตาราง villages เพื่อเอา village_no และ village_name มาแสดงบนหน้าเว็บ
@@ -2144,6 +2147,100 @@ app.post('/api/villages/register', async (req, res) => {
     }
 });
 
+
+// ==========================================
+// API: ระบบจัดการข้อมูลประชากร (Households & Members)
+// ==========================================
+
+// 1. ดึงข้อมูล "บ้านทั้งหมด" ในหมู่บ้านนั้น (พร้อมนับจำนวนคนปัจจุบัน)
+app.get('/api/households/:village_id', async (req, res) => {
+    try {
+        const { village_id } = req.params;
+        const result = await pgPool.query(`
+            SELECT h.*, 
+                   (SELECT COUNT(*) FROM household_members m WHERE m.household_id = h.household_id) as current_count
+            FROM households h
+            WHERE h.village_id = $1
+            ORDER BY h.house_no ASC
+        `, [village_id]);
+        res.json({ success: true, data: result.rows });
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+    }
+});
+
+// 2. เพิ่มข้อมูล "บ้านเลขที่ใหม่"
+app.post('/api/households', async (req, res) => {
+    try {
+        const { village_id, house_no, expected_member_count } = req.body;
+        const result = await pgPool.query(`
+            INSERT INTO households (village_id, house_no, expected_member_count)
+            VALUES ($1, $2, $3) RETURNING *
+        `, [village_id, house_no, expected_member_count]);
+        res.json({ success: true, message: 'เพิ่มบ้านสำเร็จ', data: result.rows[0] });
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+    }
+});
+
+// 3. แก้ไขข้อมูล "บ้าน" (เช่น แก้เลขที่บ้าน หรือ จำนวนคน)
+app.put('/api/households/:household_id', async (req, res) => {
+    try {
+        const { house_no, expected_member_count } = req.body;
+        const result = await pgPool.query(`
+            UPDATE households 
+            SET house_no = $1, expected_member_count = $2
+            WHERE household_id = $3 RETURNING *
+        `, [house_no, expected_member_count, req.params.household_id]);
+        res.json({ success: true, message: 'แก้ไขบ้านสำเร็จ', data: result.rows[0] });
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+    }
+});
+
+// 4. ดึงรายชื่อ "คน" ในบ้านที่เลือก
+app.get('/api/household-members/:household_id', async (req, res) => {
+    try {
+        const { household_id } = req.params;
+        const result = await pgPool.query(`
+            SELECT * FROM household_members
+            WHERE household_id = $1
+            ORDER BY created_at ASC
+        `, [household_id]);
+        res.json({ success: true, data: result.rows });
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+    }
+});
+
+// 5. เพิ่มรายชื่อ "คน" เข้าบ้าน
+app.post('/api/household-members', async (req, res) => {
+    try {
+        const { household_id, citizen_id, first_name, last_name, nickname, gender, date_of_birth } = req.body;
+        const result = await pgPool.query(`
+            INSERT INTO household_members (household_id, citizen_id, first_name, last_name, nickname, gender, date_of_birth)
+            VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *
+        `, [household_id, citizen_id, first_name, last_name, nickname, gender, date_of_birth]);
+        res.json({ success: true, message: 'เพิ่มสมาชิกสำเร็จ', data: result.rows[0] });
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+    }
+});
+
+// 6. แก้ไขข้อมูล "คน"
+app.put('/api/household-members/:member_id', async (req, res) => {
+    try {
+        const { citizen_id, first_name, last_name, nickname, gender, date_of_birth } = req.body;
+        const result = await pgPool.query(`
+            UPDATE household_members 
+            SET citizen_id = $1, first_name = $2, last_name = $3, nickname = $4, gender = $5, date_of_birth = $6
+            WHERE member_id = $7 RETURNING *
+        `, [citizen_id, first_name, last_name, nickname, gender, date_of_birth, req.params.member_id]);
+        res.json({ success: true, message: 'แก้ไขสมาชิกสำเร็จ', data: result.rows[0] });
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+    }
+});
 
 app.listen(port, () => {
     console.log(`Server is running on port ${port}`);
