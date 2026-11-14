@@ -35,6 +35,51 @@ const pgPool = new Pool({
     }
 });
 
+
+
+// ==========================================
+// API: บันทึกข้อมูลหมู่บ้านแบบ Batch (ทีละหลายรายการ)
+// ==========================================
+app.post('/api/sys-villages/batch', async (req, res) => {
+    const { tambon_id, villages } = req.body; 
+    // villages คาดหวังรูปแบบ: [{ village_no: '1', village_name: 'บ้านดง' }, ...]
+
+    if (!tambon_id || !villages || villages.length === 0) {
+        return res.status(400).json({ success: false, message: 'ข้อมูลไม่ครบถ้วน' });
+    }
+
+    const client = await pgPool.connect();
+    try {
+        await client.query('BEGIN');
+        
+        let insertedCount = 0;
+        for (const v of villages) {
+            // เช็คว่ามีหมู่บ้านนี้ในตำบลนี้หรือยัง (กันซ้ำ)
+            const check = await client.query(
+                'SELECT village_id FROM sys_villages WHERE tambon_id = $1 AND village_no = $2 AND village_name = $3',
+                [tambon_id, v.village_no, v.village_name]
+            );
+
+            if (check.rows.length === 0) {
+                await client.query(
+                    'INSERT INTO sys_villages (tambon_id, village_no, village_name) VALUES ($1, $2, $3)',
+                    [tambon_id, v.village_no, v.village_name]
+                );
+                insertedCount++;
+            }
+        }
+
+        await client.query('COMMIT');
+        res.json({ success: true, message: `บันทึกข้อมูลหมู่บ้านสำเร็จ ${insertedCount} รายการ` });
+    } catch (error) {
+        await client.query('ROLLBACK');
+        console.error("Batch Insert Villages Error:", error);
+        res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการบันทึกข้อมูล' });
+    } finally {
+        client.release();
+    }
+});
+
 // ==========================================
 // API: อัปโหลดรูป Profile
 // ==========================================
