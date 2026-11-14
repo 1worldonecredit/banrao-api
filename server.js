@@ -2268,6 +2268,40 @@ app.get('/api/location-context/:village_id', async (req, res) => {
     }
 });
 
+// ==========================================
+// API: ดึงรายชื่อคณะทำงานและผู้นำชุมชน (Community Committees)
+// ==========================================
+app.get('/api/community-committees/:village_id', async (req, res) => {
+    try {
+        const { village_id } = req.params;
+        
+        // หมายเหตุ: ตรวจสอบชื่อตารางในคำสั่ง SQL ให้ตรงกับฐานข้อมูล Neon ของคุณ
+        // จากโปรเจกต์ของคุณ ตารางอาจชื่อ user_positions, committee_profiles หรือ community_committees
+        
+        const result = await pgPool.query(`
+            SELECT * 
+            FROM committee_profiles 
+            WHERE village_id = $1
+            ORDER BY created_at ASC
+        `, [village_id]);
+        
+        /* 
+        // 💡 ถ้าคุณมีการแยกตารางตำแหน่ง (sys_positions) ให้เปิดใช้ SQL ตัวนี้แทนครับ:
+        const result = await pgPool.query(\`
+            SELECT up.*, sp.position_name 
+            FROM user_positions up
+            LEFT JOIN sys_positions sp ON up.position_id = sp.position_id
+            WHERE up.village_id = $1
+            ORDER BY sp.level ASC, up.created_at ASC
+        \`, [village_id]);
+        */
+
+        res.json({ success: true, data: result.rows });
+    } catch (error) {
+        console.error("API Error (community-committees):", error);
+        res.status(500).json({ success: false, message: error.message });
+    }
+});
 
 app.listen(port, () => {
     console.log(`Server is running on port ${port}`);
