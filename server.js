@@ -36,34 +36,31 @@ const pgPool = new Pool({
 });
 
 
-// ดึงรายชื่อจังหวัดทั้งหมด
+// 1. ดึงจังหวัด (เปลี่ยนมาส่งคืน province_code ให้ Frontend)
 app.get('/api/sys-provinces', async (req, res) => {
     try {
-        const result = await pgPool.query('SELECT province_id, province_name_th FROM sys_provinces ORDER BY province_name_th ASC');
+        const result = await pgPool.query('SELECT province_code, province_name_th FROM sys_provinces ORDER BY province_name_th ASC');
         res.json(result.rows);
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
+    } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ดึงรายชื่ออำเภอตาม province_id
-app.get('/api/sys-amphures/:provinceId', async (req, res) => {
+// 2. ดึงอำเภอ (ค้นหาด้วย amphure_code ที่ขึ้นต้นด้วยรหัสจังหวัด 2 หลัก)
+app.get('/api/sys-amphures/:provinceCode', async (req, res) => {
     try {
-        const result = await pgPool.query('SELECT amphure_id, amphure_name_th FROM sys_amphures WHERE province_id = $1 ORDER BY amphure_name_th ASC', [req.params.provinceId]);
+        const pCode = req.params.provinceCode;
+        const result = await pgPool.query('SELECT amphure_code, amphure_name_th FROM sys_amphures WHERE amphure_code LIKE $1 ORDER BY amphure_name_th ASC', [`${pCode}%`]);
         res.json(result.rows);
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
+    } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ดึงรายชื่อตำบลตาม amphure_id
-app.get('/api/sys-tambons/:amphureId', async (req, res) => {
+// 3. ดึงตำบล (ค้นหาด้วย tambon_code ที่ขึ้นต้นด้วยรหัสอำเภอ 4 หลัก)
+app.get('/api/sys-tambons/:amphureCode', async (req, res) => {
     try {
-        const result = await pgPool.query('SELECT tambon_id, tambon_name_th FROM sys_tambons WHERE amphure_id = $1 ORDER BY tambon_name_th ASC', [req.params.amphureId]);
+        const aCode = req.params.amphureCode;
+        // ต้องคืนค่า tambon_id กลับไปเพื่อให้ Frontend เอาไปบันทึกหมู่บ้านลงตาราง sys_villages
+        const result = await pgPool.query('SELECT tambon_id, tambon_name_th FROM sys_tambons WHERE tambon_code LIKE $1 ORDER BY tambon_name_th ASC', [`${aCode}%`]);
         res.json(result.rows);
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
+    } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // ==========================================
