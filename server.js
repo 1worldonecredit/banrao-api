@@ -1130,6 +1130,9 @@ app.get('/api/search-citizen/:citizenId', async (req, res) => {
     }
 });
 
+// ==========================================
+// API: ดึงข้อมูลผังผู้นำและคณะทำงาน
+// ==========================================
 app.get('/api/community-leaders/:villageId', async (req, res) => {
     const { villageId } = req.params;
     const { term_date, committee_id } = req.query;
@@ -1138,6 +1141,7 @@ app.get('/api/community-leaders/:villageId', async (req, res) => {
     try {
         let query = `
             SELECT 
+                up.id, /* 🌟 สำคัญมาก: เพิ่ม up.id ให้ Frontend นำไปใช้ทำ parent_id ได้ง่ายๆ */
                 up.id as position_record_id,
                 up.account_id,
                 up.position_id,
@@ -1145,7 +1149,7 @@ app.get('/api/community-leaders/:villageId', async (req, res) => {
                 up.start_date,
                 up.end_date,
                 up.responsibilities,
-                up.parent_id, /* 🌟 สำคัญ: ดึง parent_id ออกมาด้วย */
+                up.parent_id,
                 p.first_name,
                 p.last_name,
                 cpm.image_url as user_image
