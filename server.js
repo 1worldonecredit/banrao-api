@@ -1982,8 +1982,9 @@ app.post('/api/villages/register', async (req, res) => {
             ) VALUES ($1, $2, 'VILLAGE', $3, CURRENT_DATE, true, $4, null, 'ผู้นำสูงสุดของหมู่บ้าน')
         `;
         await client.query(insertLeaderQuery, [
-            newAccountId, currentPositionId, newVillageId, newCommitteeId
+            newAccountId, currentPositionId, newVillageId, null // 🌟 เปลี่ยน newCommitteeId เป็น null ชั่วคราวเพื่อหลีกเลี่ยง Error Integer
         ]);
+        // ==============================================
         // ==============================================
 
         await client.query('COMMIT');
