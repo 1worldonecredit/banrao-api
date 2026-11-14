@@ -1131,7 +1131,7 @@ app.get('/api/search-citizen/:citizenId', async (req, res) => {
 });
 
 // ==========================================
-// API: ดึงข้อมูลผังผู้นำและคณะทำงาน
+// API: ดึงข้อมูลผังผู้นำและคณะทำงาน (แก้ไขชื่อคอลัมน์)
 // ==========================================
 app.get('/api/community-leaders/:villageId', async (req, res) => {
     const { villageId } = req.params;
@@ -1141,8 +1141,7 @@ app.get('/api/community-leaders/:villageId', async (req, res) => {
     try {
         let query = `
             SELECT 
-                up.id, /* 🌟 สำคัญมาก: เพิ่ม up.id ให้ Frontend นำไปใช้ทำ parent_id ได้ง่ายๆ */
-                up.id as position_record_id,
+                up.id, /* ส่งกลับไปเป็น id ตรงๆ เพื่อให้ Tree นำไปจัดเรียงได้ง่ายๆ */
                 up.account_id,
                 up.position_id,
                 sp.position_name,
