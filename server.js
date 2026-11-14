@@ -1878,7 +1878,7 @@ app.put('/api/villages/:villageId/targets', async (req, res) => {
 });
 
 // ==========================================
-// 🌟 API สำหรับลงทะเบียนหมู่บ้านและผู้ใหญ่บ้าน (ฉบับสมบูรณ์ 100% แมปตรงกับ Database)
+// 🌟 API สำหรับลงทะเบียนหมู่บ้านและผู้ใหญ่บ้าน (อัปเดตเพิ่มคนลงผัง)
 // ==========================================
 app.post('/api/villages/register', async (req, res) => {
     const {
@@ -1909,13 +1909,8 @@ app.post('/api/villages/register', async (req, res) => {
             VALUES (gen_random_uuid(), $1, $2, $3, $4, '1900-01-01')
             RETURNING profile_id;
         `;
-        let newProfileId = null;
-        try {
-           const profileResult = await client.query(insertProfileQuery, [first_name, last_name, nickname, citizen_id]);
-           newProfileId = profileResult.rows[0].profile_id;
-        } catch(e) {
-           console.log("บันทึก Profile ไม่สำเร็จ (ตรวจสอบ schema):", e.message);
-        }
+        const profileResult = await client.query(insertProfileQuery, [first_name, last_name, nickname, citizen_id]);
+        const newProfileId = profileResult.rows[0].profile_id;
 
         const hashedPassword = await bcrypt.hash(password, saltRounds);
 
@@ -1929,7 +1924,6 @@ app.post('/api/villages/register', async (req, res) => {
             )
             RETURNING account_id;
         `;
-        
         const userResult = await client.query(insertUserQuery, [
             phone_number, hashedPassword, '100000', newProfileId, referrer_account_id || null
         ]); 
@@ -1950,7 +1944,7 @@ app.post('/api/villages/register', async (req, res) => {
         await client.query('UPDATE user_accounts SET village_id = $1 WHERE account_id = $2', [newVillageId, newAccountId]);
 
         // ==============================================
-        // 🌟 6. สร้าง "แท็บคณะทำงาน" เริ่มต้น ให้หมู่บ้านใหม่ (สมบูรณ์ตาม Schema)
+        // 🌟 6. สร้าง "แท็บคณะทำงาน" เริ่มต้น
         // ==============================================
         const insertCommitteeQuery = `
             INSERT INTO village_committees (
@@ -1959,15 +1953,37 @@ app.post('/api/villages/register', async (req, res) => {
             VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, CURRENT_TIMESTAMP)
             RETURNING committee_id;
         `;
-        
         const committeeResult = await client.query(insertCommitteeQuery, [
             newVillageId, 
             newAccountId, 
-            'ผู้ใหญ่บ้าน', // ใส่ข้อมูลลงคอลัมน์ position_name ที่มีอยู่
-            'คณะกรรมการหมู่บ้าน', // ข้อมูลแท็บ
-            'บริหารจัดการและดูแลความเรียบร้อยโดยรวมของหมู่บ้าน' // ข้อมูลคำอธิบาย
+            'ผู้ใหญ่บ้าน',
+            'คณะกรรมการหมู่บ้าน', 
+            'บริหารจัดการและดูแลความเรียบร้อยโดยรวมของหมู่บ้าน'
         ]);
         const newCommitteeId = committeeResult.rows[0].committee_id;
+
+        // ==============================================
+        // 🌟 7. เอาผู้ใหญ่บ้านคนนี้ ไปใส่ในตาราง user_positions จริงๆ
+        // ==============================================
+        // เช็คว่ามีตำแหน่ง "ผู้ใหญ่บ้าน" ในระบบหรือยัง
+        let currentPositionId = null;
+        const posResult = await client.query('SELECT position_id FROM sys_positions WHERE position_name = $1 LIMIT 1', ['ผู้ใหญ่บ้าน']);
+        if (posResult.rows.length > 0) {
+            currentPositionId = posResult.rows[0].position_id;
+        } else {
+            const maxIdResult = await client.query('SELECT COALESCE(MAX(position_id), 0) + 1 as next_id FROM sys_positions WHERE position_id < 999');
+            currentPositionId = maxIdResult.rows[0].next_id;
+            await client.query(`INSERT INTO sys_positions (position_id, position_name, position_level) VALUES ($1, $2, 'VILLAGE')`, [currentPositionId, 'ผู้ใหญ่บ้าน']);
+        }
+
+        const insertLeaderQuery = `
+            INSERT INTO user_positions (
+                account_id, position_id, scope_type, scope_id, start_date, is_active, committee_id, parent_id, responsibilities
+            ) VALUES ($1, $2, 'VILLAGE', $3, CURRENT_DATE, true, $4, null, 'ผู้นำสูงสุดของหมู่บ้าน')
+        `;
+        await client.query(insertLeaderQuery, [
+            newAccountId, currentPositionId, newVillageId, newCommitteeId
+        ]);
         // ==============================================
 
         await client.query('COMMIT');
