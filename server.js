@@ -38,6 +38,9 @@ const pgPool = new Pool({
 // ==========================================
 // API: บันทึกข้อมูลหมู่บ้านแบบ Batch 
 // ==========================================
+// ==========================================
+// API: บันทึกข้อมูลหมู่บ้านแบบ Batch (รองรับ UUID และ Schema เต็ม)
+// ==========================================
 app.post('/api/sys-villages/batch', async (req, res) => {
     const { tambon_id, villages } = req.body; 
 
@@ -51,15 +54,18 @@ app.post('/api/sys-villages/batch', async (req, res) => {
         
         let insertedCount = 0;
         for (const v of villages) {
-            // เช็คข้อมูลซ้ำก่อนบันทึก
+            // 1. เช็คว่ามีหมู่บ้านนี้ในตำบลนี้หรือยัง (กันข้อมูลซ้ำ)
             const check = await client.query(
                 'SELECT village_id FROM sys_villages WHERE tambon_id = $1 AND village_no = $2 AND village_name = $3',
                 [tambon_id, v.village_no, v.village_name]
             );
 
             if (check.rows.length === 0) {
+                // 2. บันทึกข้อมูล โดยสร้าง village_id เป็น UUID และกำหนดค่าเริ่มต้น (Default) ให้ฟิลด์อื่นๆ
                 await client.query(
-                    'INSERT INTO sys_villages (tambon_id, village_no, village_name) VALUES ($1, $2, $3)',
+                    `INSERT INTO sys_villages 
+                    (village_id, tambon_id, village_no, village_name, is_approved_by_admin, is_registration_open, created_at) 
+                    VALUES (gen_random_uuid(), $1, $2, $3, true, true, CURRENT_TIMESTAMP)`,
                     [tambon_id, v.village_no, v.village_name]
                 );
                 insertedCount++;
@@ -71,7 +77,8 @@ app.post('/api/sys-villages/batch', async (req, res) => {
     } catch (error) {
         await client.query('ROLLBACK');
         console.error("Batch Insert Villages Error:", error);
-        res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการบันทึกข้อมูล' });
+        // เพิ่มการส่ง error.message กลับไปที่หน้าจอ เพื่อให้เรารู้ทันทีถ้า Database ฟ้องอะไรอีก
+        res.status(500).json({ success: false, message: `เกิดข้อผิดพลาดจากฐานข้อมูล: ${error.message}` });
     } finally {
         client.release();
     }
