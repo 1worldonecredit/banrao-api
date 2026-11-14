@@ -36,10 +36,7 @@ const pgPool = new Pool({
 });
 
 // ==========================================
-// API: บันทึกข้อมูลหมู่บ้านแบบ Batch 
-// ==========================================
-/// ==========================================
-// API: บันทึกข้อมูลหมู่บ้านแบบ Batch (แก้ปัญหา Error 500 column does not exist)
+// API: บันทึกข้อมูลหมู่บ้านแบบ Batch (อัปเดตชื่อตารางเป็น villages)
 // ==========================================
 app.post('/api/sys-villages/batch', async (req, res) => {
     const { tambon_id, villages } = req.body; 
@@ -54,18 +51,18 @@ app.post('/api/sys-villages/batch', async (req, res) => {
         
         let insertedCount = 0;
         for (const v of villages) {
-            // 1. เช็คข้อมูลซ้ำ (ใช้ tambon_code แทน tambon_id)
+            // 1. เช็คข้อมูลซ้ำในตาราง villages
             const check = await client.query(
-                'SELECT village_id FROM sys_villages WHERE tambon_code = $1 AND village_no = $2 AND village_name = $3',
+                'SELECT village_id FROM villages WHERE tambon_id = $1 AND village_no = $2 AND village_name = $3', 
                 [tambon_id, v.village_no, v.village_name]
             );
 
             if (check.rows.length === 0) {
-                // 2. บันทึกข้อมูล (ใช้ tambon_code แทน tambon_id)
+                // 2. บันทึกข้อมูลลงตาราง villages 
+                // หมายเหตุ: โครงสร้างตาราง villages ของคุณมีการตั้งค่า DEFAULT ให้หลายคอลัมน์แล้ว (เช่น village_id, is_approved_by_admin, created_at)
+                // ดังนั้นเราส่งแค่ 3 คอลัมน์หลักก็พอครับ
                 await client.query(
-                    `INSERT INTO sys_villages 
-                    (village_id, tambon_code, village_no, village_name, is_approved_by_admin, is_registration_open, created_at) 
-                    VALUES (gen_random_uuid(), $1, $2, $3, true, true, CURRENT_TIMESTAMP)`,
+                    `INSERT INTO villages (tambon_id, village_no, village_name) VALUES ($1, $2, $3)`,
                     [tambon_id, v.village_no, v.village_name]
                 );
                 insertedCount++;
@@ -82,6 +79,8 @@ app.post('/api/sys-villages/batch', async (req, res) => {
         client.release();
     }
 });
+
+
 // 1. ดึงจังหวัด (เปลี่ยนมาส่งคืน province_code ให้ Frontend)
 app.get('/api/sys-provinces', async (req, res) => {
     try {
