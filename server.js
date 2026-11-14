@@ -80,6 +80,52 @@ app.post('/api/sys-villages/batch', async (req, res) => {
     }
 });
 
+// ==========================================
+// API 1: ดึงรายชื่อหมู่บ้านตามชื่อตำบล (สำหรับ Dropdown)
+// ==========================================
+app.get('/api/villages/by-tambon', async (req, res) => {
+    const { tambon_name } = req.query;
+    if (!tambon_name) return res.json([]);
+
+    try {
+        // ตัดคำว่า "ตำบล" หรือ "ต." ออก เพื่อนำไปค้นหาแบบ LIKE ได้แม่นยำขึ้น
+        const cleanTambonName = tambon_name.replace('ตำบล', '').replace('ต.', '').trim();
+        
+        const result = await pgPool.query(`
+            SELECT v.village_id, v.village_no, v.village_name 
+            FROM villages v
+            JOIN sys_tambons t ON v.tambon_id = t.tambon_id
+            WHERE t.tambon_name_th LIKE $1
+            ORDER BY v.village_no ASC
+        `, [`%${cleanTambonName}%`]);
+        
+        res.json(result.rows);
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.get('/api/users/referrer/:phone', async (req, res) => {
+    try {
+        // ต้อง JOIN ตาราง villages เพื่อเอา village_no และ village_name มาแสดงบนหน้าเว็บ
+        const result = await pgPool.query(`
+            SELECT u.first_name, u.last_name, v.village_no, v.village_name
+            FROM user_accounts u
+            LEFT JOIN villages v ON u.village_id = v.village_id 
+            WHERE u.phone = $1
+            LIMIT 1
+        `, [req.params.phone]);
+        
+        if (result.rows.length > 0) {
+            res.json({ success: true, data: result.rows[0] });
+        } else {
+            res.json({ success: false, message: 'ไม่พบข้อมูล' });
+        }
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
 
 // 1. ดึงจังหวัด (เปลี่ยนมาส่งคืน province_code ให้ Frontend)
 app.get('/api/sys-provinces', async (req, res) => {
