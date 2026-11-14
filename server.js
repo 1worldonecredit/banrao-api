@@ -1271,9 +1271,17 @@ app.get('/api/community-committees/:villageId', async (req, res) => {
         res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการดึงข้อมูลคณะทำงาน' });
     }
 });
-
+// ==========================================
+// API: เพิ่มบุคลากรลงในผังคณะทำงาน (แก้ปัญหา $9 integer)
+// ==========================================
 app.post('/api/community-leaders', async (req, res) => {
-    const { village_id, committee_id, position_name, account_id, start_date, end_date, responsibilities, parent_id } = req.body; // 🌟 เพิ่มรับค่า parent_id
+    const { village_id, committee_id, position_name, account_id, start_date, end_date, responsibilities, parent_id } = req.body;
+
+    // 🌟 1. ดักจับและแปลง parent_id ให้เป็นตัวเลข (Integer) หรือ null เท่านั้น ป้องกัน Error $9
+    let safeParentId = parseInt(parent_id, 10);
+    if (isNaN(safeParentId)) {
+        safeParentId = null;
+    }
 
     const client = await pgPool.connect();
     try {
@@ -1295,7 +1303,15 @@ app.post('/api/community-leaders', async (req, res) => {
         `;
         
         await client.query(insertQuery, [
-            account_id, currentPositionId, 'VILLAGE', village_id, start_date, end_date || null, responsibilities, committee_id, parent_id || null // 🌟 บันทึก parent_id
+            account_id, 
+            currentPositionId, 
+            'VILLAGE', 
+            village_id, 
+            start_date, 
+            end_date || null, 
+            responsibilities, 
+            committee_id, 
+            safeParentId // 🌟 2. ใช้ safeParentId ที่ผ่านการกรองแล้ว ส่งเข้า $9
         ]);
 
         await client.query('COMMIT'); 
