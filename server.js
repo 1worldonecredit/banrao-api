@@ -1975,10 +1975,25 @@ app.put('/api/villages/:villageId/targets', async (req, res) => {
 });
 
 // ==========================================
-// 🌟 API สำหรับลงทะเบียนหมู่บ้านและผู้ใหญ่บ้าน (แก้ปัญหาวงเล็บหาย และดักเลขบัตรซ้ำ)
+// 🌟 API สำหรับลงทะเบียนหมู่บ้านและผู้ใหญ่บ้าน (ฉบับสมบูรณ์ แก้ไขแล้ว)
 // ==========================================
 app.post('/api/villages/register', async (req, res) => {
-   // 1. ตรวจสอบเบอร์โทรซ้ำ และ เลขบัตร ปชช. ซ้ำ (เช็คเลขบัตรเฉพาะเมื่อมีการกรอกมา)
+    const {
+        village_no, village_name, province, district, sub_district,
+        latitude, longitude,
+        citizen_id, first_name, last_name, nickname, phone_number, password,
+        referrer_account_id
+    } = req.body;
+
+    if (!phone_number || !password) {
+        return res.status(400).json({ success: false, message: 'กรุณากรอกข้อมูลเบอร์โทรศัพท์และรหัสผ่าน' });
+    }
+
+    const client = await pgPool.connect();
+    try {
+        await client.query('BEGIN'); 
+
+        // 1. ตรวจสอบเบอร์โทรซ้ำ และ เลขบัตร ปชช. ซ้ำ
         const cleanCitizenId = citizen_id ? String(citizen_id).replace(/-/g, '').trim() || null : null;
 
         const checkPhone = await client.query(
@@ -2001,7 +2016,7 @@ app.post('/api/villages/register', async (req, res) => {
             }
         }
 
-        // 2. สร้าง Profile (ส่ง cleanCitizenId ที่เป็น null หากไม่ได้กรอก)
+        // 2. สร้าง Profile 
         const insertProfileQuery = `
             INSERT INTO user_profiles (profile_id, first_name, last_name, nickname, citizen_id, dob)
             VALUES (gen_random_uuid(), $1, $2, $3, $4, '1900-01-01')
@@ -2010,7 +2025,7 @@ app.post('/api/villages/register', async (req, res) => {
         const profileResult = await client.query(insertProfileQuery, [first_name, last_name, nickname, cleanCitizenId]);
         const newProfileId = profileResult.rows[0].profile_id;
 
-        const hashedPassword = await bcrypt.hash(password, saltRounds);
+        const hashedPassword = await bcrypt.hash(password, 10);
 
         // 3. สร้าง User Account
         const insertUserQuery = `
@@ -2050,7 +2065,7 @@ app.post('/api/villages/register', async (req, res) => {
             }
         }
 
-        // 4. สร้าง ข้อมูลหมู่บ้าน (บันทึก tambon_id)
+        // 4. สร้าง ข้อมูลหมู่บ้าน
         const insertVillageQuery = `
             INSERT INTO villages (village_id, village_no, village_name, tambon_id, headman_account_id, headman_lat, headman_lng)
             VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6)
@@ -2117,7 +2132,6 @@ app.post('/api/villages/register', async (req, res) => {
         client.release();
     }
 });
-
 
 // ==========================================
 // API: ระบบจัดการข้อมูลประชากร (Households & Members)
