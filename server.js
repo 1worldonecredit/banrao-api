@@ -506,6 +506,8 @@ app.delete('/api/menus/:id', async (req, res) => {
 // 🌟 API เข้าสู่ระบบ (Login) - โครงสร้างสมบูรณ์อิงตาม Schema จริง 100%
 // ==========================================
 app.post('/api/login', async (req, res) => {
+
+    console.log('👉 มีคนกด Login! ข้อมูลที่ส่งมาคือ:', req.body);
     const usernameInput = req.body.username || req.body.phone_number;
     const password = req.body.password;
 
