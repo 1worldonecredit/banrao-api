@@ -2077,6 +2077,8 @@ app.post('/api/villages/register', async (req, res) => {
         const committeeResult = await client.query(insertCommitteeQuery, [newVillageId, newAccountId]);
         const newCommitteeId = committeeResult.rows[0].committee_id;
 
+       // ... (โค้ดช่วงบนเหมือนเดิม จนถึงขั้นตอนที่ 7) ...
+
         // 7. เอาผู้ใหญ่บ้านคนนี้ ไปใส่ในตาราง user_positions
         let currentPositionId = null;
         const posResult = await client.query('SELECT position_id FROM sys_positions WHERE position_name = $1 LIMIT 1', ['ผู้ใหญ่บ้าน']);
@@ -2088,13 +2090,13 @@ app.post('/api/villages/register', async (req, res) => {
             await client.query(`INSERT INTO sys_positions (position_id, position_name, position_level) VALUES ($1, 'ผู้ใหญ่บ้าน', 'VILLAGE')`, [currentPositionId]);
         }
 
-        // บันทึกตำแหน่ง พร้อม scope_id เป็น village_id ของหมู่บ้านนั้น
+        // 🌟 แก้ไข: ลบ committee_id ออกจากการ INSERT เพื่อป้องกัน Error 22P02
         const insertLeaderQuery = `
             INSERT INTO user_positions (
-                account_id, position_id, scope_type, scope_id, start_date, is_active, committee_id, responsibilities
-            ) VALUES ($1, $2, 'VILLAGE', $3, CURRENT_DATE, true, $4, 'ผู้นำสูงสุดของหมู่บ้าน')
+                account_id, position_id, scope_type, scope_id, start_date, is_active, responsibilities
+            ) VALUES ($1, $2, 'VILLAGE', $3, CURRENT_DATE, true, 'ผู้นำสูงสุดของหมู่บ้าน')
         `;
-        await client.query(insertLeaderQuery, [newAccountId, currentPositionId, newVillageId, newCommitteeId]);
+        await client.query(insertLeaderQuery, [newAccountId, currentPositionId, newVillageId]);
 
         await client.query('COMMIT');
         res.json({ 
