@@ -2118,6 +2118,8 @@ app.post('/api/villages/register', async (req, res) => {
     }
 });
 
+
+
 // ==========================================
 // API: ระบบจัดการข้อมูลประชากร (Households & Members)
 // ==========================================
@@ -2153,21 +2155,26 @@ app.post('/api/households', async (req, res) => {
     }
 });
 
-// 3. แก้ไขข้อมูล "บ้าน" (เช่น แก้เลขที่บ้าน หรือ จำนวนคน)
+// ==========================================
+// API: แก้ไขข้อมูลบ้าน (บ้านเลขที่, จำนวนคนเป้าหมาย)
+// ==========================================
 app.put('/api/households/:household_id', async (req, res) => {
     try {
+        const { household_id } = req.params;
         const { house_no, expected_member_count } = req.body;
-        const result = await pgPool.query(`
+        
+        await pgPool.query(`
             UPDATE households 
-            SET house_no = $1, expected_member_count = $2
-            WHERE household_id = $3 RETURNING *
-        `, [house_no, expected_member_count, req.params.household_id]);
-        res.json({ success: true, message: 'แก้ไขบ้านสำเร็จ', data: result.rows[0] });
+            SET house_no = $1, 
+                expected_member_count = $2
+            WHERE household_id = $3
+        `, [house_no, expected_member_count || 0, household_id]);
+        
+        res.json({ success: true, message: 'แก้ไขข้อมูลบ้านสำเร็จ' });
     } catch (error) {
         res.status(500).json({ success: false, message: error.message });
     }
 });
-
 // ==========================================
 // 1. API: ดึงข้อมูลสมาชิกในบ้าน (ปรับให้ดึงข้อมูลได้ชัวร์ 100%)
 // ==========================================
