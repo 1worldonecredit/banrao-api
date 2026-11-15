@@ -2235,15 +2235,83 @@ app.get('/api/household-members/:household_id', async (req, res) => {
     }
 });
 
-// 5. เพิ่มรายชื่อ "คน" เข้าบ้าน
+// ==========================================
+// API 5: เพิ่มรายชื่อ "คน" เข้าบ้าน (อัปเดตรองรับชาวต่างชาติ และสถานะการอยู่อาศัย)
+// ==========================================
 app.post('/api/household-members', async (req, res) => {
     try {
-        const { household_id, citizen_id, first_name, last_name, nickname, gender, date_of_birth } = req.body;
+        // 1. รับค่าที่ส่งมาจาก Frontend ทั้งหมด (เพิ่มฟิลด์ใหม่ๆ เข้ามา)
+        const { 
+            household_id, citizen_id, first_name, last_name, nickname, gender, date_of_birth,
+            is_foreigner, passport_no, nationality, resident_type, relationship, note, status
+        } = req.body;
+
+        // 2. บันทึกข้อมูลลงตาราง household_members (เพิ่มคอลัมน์ใหม่ๆ ลงไปในคำสั่ง INSERT)
         const result = await pgPool.query(`
-            INSERT INTO household_members (household_id, citizen_id, first_name, last_name, nickname, gender, date_of_birth)
-            VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *
-        `, [household_id, citizen_id, first_name, last_name, nickname, gender, date_of_birth]);
+            INSERT INTO household_members (
+                household_id, citizen_id, first_name, last_name, nickname, gender, date_of_birth,
+                is_foreigner, passport_no, nationality, resident_type, relationship, note, status
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) 
+            RETURNING *
+        `, [
+            household_id, citizen_id, first_name, last_name, nickname, gender, date_of_birth,
+            is_foreigner, passport_no, nationality, resident_type, relationship, note, status || 'ACTIVE'
+        ]);
+
         res.json({ success: true, message: 'เพิ่มสมาชิกสำเร็จ', data: result.rows[0] });
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+    }
+});
+
+// ==========================================
+// API: แก้ไขข้อมูลสมาชิกเดิม (เผื่อไว้ใช้งานตอนกดปุ่ม Edit)
+// ==========================================
+app.put('/api/household-members/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { 
+            citizen_id, first_name, last_name, nickname, gender, date_of_birth,
+            is_foreigner, passport_no, nationality, resident_type, relationship, note, status
+        } = req.body;
+
+        await pgPool.query(`
+            UPDATE household_members 
+            SET citizen_id = $1, first_name = $2, last_name = $3, nickname = $4, gender = $5, date_of_birth = $6,
+                is_foreigner = $7, passport_no = $8, nationality = $9, resident_type = $10, relationship = $11, note = $12, status = $13
+            WHERE member_id = $14
+        `, [
+            citizen_id, first_name, last_name, nickname, gender, date_of_birth,
+            is_foreigner, passport_no, nationality, resident_type, relationship, note, status, id
+        ]);
+
+        res.json({ success: true, message: 'แก้ไขข้อมูลสำเร็จ' });
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+    }
+});
+
+// ==========================================
+// API: ดึงข้อมูลสมาชิกในบ้าน (ใช้ LEFT JOIN เพื่อให้รายชื่อแสดงเสมอแม้ไม่มี Profile)
+// ==========================================
+app.get('/api/household-members/:household_id', async (req, res) => {
+    try {
+        const { household_id } = req.params;
+        const result = await pgPool.query(`
+            SELECT m.*, 
+                   -- ดึงชื่อจากตารางหลัก m เป็นหลัก ถ้าไม่มีค่อยไปเอาจาก p (เผื่อไว้)
+                   COALESCE(m.first_name, p.first_name) as first_name, 
+                   COALESCE(m.last_name, p.last_name) as last_name, 
+                   COALESCE(m.nickname, p.nickname) as nickname, 
+                   COALESCE(m.gender, p.gender) as gender
+            FROM household_members m
+            LEFT JOIN user_profiles p ON m.profile_id = p.profile_id
+            WHERE m.household_id = $1
+            ORDER BY m.status DESC, m.first_name ASC
+        `, [household_id]); 
+        
+        res.json({ success: true, data: result.rows });
     } catch (error) {
         res.status(500).json({ success: false, message: error.message });
     }
