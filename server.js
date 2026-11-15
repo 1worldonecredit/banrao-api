@@ -2213,15 +2213,20 @@ app.put('/api/households/:household_id', async (req, res) => {
     }
 });
 
-// 4. ดึงรายชื่อ "คน" ในบ้านที่เลือก
+// ==========================================
+// API: ดึงข้อมูลสมาชิกในบ้าน (เพิ่มเงื่อนไข status)
+// ==========================================
 app.get('/api/household-members/:household_id', async (req, res) => {
     try {
         const { household_id } = req.params;
         const result = await pgPool.query(`
-            SELECT * FROM household_members
-            WHERE household_id = $1
-            ORDER BY created_at ASC
-        `, [household_id]);
+            SELECT m.*, p.first_name, p.last_name, p.nickname, p.gender, p.citizen_id
+            FROM household_members m
+            JOIN user_profiles p ON m.profile_id = p.profile_id
+            WHERE m.household_id = $1
+            ORDER BY m.status DESC, p.first_name ASC
+        `, [household_id]); // เรียงให้คนที่ยังอยู่ (ACTIVE) ขึ้นก่อน
+        
         res.json({ success: true, data: result.rows });
     } catch (error) {
         res.status(500).json({ success: false, message: error.message });
@@ -2256,9 +2261,27 @@ app.put('/api/household-members/:member_id', async (req, res) => {
         res.status(500).json({ success: false, message: error.message });
     }
 });
-
 // ==========================================
-// API: ดึงข้อมูลพื้นที่แบบเต็ม (หมู่บ้าน -> ตำบล -> อำเภอ -> จังหวัด)
+// API: อัปเดตสถานะสมาชิก (ACTIVE -> INACTIVE)
+// ==========================================
+app.put('/api/household-members/:member_id/status', async (req, res) => {
+    try {
+        const { member_id } = req.params;
+        const { status } = req.body; // รับค่า 'ACTIVE' หรือ 'INACTIVE'
+        
+        await pgPool.query(`
+            UPDATE household_members 
+            SET status = $1 
+            WHERE member_id = $2
+        `, [status, member_id]);
+        
+        res.json({ success: true, message: 'อัปเดตสถานะสำเร็จ' });
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+    }
+});
+// ==========================================
+// API: ดึงข้อมูลพื้นที่แบบเต็ม (แก้ JOIN ให้ถูกต้อง)
 // ==========================================
 app.get('/api/location-context/:village_id', async (req, res) => {
     try {
@@ -2267,9 +2290,9 @@ app.get('/api/location-context/:village_id', async (req, res) => {
             SELECT v.village_no, v.village_name, 
                    t.tambon_name_th, a.amphure_name_th, p.province_name_th
             FROM villages v
-            JOIN sys_tambons t ON v.tambon_id = t.tambon_id
-            JOIN sys_amphures a ON t.amphure_code = a.amphure_code
-            JOIN sys_provinces p ON a.province_code = p.province_code
+            LEFT JOIN sys_tambons t ON v.tambon_id = t.tambon_id
+            LEFT JOIN sys_amphures a ON t.amphure_id = a.amphure_id
+            LEFT JOIN sys_provinces p ON a.province_id = p.province_id
             WHERE v.village_id = $1
         `, [village_id]);
         
