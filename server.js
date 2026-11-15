@@ -2197,17 +2197,59 @@ app.get('/api/household-members/:household_id', async (req, res) => {
 });
 
 // ==========================================
-// API 5: เพิ่มรายชื่อ "คน" เข้าบ้าน (อัปเดตรองรับชาวต่างชาติ และสถานะการอยู่อาศัย)
+// API: เพิ่มรายชื่อ "คน" เข้าบ้าน (เพิ่มระบบตรวจสอบความซ้ำซ้อน)
 // ==========================================
 app.post('/api/household-members', async (req, res) => {
     try {
-        // 1. รับค่าที่ส่งมาจาก Frontend ทั้งหมด (เพิ่มฟิลด์ใหม่ๆ เข้ามา)
         const { 
             household_id, citizen_id, first_name, last_name, nickname, gender, date_of_birth,
             is_foreigner, passport_no, nationality, resident_type, relationship, note, status
         } = req.body;
 
-        // 2. บันทึกข้อมูลลงตาราง household_members (เพิ่มคอลัมน์ใหม่ๆ ลงไปในคำสั่ง INSERT)
+        // 1. กำหนดตัวแปรสำหรับค้นหาความซ้ำซ้อน (คนไทยใช้ citizen_id, ต่างชาติใช้ passport_no)
+        const idToCheck = is_foreigner ? passport_no : citizen_id;
+        const idColumn = is_foreigner ? 'passport_no' : 'citizen_id';
+
+        if (!idToCheck) {
+            return res.status(400).json({ success: false, message: 'กรุณาระบุเลขบัตรประชาชนหรือเลขพาสปอร์ต' });
+        }
+
+        // 2. ค้นหาประวัติของคนๆ นี้ในระบบ (หาจากทุกบ้านในหมู่บ้าน)
+        // เพื่อเช็คว่าเขาเคยถูกบันทึกไว้ที่บ้านหลังไหนบ้าง
+        const existingRecords = await pgPool.query(`
+            SELECT member_id, household_id, resident_type, status 
+            FROM household_members 
+            WHERE ${idColumn} = $1
+        `, [idToCheck]);
+
+        if (existingRecords.rows.length > 0) {
+            
+            // กฎข้อ 1: ห้ามเพิ่มซ้ำในบ้านหลังเดิม (เว้นแต่จะแก้ข้อมูล ซึ่งจะไปเข้าเส้น PUT แทน)
+            const alreadyInThisHouse = existingRecords.rows.find(r => r.household_id === household_id);
+            if (alreadyInThisHouse) {
+                return res.status(400).json({ 
+                    success: false, 
+                    message: 'บุคคลนี้มีรายชื่ออยู่ในบ้านหลังนี้แล้ว กรุณาใช้ปุ่มแก้ไขหากต้องการเปลี่ยนแปลงข้อมูล' 
+                });
+            }
+
+            // กฎข้อ 2: ถ้ากำลังจะบันทึกแบบ "มีชื่อในทะเบียนบ้าน" (REGISTERED)
+            if (resident_type === 'REGISTERED') {
+                // ต้องเช็คว่า เขาเคยเป็นเจ้าบ้าน/มีชื่อในทะเบียนบ้าน ของบ้านหลังอื่น และสถานะยัง Active อยู่หรือไม่?
+                const activeRegistered = existingRecords.rows.find(r => r.resident_type === 'REGISTERED' && r.status === 'ACTIVE');
+                if (activeRegistered) {
+                    return res.status(400).json({ 
+                        success: false, 
+                        message: 'ไม่สามารถบันทึกได้! บุคคลนี้มีชื่อในทะเบียนบ้านหลักอยู่ที่บ้านหลังอื่นแล้ว (1 คน มีชื่อในทะเบียนบ้านได้เพียงที่เดียว)' 
+                    });
+                }
+            }
+            
+            // กฎข้อ 3: ถ้ากำลังจะบันทึกแบบ "ผู้อยู่อาศัย (NON_REGISTERED)"
+            // อันนี้อนุญาตให้บันทึกได้เลย เพราะเขาอาจจะมีชื่อในทะเบียนบ้านที่อื่น (หรือที่บ้านหลังอื่นในหมู่บ้าน) แล้วมาเช่าบ้านหลังนี้
+        }
+
+        // 3. ถ้าผ่านเงื่อนไขทั้งหมด ให้ทำการบันทึกลง Database
         const result = await pgPool.query(`
             INSERT INTO household_members (
                 household_id, citizen_id, first_name, last_name, nickname, gender, date_of_birth,
@@ -2222,6 +2264,7 @@ app.post('/api/household-members', async (req, res) => {
 
         res.json({ success: true, message: 'เพิ่มสมาชิกสำเร็จ', data: result.rows[0] });
     } catch (error) {
+        console.error("Add Member Error:", error);
         res.status(500).json({ success: false, message: error.message });
     }
 });
