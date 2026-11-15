@@ -149,25 +149,28 @@ app.get('/api/villages/by-tambon-id/:tambonId', async (req, res) => {
 
 
 
-
+// ==========================================
+// API: ค้นหาข้อมูลผู้แนะนำจากเบอร์โทรศัพท์
+// ==========================================
 app.get('/api/users/referrer/:phone', async (req, res) => {
     try {
-        // ต้อง JOIN ตาราง villages เพื่อเอา village_no และ village_name มาแสดงบนหน้าเว็บ
+        const { phone } = req.params;
         const result = await pgPool.query(`
-            SELECT u.first_name, u.last_name, v.village_no, v.village_name
+            SELECT u.account_id, p.first_name, p.last_name, v.village_no, v.village_name
             FROM user_accounts u
-            LEFT JOIN villages v ON u.village_id = v.village_id 
-            WHERE u.phone = $1
+            JOIN user_profiles p ON u.profile_id = p.profile_id
+            LEFT JOIN villages v ON u.village_id = v.village_id
+            WHERE u.username_phone = $1 AND u.is_active = true
             LIMIT 1
-        `, [req.params.phone]);
-        
+        `, [phone]);
+
         if (result.rows.length > 0) {
             res.json({ success: true, data: result.rows[0] });
         } else {
             res.json({ success: false, message: 'ไม่พบข้อมูล' });
         }
     } catch (error) {
-        res.status(500).json({ error: error.message });
+        res.status(500).json({ success: false, message: error.message });
     }
 });
 
@@ -1975,26 +1978,24 @@ app.put('/api/villages/:villageId/targets', async (req, res) => {
 // 🌟 API สำหรับลงทะเบียนหมู่บ้านและผู้ใหญ่บ้าน (อัปเดตค้นหาและบันทึก tambon_id)
 // ==========================================
 app.post('/api/villages/register', async (req, res) => {
-    const {
-        village_no, village_name, province, district, sub_district,
-        latitude, longitude,
-        citizen_id, first_name, last_name, nickname, phone_number, password,
-        referrer_account_id
-    } = req.body;
+   // 1. ตรวจสอบเบอร์โทรซ้ำ และ เลขบัตร ปชช. ซ้ำ
+        const cleanCitizenId = citizen_id ? citizen_id.replace(/-/g, '').trim() : null;
+        
+        const checkUser = await client.query(`
+            SELECT u.account_id, p.citizen_id 
+            FROM user_accounts u
+            LEFT JOIN user_profiles p ON u.profile_id = p.profile_id
+            WHERE u.username_phone = $1 OR (p.citizen_id = $2 AND p.citizen_id IS NOT NULL)
+        `, [phone_number, cleanCitizenId]);
 
-    if (!phone_number || !password) {
-        return res.status(400).json({ success: false, message: 'กรุณากรอกข้อมูลเบอร์โทรศัพท์และรหัสผ่าน' });
-    }
-
-    const client = await pgPool.connect();
-    try {
-        await client.query('BEGIN'); 
-
-        // 1. ตรวจสอบเบอร์โทรซ้ำ
-        const checkUser = await client.query('SELECT account_id FROM user_accounts WHERE username_phone = $1', [phone_number]);
         if (checkUser.rows.length > 0) {
             await client.query('ROLLBACK');
-            return res.status(400).json({ success: false, message: 'เบอร์โทรศัพท์นี้มีการลงทะเบียนแล้ว' });
+            const foundByPhone = checkUser.rows.some(r => r.account_id && req.body.phone_number === phone_number); // เช็คคร่าวๆ
+            if (foundByPhone) {
+                return res.status(400).json({ success: false, message: 'เบอร์โทรศัพท์นี้มีการลงทะเบียนแล้ว' });
+            } else {
+                return res.status(400).json({ success: false, message: 'เลขบัตรประชาชนนี้มีการลงทะเบียนในระบบแล้ว' });
+            }
         }
 
         // 2. สร้าง Profile 
