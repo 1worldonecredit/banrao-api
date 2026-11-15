@@ -2214,18 +2214,20 @@ app.put('/api/households/:household_id', async (req, res) => {
 });
 
 // ==========================================
-// API: ดึงข้อมูลสมาชิกในบ้าน (เพิ่มเงื่อนไข status)
+// API: ดึงข้อมูลสมาชิกในบ้าน 
 // ==========================================
 app.get('/api/household-members/:household_id', async (req, res) => {
     try {
         const { household_id } = req.params;
         const result = await pgPool.query(`
-            SELECT m.*, p.first_name, p.last_name, p.nickname, p.gender, p.citizen_id
+            SELECT m.*, 
+                   -- กรณีบันทึกชื่อไว้ใน user_profiles ก็ดึงมา แต่ถ้าเซฟตรงๆ ไว้ใน household_members ก็จะดึงได้ด้วย
+                   p.first_name, p.last_name, p.nickname, p.gender, p.citizen_id
             FROM household_members m
-            JOIN user_profiles p ON m.profile_id = p.profile_id
+            LEFT JOIN user_profiles p ON m.profile_id = p.profile_id
             WHERE m.household_id = $1
-            ORDER BY m.status DESC, p.first_name ASC
-        `, [household_id]); // เรียงให้คนที่ยังอยู่ (ACTIVE) ขึ้นก่อน
+            ORDER BY m.status DESC
+        `, [household_id]); 
         
         res.json({ success: true, data: result.rows });
     } catch (error) {
