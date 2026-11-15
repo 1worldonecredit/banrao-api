@@ -1978,42 +1978,30 @@ app.put('/api/villages/:villageId/targets', async (req, res) => {
 // 🌟 API สำหรับลงทะเบียนหมู่บ้านและผู้ใหญ่บ้าน (แก้ปัญหาวงเล็บหาย และดักเลขบัตรซ้ำ)
 // ==========================================
 app.post('/api/villages/register', async (req, res) => {
-    const {
-        village_no, village_name, province, district, sub_district,
-        latitude, longitude,
-        citizen_id, first_name, last_name, nickname, phone_number, password,
-        referrer_account_id
-    } = req.body;
+   // 1. ตรวจสอบเบอร์โทรซ้ำ และ เลขบัตร ปชช. ซ้ำ (เช็คเลขบัตรเฉพาะเมื่อมีการกรอกมา)
+        const cleanCitizenId = citizen_id ? String(citizen_id).replace(/-/g, '').trim() || null : null;
 
-    if (!phone_number || !password) {
-        return res.status(400).json({ success: false, message: 'กรุณากรอกข้อมูลเบอร์โทรศัพท์และรหัสผ่าน' });
-    }
-
-    const client = await pgPool.connect();
-    try {
-        await client.query('BEGIN'); 
-
-        // 1. ตรวจสอบเบอร์โทรซ้ำ และ เลขบัตร ปชช. ซ้ำ
-        const cleanCitizenId = citizen_id ? citizen_id.replace(/-/g, '').trim() : null;
-        
-        const checkUser = await client.query(`
-            SELECT u.account_id, p.citizen_id 
-            FROM user_accounts u
-            LEFT JOIN user_profiles p ON u.profile_id = p.profile_id
-            WHERE u.username_phone = $1 OR (p.citizen_id = $2 AND p.citizen_id IS NOT NULL)
-        `, [phone_number, cleanCitizenId]);
-
-        if (checkUser.rows.length > 0) {
+        const checkPhone = await client.query(
+            'SELECT account_id FROM user_accounts WHERE username_phone = $1',
+            [phone_number]
+        );
+        if (checkPhone.rows.length > 0) {
             await client.query('ROLLBACK');
-            const foundByPhone = checkUser.rows.some(r => r.account_id && req.body.phone_number === phone_number); 
-            if (foundByPhone) {
-                return res.status(400).json({ success: false, message: 'เบอร์โทรศัพท์นี้มีการลงทะเบียนแล้ว' });
-            } else {
+            return res.status(400).json({ success: false, message: 'เบอร์โทรศัพท์นี้มีการลงทะเบียนแล้ว' });
+        }
+
+        if (cleanCitizenId) {
+            const checkCitizen = await client.query(
+                'SELECT profile_id FROM user_profiles WHERE citizen_id = $1',
+                [cleanCitizenId]
+            );
+            if (checkCitizen.rows.length > 0) {
+                await client.query('ROLLBACK');
                 return res.status(400).json({ success: false, message: 'เลขบัตรประชาชนนี้มีการลงทะเบียนในระบบแล้ว' });
             }
         }
 
-        // 2. สร้าง Profile 
+        // 2. สร้าง Profile (ส่ง cleanCitizenId ที่เป็น null หากไม่ได้กรอก)
         const insertProfileQuery = `
             INSERT INTO user_profiles (profile_id, first_name, last_name, nickname, citizen_id, dob)
             VALUES (gen_random_uuid(), $1, $2, $3, $4, '1900-01-01')
