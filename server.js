@@ -14,14 +14,38 @@ const bcrypt = require('bcrypt');
 // เปิดใช้งาน CORS เพื่อให้ Frontend (พอร์ต 5173) เรียกใช้งานได้
 const saltRounds = 10;
 
-
-
-// ------------------------------
+// ---------------------------------------------
 // ตั้งค่า Secret Key สำหรับสร้าง Token (ในระบบจริงควรเก็บไว้ในไฟล์ .env)
 const JWT_SECRET = process.env.JWT_SECRET || 'mySuperSecretKeyForBookingApp2026';
-app.use(cors());
 
-// ขยายขีดจำกัดให้รองรับรูปภาพสลิป
+// ==========================================
+// 1. ตั้งค่า CORS (ตั้งค่าไว้ที่เดียวให้จบ ครอบคลุมทุกโดเมน)
+// ==========================================
+const allowedOrigins = [
+  'https://banrao.life',
+  'https://www.banrao.life',
+  'https://supper.banrao.life',
+  'https://emp.banrao.life',
+  'http://localhost:5173',
+  'http://localhost:5174'
+];
+
+app.use(cors({
+  origin: function (origin, callback) {
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.indexOf(origin) === -1) {
+      const msg = 'The CORS policy for this site does not allow access from the specified Origin.';
+      return callback(new Error(msg), false);
+    }
+    return callback(null, true);
+  },
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  credentials: true 
+}));
+
+// ==========================================
+// 2. ขยายขีดจำกัดให้รองรับรูปภาพสลิป
+// ==========================================
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
@@ -307,18 +331,7 @@ app.post('/api/save-location', async (req, res) => {
         res.status(500).json({ success: false, error: "Database Error" });
     }
 });
-// ---------------------------------------------------------
-// 0. ตั้งค่า CORS (จำกัดโดเมนที่อนุญาตให้เข้าถึง API)
-// ---------------------------------------------------------
-const allowedOrigins = [
-  'https://banrao.life',             // โดเมนหลัก
-  'https://supper.banrao.life', 
-  'https://api.banrao.life',
-  'https://emp.banrao.life',
-   // โดเมนหลัก (มี www)
- 'http://localhost:5173',
-  'http://localhost:5174'       // สำหรับทดสอบ Frontend (อื่นๆ)
-];
+
 
 
 // ==========================================
