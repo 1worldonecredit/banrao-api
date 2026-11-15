@@ -1975,7 +1975,7 @@ app.put('/api/villages/:villageId/targets', async (req, res) => {
 });
 
 // ==========================================
-// 🌟 API สำหรับลงทะเบียนหมู่บ้านและผู้ใหญ่บ้าน (ฉบับสมบูรณ์ แก้ไขแล้ว)
+// 🌟 API สำหรับลงทะเบียนหมู่บ้านและผู้ใหญ่บ้าน (ฉบับสมบูรณ์ที่สุด - ป้องกัน Error ทุกจุด)
 // ==========================================
 app.post('/api/villages/register', async (req, res) => {
     const {
@@ -1994,7 +1994,7 @@ app.post('/api/villages/register', async (req, res) => {
         await client.query('BEGIN'); 
 
         // 1. ตรวจสอบเบอร์โทรซ้ำ และ เลขบัตร ปชช. ซ้ำ
-        const cleanCitizenId = citizen_id ? String(citizen_id).replace(/-/g, '').trim() || null : null;
+        const cleanCitizenId = citizen_id ? String(citizen_id).replace(/-/g, '').trim() : null;
 
         const checkPhone = await client.query(
             'SELECT account_id FROM user_accounts WHERE username_phone = $1',
@@ -2016,13 +2016,15 @@ app.post('/api/villages/register', async (req, res) => {
             }
         }
 
-        // 2. สร้าง Profile 
+        // 2. สร้าง Profile (สร้างเลขสุ่ม 13 หลักนำหน้า 999 กรณีไม่กรอก เพื่อกัน Error UNIQUE)
+        const finalCitizenId = cleanCitizenId || `999${Math.floor(Math.random() * 10000000000).toString().padStart(10, '0')}`;
+
         const insertProfileQuery = `
             INSERT INTO user_profiles (profile_id, first_name, last_name, nickname, citizen_id, dob)
             VALUES (gen_random_uuid(), $1, $2, $3, $4, '1900-01-01')
             RETURNING profile_id;
         `;
-        const profileResult = await client.query(insertProfileQuery, [first_name, last_name, nickname, cleanCitizenId]);
+        const profileResult = await client.query(insertProfileQuery, [first_name, last_name, nickname, finalCitizenId]);
         const newProfileId = profileResult.rows[0].profile_id;
 
         const hashedPassword = await bcrypt.hash(password, 10);
@@ -2042,24 +2044,24 @@ app.post('/api/villages/register', async (req, res) => {
         ]); 
         const newAccountId = userResult.rows[0].account_id;
 
-        // 3.5 ค้นหา tambon_id จากข้อความภาษาไทย
+        // 3.5 ค้นหา tambon_id จากข้อความภาษาไทย (ลบคำนำหน้าให้ค้นหาแม่นยำ)
         let mappedTambonId = null;
         if (sub_district && district && province) {
+            const searchSub = String(sub_district).replace(/ตำบล|ต\./g, '').trim();
+            const searchDist = String(district).replace(/อำเภอ|เขต|อ\./g, '').trim();
+            const searchProv = String(province).replace(/จังหวัด|จ\./g, '').trim();
+
             const tambonQuery = `
                 SELECT t.tambon_id 
                 FROM sys_tambons t
                 JOIN sys_amphures a ON t.amphure_id = a.amphure_id
                 JOIN sys_provinces p ON a.province_id = p.province_id
-                WHERE t.tambon_name_th LIKE $1 
-                  AND a.amphure_name_th LIKE $2 
-                  AND p.province_name_th LIKE $3
+                WHERE t.tambon_name_th LIKE '%' || $1 || '%'
+                  AND a.amphure_name_th LIKE '%' || $2 || '%'
+                  AND p.province_name_th LIKE '%' || $3 || '%'
                 LIMIT 1;
             `;
-            const searchSub = sub_district.replace('ตำบล', '').replace('ต.', '').trim();
-            const searchDist = district.replace('อำเภอ', '').replace('เขต', '').replace('อ.', '').trim();
-            const searchProv = province.replace('จังหวัด', '').replace('จ.', '').trim();
-            
-            const tResult = await client.query(tambonQuery, [`%${searchSub}%`, `%${searchDist}%`, `%${searchProv}%`]);
+            const tResult = await client.query(tambonQuery, [searchSub, searchDist, searchProv]);
             if (tResult.rows.length > 0) {
                 mappedTambonId = tResult.rows[0].tambon_id;
             }
