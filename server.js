@@ -1975,10 +1975,25 @@ app.put('/api/villages/:villageId/targets', async (req, res) => {
 });
 
 // ==========================================
-// 🌟 API สำหรับลงทะเบียนหมู่บ้านและผู้ใหญ่บ้าน (อัปเดตค้นหาและบันทึก tambon_id)
+// 🌟 API สำหรับลงทะเบียนหมู่บ้านและผู้ใหญ่บ้าน (แก้ปัญหาวงเล็บหาย และดักเลขบัตรซ้ำ)
 // ==========================================
 app.post('/api/villages/register', async (req, res) => {
-   // 1. ตรวจสอบเบอร์โทรซ้ำ และ เลขบัตร ปชช. ซ้ำ
+    const {
+        village_no, village_name, province, district, sub_district,
+        latitude, longitude,
+        citizen_id, first_name, last_name, nickname, phone_number, password,
+        referrer_account_id
+    } = req.body;
+
+    if (!phone_number || !password) {
+        return res.status(400).json({ success: false, message: 'กรุณากรอกข้อมูลเบอร์โทรศัพท์และรหัสผ่าน' });
+    }
+
+    const client = await pgPool.connect();
+    try {
+        await client.query('BEGIN'); 
+
+        // 1. ตรวจสอบเบอร์โทรซ้ำ และ เลขบัตร ปชช. ซ้ำ
         const cleanCitizenId = citizen_id ? citizen_id.replace(/-/g, '').trim() : null;
         
         const checkUser = await client.query(`
@@ -1990,7 +2005,7 @@ app.post('/api/villages/register', async (req, res) => {
 
         if (checkUser.rows.length > 0) {
             await client.query('ROLLBACK');
-            const foundByPhone = checkUser.rows.some(r => r.account_id && req.body.phone_number === phone_number); // เช็คคร่าวๆ
+            const foundByPhone = checkUser.rows.some(r => r.account_id && req.body.phone_number === phone_number); 
             if (foundByPhone) {
                 return res.status(400).json({ success: false, message: 'เบอร์โทรศัพท์นี้มีการลงทะเบียนแล้ว' });
             } else {
@@ -2004,7 +2019,7 @@ app.post('/api/villages/register', async (req, res) => {
             VALUES (gen_random_uuid(), $1, $2, $3, $4, '1900-01-01')
             RETURNING profile_id;
         `;
-        const profileResult = await client.query(insertProfileQuery, [first_name, last_name, nickname, citizen_id]);
+        const profileResult = await client.query(insertProfileQuery, [first_name, last_name, nickname, cleanCitizenId]);
         const newProfileId = profileResult.rows[0].profile_id;
 
         const hashedPassword = await bcrypt.hash(password, saltRounds);
@@ -2024,9 +2039,7 @@ app.post('/api/villages/register', async (req, res) => {
         ]); 
         const newAccountId = userResult.rows[0].account_id;
 
-        // ==============================================
-        // 🌟 3.5 ค้นหา tambon_id จากข้อความภาษาไทย
-        // ==============================================
+        // 3.5 ค้นหา tambon_id จากข้อความภาษาไทย
         let mappedTambonId = null;
         if (sub_district && district && province) {
             const tambonQuery = `
@@ -2039,19 +2052,17 @@ app.post('/api/villages/register', async (req, res) => {
                   AND p.province_name_th LIKE $3
                 LIMIT 1;
             `;
-            // ลบคำนำหน้าออกเพื่อให้ค้นหาเจอชัวร์ๆ
             const searchSub = sub_district.replace('ตำบล', '').replace('ต.', '').trim();
             const searchDist = district.replace('อำเภอ', '').replace('เขต', '').replace('อ.', '').trim();
             const searchProv = province.replace('จังหวัด', '').replace('จ.', '').trim();
             
-            // ใช้ client.query เพื่อให้อยู่ใน Transaction เดียวกัน
             const tResult = await client.query(tambonQuery, [`%${searchSub}%`, `%${searchDist}%`, `%${searchProv}%`]);
             if (tResult.rows.length > 0) {
                 mappedTambonId = tResult.rows[0].tambon_id;
             }
         }
 
-        // 4. สร้าง ข้อมูลหมู่บ้าน (🌟 อัปเดตให้บันทึก tambon_id ด้วย)
+        // 4. สร้าง ข้อมูลหมู่บ้าน (บันทึก tambon_id)
         const insertVillageQuery = `
             INSERT INTO villages (village_id, village_no, village_name, tambon_id, headman_account_id, headman_lat, headman_lng)
             VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6)
@@ -2118,7 +2129,6 @@ app.post('/api/villages/register', async (req, res) => {
         client.release();
     }
 });
-
 
 
 // ==========================================
