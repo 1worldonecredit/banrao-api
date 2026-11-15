@@ -1789,87 +1789,23 @@ app.get('/api/search-citizen-full/:citizenId', async (req, res) => {
         client.release();
     }
 });
-
 // ==========================================
-// 🌟 API บริหารจัดการข้อมูลบ้านและประชากร (Households & Members)
+// API: เพิ่มข้อมูลบ้าน
 // ==========================================
-
-// 1. API เพิ่มข้อมูลบ้านพร้อมรายชื่อสมาชิก (ใช้ Transaction เพื่อความปลอดภัย)
 app.post('/api/households', async (req, res) => {
-    const {
-        village_id, house_no, latitude, longitude, occupancy_status, map_image_url, created_by, members
-    } = req.body;
-
-    // ตรวจสอบข้อมูลเบื้องต้น
-    if (!village_id || !house_no) {
-        return res.status(400).json({ success: false, message: 'กรุณาระบุพื้นที่หมู่บ้านและบ้านเลขที่' });
-    }
-
-    const client = await pgPool.connect();
     try {
-        await client.query('BEGIN'); // เริ่มการทำงานแบบผูกมัด (ถ้าพังจะย้อนกลับทั้งหมด)
-
-        // 1.1 บันทึกข้อมูลบ้านลงตาราง households
-        const insertHouseQuery = `
-            INSERT INTO households (village_id, house_no, latitude, longitude, occupancy_status, map_image_url, created_by)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
-            RETURNING household_id;
-        `;
-        const houseResult = await client.query(insertHouseQuery, [
-            village_id, 
-            house_no, 
-            latitude || null, 
-            longitude || null, 
-            occupancy_status || 'OWNER_OCCUPIED', 
-            map_image_url || null, 
-            created_by || null
-        ]);
+        const { village_id, house_no, expected_member_count } = req.body;
         
-        const newHouseholdId = houseResult.rows[0].household_id;
-
-        if (members && Array.isArray(members) && members.length > 0) {
-            const insertMemberQuery = `
-                INSERT INTO household_members (
-                    household_id, citizen_id, first_name, last_name, is_head_of_household,
-                    resident_type, living_status, nationality, origin_location,
-                    nickname, date_of_birth, gender -- 🌟 เพิ่มฟิลด์ใหม่
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12);
-            `;
-            
-            for (const member of members) {
-                // 🌟 แกะขีดออกก่อนบันทึกลงฐานข้อมูล เพื่อความเป็นระเบียบ
-                const cleanCitizenId = member.is_foreigner ? member.citizen_id : (member.citizen_id || '').replace(/-/g, '');
-                
-                await client.query(insertMemberQuery, [
-                    newHouseholdId,
-                    cleanCitizenId || null,
-                    member.first_name,
-                    member.last_name,
-                    member.is_head_of_household || false,
-                    member.resident_type || 'REGISTERED',
-                    member.living_status || 'LIVING_HERE',
-                    member.nationality || 'THAI',
-                    member.origin_location || null,
-                    member.nickname || null,             // 🌟
-                    member.date_of_birth || null,        // 🌟
-                    member.gender || null                // 🌟
-                ]);
-            }
-        }
-
-        await client.query('COMMIT'); // ยืนยันการบันทึกข้อมูลทั้ง 2 ตารางลง Database
-        res.json({ 
-            success: true, 
-            message: 'บันทึกข้อมูลบ้านและประชากรเรียบร้อยแล้ว', 
-            household_id: newHouseholdId 
-        });
-
+        // 🌟 แก้ไขตรง INSERT นี้ให้รับ expected_member_count ด้วย
+        const result = await pgPool.query(`
+            INSERT INTO households (village_id, house_no, expected_member_count)
+            VALUES ($1, $2, $3)
+            RETURNING *
+        `, [village_id, house_no, expected_member_count || 0]);
+        
+        res.json({ success: true, message: 'สร้างข้อมูลบ้านสำเร็จ', data: result.rows[0] });
     } catch (error) {
-        await client.query('ROLLBACK'); // ถอยกลับหากเกิด Error ระหว่างทาง
-        console.error('Error creating household:', error);
-        res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการบันทึกข้อมูลเข้าฐานข้อมูล' });
-    } finally {
-        client.release();
+        res.status(500).json({ success: false, message: error.message });
     }
 });
 
@@ -2349,8 +2285,9 @@ app.put('/api/household-members/:member_id/status', async (req, res) => {
         res.status(500).json({ success: false, message: error.message });
     }
 });
+
 // ==========================================
-// 2. API: ดึงข้อมูลพื้นที่แบบเต็ม (ปรับให้รองรับกรณี tambon_id แหว่ง)
+// 2. API: ดึงข้อมูลพื้นที่แบบเต็ม (แก้ปัญหาตำบลขึ้น ไม่ระบุ)
 // ==========================================
 app.get('/api/location-context/:village_id', async (req, res) => {
     try {
@@ -2373,7 +2310,7 @@ app.get('/api/location-context/:village_id', async (req, res) => {
             res.json({ success: false, message: 'ไม่พบข้อมูลพื้นที่' });
         }
     } catch (error) {
-        console.error("Error Fetching Location:", error);
+        console.error("Error fetching location:", error);
         res.status(500).json({ success: false, message: error.message });
     }
 });
