@@ -2214,23 +2214,22 @@ app.put('/api/households/:household_id', async (req, res) => {
 });
 
 // ==========================================
-// API: ดึงข้อมูลสมาชิกในบ้าน 
+// 1. API: ดึงข้อมูลสมาชิกในบ้าน (ปรับให้ดึงข้อมูลได้ชัวร์ 100%)
 // ==========================================
 app.get('/api/household-members/:household_id', async (req, res) => {
     try {
         const { household_id } = req.params;
         const result = await pgPool.query(`
-            SELECT m.*, 
-                   -- กรณีบันทึกชื่อไว้ใน user_profiles ก็ดึงมา แต่ถ้าเซฟตรงๆ ไว้ใน household_members ก็จะดึงได้ด้วย
-                   p.first_name, p.last_name, p.nickname, p.gender, p.citizen_id
-            FROM household_members m
-            LEFT JOIN user_profiles p ON m.profile_id = p.profile_id
-            WHERE m.household_id = $1
-            ORDER BY m.status DESC
+            -- ดึงข้อมูลตรงๆ จากตาราง household_members เลย เพื่อป้องกันปัญหาการ JOIN แล้วข้อมูลหาย
+            SELECT *
+            FROM household_members
+            WHERE household_id = $1
+            ORDER BY status DESC, first_name ASC
         `, [household_id]); 
         
         res.json({ success: true, data: result.rows });
     } catch (error) {
+        console.error("Error Fetching Members:", error);
         res.status(500).json({ success: false, message: error.message });
     }
 });
@@ -2351,14 +2350,16 @@ app.put('/api/household-members/:member_id/status', async (req, res) => {
     }
 });
 // ==========================================
-// API: ดึงข้อมูลพื้นที่แบบเต็ม (แก้ JOIN ให้ถูกต้อง)
+// 2. API: ดึงข้อมูลพื้นที่แบบเต็ม (ปรับให้รองรับกรณี tambon_id แหว่ง)
 // ==========================================
 app.get('/api/location-context/:village_id', async (req, res) => {
     try {
         const { village_id } = req.params;
         const result = await pgPool.query(`
             SELECT v.village_no, v.village_name, 
-                   t.tambon_name_th, a.amphure_name_th, p.province_name_th
+                   COALESCE(t.tambon_name_th, 'ไม่ระบุ') AS tambon_name_th, 
+                   COALESCE(a.amphure_name_th, 'ไม่ระบุ') AS amphure_name_th, 
+                   COALESCE(p.province_name_th, 'ไม่ระบุ') AS province_name_th
             FROM villages v
             LEFT JOIN sys_tambons t ON v.tambon_id = t.tambon_id
             LEFT JOIN sys_amphures a ON t.amphure_id = a.amphure_id
@@ -2372,6 +2373,7 @@ app.get('/api/location-context/:village_id', async (req, res) => {
             res.json({ success: false, message: 'ไม่พบข้อมูลพื้นที่' });
         }
     } catch (error) {
+        console.error("Error Fetching Location:", error);
         res.status(500).json({ success: false, message: error.message });
     }
 });
