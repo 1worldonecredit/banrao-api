@@ -1339,60 +1339,47 @@ app.delete('/api/community-leaders/:id', async (req, res) => {
   }
 });
 // ==========================================
-// API: ดึงข้อมูลผังผู้นำและคณะทำงาน (แก้ไขชื่อคอลัมน์)
+// API: ดึงข้อมูลผังผู้นำ (GET) - ปรับให้รองรับระบบประชากร
 // ==========================================
 app.get('/api/community-leaders/:villageId', async (req, res) => {
     const { villageId } = req.params;
-    const { term_date, committee_id } = req.query;
+    const { committee_id } = req.query;
 
-    const client = await pgPool.connect(); 
+    const client = await pgPool.connect();
     try {
-        let query = `
+        const result = await client.query(`
             SELECT 
-                up.id, /* ส่งกลับไปเป็น id ตรงๆ เพื่อให้ Tree นำไปจัดเรียงได้ง่ายๆ */
-                up.account_id,
-                up.position_id,
-                sp.position_name,
-                up.start_date,
-                up.end_date,
-                up.responsibilities,
-                up.parent_id,
-                p.first_name,
-                p.last_name,
-                cpm.image_url as user_image
-            FROM user_positions up
-            JOIN sys_positions sp ON up.position_id = sp.position_id
-            JOIN user_accounts a ON up.account_id = a.account_id
-            JOIN user_profiles p ON a.profile_id = p.profile_id
+                upos.id,
+                upos.parent_id,
+                upos.committee_id,
+                upos.position_name AS role_name,
+                upos.start_date,
+                upos.end_date,
+                upos.responsibilities,
+                upos.account_id,
+                
+                -- 🌟 ดึงชื่อ: ถ้ามีบัญชีใช้ชื่อนั้น ถ้าไม่มีให้ดึงจากระบบประชากร (household_members)
+                COALESCE(p.first_name, hm.first_name) AS first_name,
+                COALESCE(p.last_name, hm.last_name) AS last_name,
+                COALESCE(cpm.image_url, '/profile-img.jpg') AS user_image
+                
+            FROM user_positions upos
+            -- หาข้อมูลจากระบบบัญชี (ถ้ามี)
+            LEFT JOIN user_accounts a ON upos.account_id = a.account_id
+            LEFT JOIN user_profiles p ON a.profile_id = p.profile_id
             LEFT JOIN citizen_profiles_media cpm ON p.profile_id = cpm.profile_id AND cpm.is_active = true
-            WHERE up.scope_type = 'VILLAGE' AND up.scope_id = $1 AND up.is_active = true
-        `;
-        
-        const queryParams = [villageId];
-        let paramIndex = 2;
+            -- หาข้อมูลจากระบบประชากร (สำหรับคนที่ผู้ใหญ่บ้านเพิ่มเอง)
+            LEFT JOIN household_members hm ON upos.account_id = hm.member_id
+            
+            WHERE upos.committee_id = $1
+        `, [committee_id]);
 
-        if (committee_id) {
-            query += ` AND up.committee_id = $${paramIndex}`;
-            queryParams.push(committee_id);
-            paramIndex++;
-        }
-
-        if (term_date) {
-            query += ` AND up.start_date <= $${paramIndex} AND (up.end_date IS NULL OR up.end_date >= $${paramIndex})`;
-            queryParams.push(term_date);
-        } else {
-            query += ` AND (up.end_date IS NULL OR up.end_date >= CURRENT_DATE)`;
-        }
-
-        query += ` ORDER BY sp.position_id ASC;`;
-
-        const result = await client.query(query, queryParams);
         res.json({ success: true, data: result.rows });
     } catch (error) {
-        console.error("Fetch Leaders Error:", error);
-        res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการดึงข้อมูลผังผู้นำ' });
+        console.error("Error fetching leaders:", error);
+        res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการดึงข้อมูลผัง' });
     } finally {
-        client.release();
+        if (client) client.release();
     }
 });
 
