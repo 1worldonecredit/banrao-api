@@ -1338,12 +1338,17 @@ app.delete('/api/community-leaders/:id', async (req, res) => {
     client.release();
   }
 });
+
 // ==========================================
-// API: ดึงข้อมูลผังผู้นำ (GET) - ปรับให้รองรับระบบประชากร
+// API: ดึงข้อมูลผังผู้นำ (GET) - ปรับปรุงแก้ไข Error 500
 // ==========================================
 app.get('/api/community-leaders/:villageId', async (req, res) => {
     const { villageId } = req.params;
     const { committee_id } = req.query;
+
+    if (!committee_id) {
+        return res.status(400).json({ success: false, message: 'กรุณาระบุรหัสคณะทำงาน' });
+    }
 
     const client = await pgPool.connect();
     try {
@@ -1358,25 +1363,26 @@ app.get('/api/community-leaders/:villageId', async (req, res) => {
                 upos.responsibilities,
                 upos.account_id,
                 
-                -- 🌟 จุดสำคัญ: ต้องดึงชื่อจาก household_members มาด้วย กรณีเขาไม่มีบัญชีผู้ใช้
+                -- ดึงชื่อ: ถ้ามีบัญชีใช้ชื่อนั้น ถ้าไม่มีให้ดึงจากระบบประชากร
                 COALESCE(p.first_name, hm.first_name) AS first_name,
                 COALESCE(p.last_name, hm.last_name) AS last_name,
-                COALESCE(cpm.image_url, '/profile-img.jpg') AS user_image
+                
+                -- ดึงรูปภาพ: เผื่อกรณีคอลัมน์รูปในแต่ละตารางชื่อไม่เหมือนกัน
+                COALESCE(cpm.image_url, p.profile_image, '/profile-img.jpg') AS user_image
                 
             FROM user_positions upos
-            LEFT JOIN user_accounts a ON upos.account_id = a.account_id
+            LEFT JOIN user_accounts a ON upos.account_id::text = a.account_id::text
             LEFT JOIN user_profiles p ON a.profile_id = p.profile_id
             LEFT JOIN citizen_profiles_media cpm ON p.profile_id = cpm.profile_id AND cpm.is_active = true
-            -- 🌟 JOIN กับทะเบียนบ้านด้วย เผื่อคนนี้ผู้ใหญ่บ้านแอดเข้ามาเอง
-            LEFT JOIN household_members hm ON upos.account_id = hm.member_id
+            LEFT JOIN household_members hm ON upos.account_id::text = hm.member_id::text
             
-            WHERE upos.committee_id = $1
+            WHERE upos.committee_id::text = $1::text
         `, [committee_id]);
 
         res.json({ success: true, data: result.rows });
     } catch (error) {
         console.error("Error fetching leaders:", error);
-        res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการดึงข้อมูลผัง' });
+        res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการดึงข้อมูลผัง', error: error.message });
     } finally {
         if (client) client.release();
     }
