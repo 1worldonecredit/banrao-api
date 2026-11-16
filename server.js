@@ -1244,64 +1244,60 @@ app.get('/api/positions', async (req, res) => {
     }
 });
 
+// ==========================================
+// API: ค้นหาข้อมูลลูกบ้านด้วยเลขบัตรประชาชน (ดึงจากระบบประชากร/Household Members)
+// ==========================================
 app.get('/api/search-citizen/:villageId/:citizenId', async (req, res) => {
-  const { villageId, citizenId } = req.params;
-  const cleanCitizenId = String(citizenId || '').replace(/[^0-9]/g, '');
+    const { villageId, citizenId } = req.params;
+    
+    // 🌟 ทำความสะอาดข้อมูล: ลบช่องว่างหรือขีด (-) ออก
+    const cleanCitizenId = String(citizenId || '').replace(/[^0-9]/g, '');
 
-  if (!cleanCitizenId || !villageId) {
-    return res.status(400).json({ success: false, message: 'ข้อมูลการค้นหาไม่ครบถ้วน' });
-  }
-
-  const client = await pgPool.connect();
-  try {
-    const result = await client.query(
-      `
-      SELECT
-        a.account_id,
-        p.profile_id,
-        p.first_name,
-        p.last_name,
-        p.citizen_id,
-        v.village_name,
-        t.tambon_name_th,
-        cpm.image_url AS user_image,
-        o.occupation_name AS responsibilities
-      FROM user_profiles p
-      LEFT JOIN user_accounts a ON p.profile_id = a.profile_id
-      LEFT JOIN villages v ON a.village_id::TEXT = v.village_id::TEXT
-      LEFT JOIN sys_tambons t ON v.tambon_id = t.tambon_id
-      LEFT JOIN citizen_profiles_media cpm ON p.profile_id = cpm.profile_id AND cpm.is_active = true
-      LEFT JOIN sys_occupations o ON a.occupation_id = o.occupation_id
-      WHERE REPLACE(TRIM(p.citizen_id::TEXT), '-', '') = $1
-        AND a.village_id::TEXT = $2::TEXT
-      `,
-      [cleanCitizenId, String(villageId)]
-    );
-
-    if (result.rows.length > 0 && result.rows[0].account_id) {
-      return res.json({ success: true, data: result.rows[0] });
+    if (!cleanCitizenId || !villageId) {
+        return res.status(400).json({ success: false, message: 'ข้อมูลการค้นหาไม่ครบถ้วน' });
     }
 
-    if (result.rows.length > 0 && !result.rows[0].account_id) {
-      return res.status(404).json({ success: false, message: 'บุคคลนี้ยังไม่มีบัญชีผู้ใช้งานในระบบ' });
+    const client = await pgPool.connect(); 
+    try {
+        // 🌟 เปลี่ยนมาค้นหาใน household_members ที่ผูกกับ households แทน เพื่อให้เจอลูกบ้านทั้งหมด
+        const result = await client.query(`
+            SELECT 
+                hm.member_id AS account_id, -- ใช้ member_id แทน account_id ชั่วคราวเพื่อให้ผังดึง ID ไปใช้งานได้
+                hm.first_name, 
+                hm.last_name,
+                hm.citizen_id,
+                v.village_name,          
+                t.tambon_name_th,        
+                -- กรณีที่ใน household_members ไม่มีรูป อาจจะต้องดึงจาก user_profiles หรือใช้รูป default
+                '/profile-img.jpg' AS user_image, 
+                hm.relationship AS responsibilities
+            FROM household_members hm
+            INNER JOIN households h ON hm.household_id = h.household_id
+            LEFT JOIN villages v ON h.village_id::TEXT = v.village_id::TEXT
+            LEFT JOIN sys_tambons t ON v.tambon_id = t.tambon_id
+            WHERE REPLACE(TRIM(hm.citizen_id::TEXT), '-', '') = $1 
+              AND h.village_id::TEXT = $2::TEXT
+              AND hm.status = 'ACTIVE' -- เอาเฉพาะคนที่ยังอาศัยอยู่
+            LIMIT 1
+        `, [cleanCitizenId, String(villageId)]);
+
+        if (result.rows.length > 0) {
+            res.json({ success: true, data: result.rows[0] });
+        } else {
+            // เช็คว่ามีคนนี้อยู่จริงไหม แต่ไม่ได้อยู่หมู่บ้านนี้
+            const checkOtherVillage = await client.query(`SELECT member_id FROM household_members WHERE REPLACE(TRIM(citizen_id::TEXT), '-', '') = $1 AND status = 'ACTIVE'`, [cleanCitizenId]);
+            if(checkOtherVillage.rows.length > 0){
+                res.status(404).json({ success: false, message: 'ไม่พบข้อมูลลูกบ้านนี้ในหมู่บ้านของคุณ' });
+            } else {
+                res.status(404).json({ success: false, message: 'ไม่พบข้อมูลเลขบัตรประชาชนนี้ในระบบจัดการประชากร' });
+            }
+        }
+    } catch (error) {
+        console.error("Search Citizen Error:", error);
+        res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการค้นหาข้อมูล' });
+    } finally {
+        if (client) client.release(); 
     }
-
-    const checkProfile = await client.query(
-      `SELECT profile_id FROM user_profiles WHERE REPLACE(TRIM(citizen_id::TEXT), '-', '') = $1`,
-      [cleanCitizenId]
-    );
-
-    if (checkProfile.rows.length > 0) {
-      return res.status(404).json({ success: false, message: 'ไม่พบข้อมูลลูกบ้านนี้ในหมู่บ้านที่เลือก' });
-    }
-
-    return res.status(404).json({ success: false, message: 'ไม่พบข้อมูลเลขบัตรประชาชนนี้ในระบบ' });
-  } catch (error) {
-    console.error('Search Citizen Error:', error);
-    return res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการค้นหาข้อมูล: ' + error.message });
-  } finally {
-    client.release();
-  }
 });
 
 app.delete('/api/community-leaders/:id', async (req, res) => {
