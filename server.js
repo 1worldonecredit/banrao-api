@@ -519,11 +519,10 @@ app.delete('/api/menus/:id', async (req, res) => {
 });
 
 // ==========================================
-// 🌟 API เข้าสู่ระบบ (Login) - โครงสร้างสมบูรณ์อิงตาม Schema จริง 100%
+// 🌟 API เข้าสู่ระบบ (Login) - แก้ไขปัญหา Connection Pool ค้าง
 // ==========================================
 app.post('/api/login', async (req, res) => {
-
-console.log('👉 มีคนกด Login! ข้อมูลที่ส่งมาคือ:', req.body);
+    console.log('👉 มีคนกด Login! ข้อมูลที่ส่งมาคือ:', req.body);
     const usernameInput = req.body.username || req.body.phone_number;
     const password = req.body.password;
 
@@ -531,8 +530,10 @@ console.log('👉 มีคนกด Login! ข้อมูลที่ส่ง
         return res.status(400).json({ success: false, message: 'กรุณากรอกเบอร์โทรศัพท์และรหัสผ่าน' });
     }
 
+    // 🌟 ดึง client ออกมาจาก Pool อย่างถูกต้อง
+    const client = await pgPool.connect(); 
     try {
-        const userQuery = await pgPool.query(
+        const userQuery = await client.query(
             `SELECT 
                 a.account_id, a.username_phone, a.password_hash, a.occupation_id, a.is_active, a.household_member_count, a.role,
                 p.first_name, p.last_name, p.nickname, p.dob, p.citizen_id, p.gender, p.house_no,
@@ -541,7 +542,6 @@ console.log('👉 มีคนกด Login! ข้อมูลที่ส่ง
                 v.village_id, v.village_no, v.village_name, v.headman_lat, v.headman_lng, 
                 v.headman_account_id,
                 
-                -- ดึงสถิติประชากรจากตารางจริง
                 v.household_count AS target_household_count, 
                 v.population_count AS target_population_count,
                 (SELECT COUNT(*) FROM households h WHERE h.village_id = v.village_id) AS actual_household_count,
@@ -594,11 +594,10 @@ console.log('👉 มีคนกด Login! ข้อมูลที่ส่ง
             return res.status(401).json({ success: false, message: 'เบอร์โทรศัพท์หรือรหัสผ่านไม่ถูกต้อง' });
         }
 
-        // ดึงสิทธิ์ (Permissions) จากตาราง sys_permissions ผ่าน occupation_permissions (ถ้าตารางนี้ยังมีอยู่)
         let permissions = [];
         if (user.occupation_id) {
              try {
-                const permQuery = await pgPool.query(
+                const permQuery = await client.query(
                     `SELECT sp.permission_code
                      FROM occupation_permissions op
                      JOIN sys_permissions sp ON op.permission_id = sp.permission_id
@@ -623,7 +622,6 @@ console.log('👉 มีคนกด Login! ข้อมูลที่ส่ง
         const dayNameTh = (birthDate && !isDummyDate) ? daysTh[birthDate.getDay()] : '-';
         const genderTh = user.gender === 'MALE' ? 'ชาย' : (user.gender === 'FEMALE' ? 'หญิง' : '-');
 
-        // 🌟🌟 Logic ตำแหน่งใหม่ อิงจากตารางเป็นหลัก 🌟🌟
         let finalPositionName = null;
         let finalPositionLevel = null;
         let isSuperAdmin = false; 
@@ -633,17 +631,14 @@ console.log('👉 มีคนกด Login! ข้อมูลที่ส่ง
             finalPositionLevel = 'SYSTEM';
             isSuperAdmin = true;
         } 
-        // 1. ให้ความสำคัญกับตำแหน่งแต่งตั้งทางการ (user_positions + sys_positions) มากที่สุด
         else if (user.position_name && user.position_level) {
             finalPositionName = user.position_name;
             finalPositionLevel = user.position_level;
         }
-        // 2. ถ้าเป็นผู้สร้างหมู่บ้าน (role HEADMAN) และเชื่อมกับตาราง villages
         else if (user.role === 'HEADMAN' || (user.account_id && user.headman_account_id && user.account_id === user.headman_account_id)) {
             finalPositionName = 'ผู้ใหญ่บ้าน';
             finalPositionLevel = 'VILLAGE';
         }
-        // 3. ถ้าไม่มีตำแหน่งทางการ ให้ใช้ข้อมูล occupation_name พื้นฐาน
         else {
             finalPositionName = user.occupation_name || 'ประชาชนทั่วไป';
             finalPositionLevel = null;
@@ -680,7 +675,6 @@ console.log('👉 มีคนกด Login! ข้อมูลที่ส่ง
             actual_household_count: user.actual_household_count || 0,
             actual_population_count: user.actual_population_count || 0,
             
-            // ใช้ default image เพราะไม่มีตาราง media แล้ว
             userImage: '/profile-img.jpg', 
             headmanImage: 'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=150&q=80',
             
@@ -702,6 +696,9 @@ console.log('👉 มีคนกด Login! ข้อมูลที่ส่ง
     } catch (error) {
         console.error('Login API Error:', error);
         res.status(500).json({ success: false, message: 'Internal Server Error', error: error.message });
+    } finally {
+        // 🌟 ต้องแน่ใจว่าคืน Connection ให้ Pool เสมอ!
+        if (client) client.release();
     }
 });
 // ==========================================
