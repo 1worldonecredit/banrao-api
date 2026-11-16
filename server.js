@@ -1358,17 +1358,16 @@ app.get('/api/community-leaders/:villageId', async (req, res) => {
                 upos.responsibilities,
                 upos.account_id,
                 
-                -- 🌟 ดึงชื่อ: ถ้ามีบัญชีใช้ชื่อนั้น ถ้าไม่มีให้ดึงจากระบบประชากร (household_members)
+                -- 🌟 จุดสำคัญ: ต้องดึงชื่อจาก household_members มาด้วย กรณีเขาไม่มีบัญชีผู้ใช้
                 COALESCE(p.first_name, hm.first_name) AS first_name,
                 COALESCE(p.last_name, hm.last_name) AS last_name,
                 COALESCE(cpm.image_url, '/profile-img.jpg') AS user_image
                 
             FROM user_positions upos
-            -- หาข้อมูลจากระบบบัญชี (ถ้ามี)
             LEFT JOIN user_accounts a ON upos.account_id = a.account_id
             LEFT JOIN user_profiles p ON a.profile_id = p.profile_id
             LEFT JOIN citizen_profiles_media cpm ON p.profile_id = cpm.profile_id AND cpm.is_active = true
-            -- หาข้อมูลจากระบบประชากร (สำหรับคนที่ผู้ใหญ่บ้านเพิ่มเอง)
+            -- 🌟 JOIN กับทะเบียนบ้านด้วย เผื่อคนนี้ผู้ใหญ่บ้านแอดเข้ามาเอง
             LEFT JOIN household_members hm ON upos.account_id = hm.member_id
             
             WHERE upos.committee_id = $1
@@ -1382,7 +1381,6 @@ app.get('/api/community-leaders/:villageId', async (req, res) => {
         if (client) client.release();
     }
 });
-
 
 // ==========================================
 // API: เพิ่มคณะทำงาน / โครงการใหม่
