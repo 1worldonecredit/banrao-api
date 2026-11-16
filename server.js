@@ -1477,26 +1477,25 @@ app.delete('/api/community-leaders/:recordId', async (req, res) => {
 });
 
 // ==========================================
-// API: ดึงรายชื่อคณะทำงาน/โครงการ ของหมู่บ้าน
+// API: ดึงรายชื่อแท็บคณะทำงาน (GET)
 // ==========================================
 app.get('/api/community-committees/:villageId', async (req, res) => {
-    // 🌟 ดักและแปลง villageId ให้เป็นตัวเลข (Integer) ก่อนเสมอ
-    const villageId = parseInt(req.params.villageId, 10);
-    
-    // ถ้าแปลงแล้วไม่ใช่ตัวเลข ให้ตีกลับไปเลย ป้องกัน DB Error
-    if (isNaN(villageId)) {
-        return res.status(400).json({ success: false, message: 'รหัสหมู่บ้านไม่ถูกต้อง (ต้องเป็นตัวเลข)' });
-    }
-
+    const { villageId } = req.params;
     const client = await pgPool.connect();
+    
     try {
-        const result = await client.query('SELECT * FROM community_committees WHERE village_id = $1 ORDER BY committee_id ASC', [villageId]);
+        // 🌟 ดึงข้อมูลโดยแปลง village_id ให้เป็น text เพื่อป้องกัน error
+        const result = await client.query(
+            'SELECT * FROM community_committees WHERE village_id::text = $1::text ORDER BY committee_name ASC', 
+            [villageId]
+        );
+        
         res.json({ success: true, data: result.rows });
     } catch (error) {
-        console.error("🔥 DB Error (Get Committees):", error);
-        res.status(500).json({ success: false, message: 'DB Error: ' + error.message });
+        console.error("Error fetching committees:", error);
+        res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการดึงข้อมูลคณะทำงาน' });
     } finally {
-        if (client) client.release();
+        if (client) client.release(); // คืน Connection เสมอ
     }
 });
 // ==========================================
