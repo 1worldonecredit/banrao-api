@@ -1423,19 +1423,20 @@ app.delete('/api/community-leaders/:recordId', async (req, res) => {
     }
 });
 
-
 // ==========================================
 // API: ดึงรายชื่อคณะทำงาน/โครงการ ของหมู่บ้าน
 // ==========================================
 app.get('/api/community-committees/:villageId', async (req, res) => {
     const { villageId } = req.params;
+    const client = await pgPool.connect();
     try {
-        const client = await pgPool.connect();
         const result = await client.query('SELECT * FROM community_committees WHERE village_id = $1 ORDER BY committee_id ASC', [villageId]);
         res.json({ success: true, data: result.rows });
-        client.release();
     } catch (error) {
-        res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการดึงข้อมูลคณะทำงาน' });
+        console.error("🔥 DB Error (Get Committees):", error);
+        res.status(500).json({ success: false, message: 'DB Error: ' + error.message });
+    } finally {
+        client.release();
     }
 });
 // ==========================================
@@ -1561,29 +1562,23 @@ app.get('/api/committees', async (req, res) => {
     }
 });
 // ==========================================
-// 🌟 API สำหรับแก้ไขชื่อ/รายละเอียดคณะทำงาน (PUT)
+// API: เพิ่มคณะทำงาน / โครงการใหม่
 // ==========================================
-app.put('/api/community-committees/:id', async (req, res) => {
-    const { id } = req.params;
-    const { committee_name, description } = req.body;
-
+app.post('/api/community-committees', async (req, res) => {
+    const { village_id, committee_name, description } = req.body;
+    const client = await pgPool.connect();
     try {
-        const query = `
-            UPDATE community_committees 
-            SET committee_name = $1, description = $2 
-            WHERE committee_id = $3 
-            RETURNING *;
-        `;
-        const result = await pgPool.query(query, [committee_name, description, id]);
-        
-        if (result.rowCount === 0) {
-            return res.status(404).json({ success: false, message: 'ไม่พบข้อมูลคณะทำงานที่ต้องการแก้ไข' });
-        }
-
-        res.json({ success: true, message: 'แก้ไขข้อมูลสำเร็จ', data: result.rows[0] });
+        await client.query(
+            'INSERT INTO community_committees (village_id, committee_name, description) VALUES ($1, $2, $3)', 
+            [village_id, committee_name, description]
+        );
+        res.json({ success: true, message: 'สร้างคณะทำงานใหม่สำเร็จ' });
     } catch (error) {
-        console.error('Error updating committee:', error);
-        res.status(500).json({ success: false, message: error.message });
+        console.error("🔥 DB Error (Insert Committee):", error);
+        // 🌟 พ่น Error ของจริงจาก Database ส่งไปให้ Frontend แสดงบนหน้าจอ!
+        res.status(500).json({ success: false, message: 'DB Error: ' + error.message });
+    } finally {
+        client.release(); // 🌟 สำคัญมาก: คืน Connection เสมอแม้จะเกิด Error
     }
 });
 
