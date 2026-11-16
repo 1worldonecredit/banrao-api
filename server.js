@@ -1246,15 +1246,16 @@ app.get('/api/positions', async (req, res) => {
 
 
 // ==========================================
-// API: ค้นหาข้อมูลลูกบ้านด้วยเลขบัตรประชาชน
+// API: ค้นหาข้อมูลลูกบ้านด้วยเลขบัตรประชาชน (เฉพาะในหมู่บ้านที่กำหนด)
 // ==========================================
-app.get('/api/search-citizen/:citizenId', async (req, res) => {
-    const { citizenId } = req.params;
+app.get('/api/search-citizen/:villageId/:citizenId', async (req, res) => {
+    const { villageId, citizenId } = req.params;
     
+    const client = await pgPool.connect(); // 🌟 ใช้การจัดการ Connection Pool ที่ปลอดภัย
     try {
-        const result = await pgPool.query(`
+        const result = await client.query(`
             SELECT 
-                a.account_id,    /* 🌟 แก้ตรงนี้: เปลี่ยนจาก p.profile_id เป็น a.account_id ของจริง */
+                a.account_id, 
                 p.first_name, 
                 p.last_name,
                 p.citizen_id,
@@ -1269,19 +1270,27 @@ app.get('/api/search-citizen/:citizenId', async (req, res) => {
             LEFT JOIN citizen_profiles_media cpm ON p.profile_id = cpm.profile_id AND cpm.is_active = true
             LEFT JOIN sys_occupations o ON a.occupation_id = o.occupation_id
             WHERE TRIM(p.citizen_id::TEXT) = TRIM($1::TEXT)
-        `, [citizenId]);
+              AND a.village_id = $2 -- 🌟 เงื่อนไขสำคัญ: ต้องอยู่หมู่บ้านเดียวกับที่ร้องขอมาเท่านั้น!
+        `, [citizenId, villageId]);
 
         if (result.rows.length > 0 && result.rows[0].account_id) {
             res.json({ success: true, data: result.rows[0] });
         } else if (result.rows.length > 0 && !result.rows[0].account_id) {
-            // กรณีมีชื่อในระบบทะเบียนราษฎร์ แต่ยังไม่เคยสมัครสมาชิก (ไม่มีบัญชี)
             res.status(404).json({ success: false, message: 'บุคคลนี้ยังไม่มีบัญชีผู้ใช้งานในระบบ' });
         } else {
-            res.status(404).json({ success: false, message: 'ไม่พบข้อมูลลูกบ้านจากเลขบัตรประชาชนนี้' });
+            // เช็คว่ามีคนนี้อยู่จริงไหม แต่ไม่ได้อยู่หมู่บ้านนี้
+            const checkOtherVillage = await client.query('SELECT profile_id FROM user_profiles WHERE TRIM(citizen_id::TEXT) = TRIM($1::TEXT)', [citizenId]);
+            if(checkOtherVillage.rows.length > 0){
+                res.status(404).json({ success: false, message: 'ไม่พบข้อมูลลูกบ้านนี้ในหมู่บ้านของคุณ' });
+            } else {
+                res.status(404).json({ success: false, message: 'ไม่พบข้อมูลเลขบัตรประชาชนนี้ในระบบ' });
+            }
         }
     } catch (error) {
         console.error("Search Citizen Error:", error);
         res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการค้นหาข้อมูล' });
+    } finally {
+        if (client) client.release(); // 🌟 สำคัญ: คืน Connection เสมอ
     }
 });
 
