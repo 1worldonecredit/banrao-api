@@ -1406,16 +1406,21 @@ app.get('/api/community-leaders/:villageId', async (req, res) => {
 // ==========================================
 app.post('/api/community-committees', async (req, res) => {
     const { village_id, committee_name, description } = req.body;
+    let client;
     try {
-        const client = await pgPool.connect();
+        client = await pgPool.connect();
         await client.query(
             'INSERT INTO community_committees (village_id, committee_name, description) VALUES ($1, $2, $3)', 
             [village_id, committee_name, description]
         );
         res.json({ success: true, message: 'สร้างคณะทำงานใหม่สำเร็จ' });
-        client.release();
     } catch (error) {
-        res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการสร้างคณะทำงาน' });
+        console.error('Error in POST /api/community-committees:', error); // เพิ่มเพื่อดู error log ใน server
+        res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการสร้างคณะทำงาน: ' + error.message }); // ส่ง error กลับไปที่ frontend ให้เห็นชัดเจน
+    } finally {
+        if (client) {
+            client.release(); // คืน connection ให้ pool เสมอ
+        }
     }
 });
 
