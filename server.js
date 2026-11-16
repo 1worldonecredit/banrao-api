@@ -1244,89 +1244,104 @@ app.get('/api/positions', async (req, res) => {
     }
 });
 
-// ==========================================
-// API: ค้นหาข้อมูลลูกบ้านด้วยเลขบัตรประชาชน (เฉพาะในหมู่บ้านที่กำหนด)
-// ==========================================
 app.get('/api/search-citizen/:villageId/:citizenId', async (req, res) => {
-    let { villageId, citizenId } = req.params;
-    
-    // 🌟 ทำความสะอาดข้อมูล: ลบช่องว่างหรือขีด (-) ออกจากเลขบัตรประชาชน
-    const cleanCitizenId = citizenId.replace(/[^0-9]/g, '');
-    const cleanVillageId = parseInt(villageId, 10);
+  const { villageId, citizenId } = req.params;
+  const cleanCitizenId = String(citizenId || '').replace(/[^0-9]/g, '');
 
-    if (!cleanCitizenId || isNaN(cleanVillageId)) {
-        return res.status(400).json({ success: false, message: 'ข้อมูลไม่ถูกต้อง' });
+  if (!cleanCitizenId || !villageId) {
+    return res.status(400).json({ success: false, message: 'ข้อมูลการค้นหาไม่ครบถ้วน' });
+  }
+
+  const client = await pgPool.connect();
+  try {
+    const result = await client.query(
+      `
+      SELECT
+        a.account_id,
+        p.profile_id,
+        p.first_name,
+        p.last_name,
+        p.citizen_id,
+        v.village_name,
+        t.tambon_name_th,
+        cpm.image_url AS user_image,
+        o.occupation_name AS responsibilities
+      FROM user_profiles p
+      LEFT JOIN user_accounts a ON p.profile_id = a.profile_id
+      LEFT JOIN villages v ON a.village_id::TEXT = v.village_id::TEXT
+      LEFT JOIN sys_tambons t ON v.tambon_id = t.tambon_id
+      LEFT JOIN citizen_profiles_media cpm ON p.profile_id = cpm.profile_id AND cpm.is_active = true
+      LEFT JOIN sys_occupations o ON a.occupation_id = o.occupation_id
+      WHERE REPLACE(TRIM(p.citizen_id::TEXT), '-', '') = $1
+        AND a.village_id::TEXT = $2::TEXT
+      `,
+      [cleanCitizenId, String(villageId)]
+    );
+
+    if (result.rows.length > 0 && result.rows[0].account_id) {
+      return res.json({ success: true, data: result.rows[0] });
     }
 
-    const client = await pgPool.connect(); 
-    try {
-        const result = await client.query(`
-            SELECT 
-                a.account_id, 
-                p.first_name, 
-                p.last_name,
-                p.citizen_id,
-                v.village_name,          
-                t.tambon_name_th,        
-                cpm.image_url as user_image, 
-                o.occupation_name as responsibilities
-            FROM user_profiles p
-            LEFT JOIN user_accounts a ON p.profile_id = a.profile_id
-            LEFT JOIN villages v ON a.village_id = v.village_id
-            LEFT JOIN sys_tambons t ON v.tambon_id = t.tambon_id
-            LEFT JOIN citizen_profiles_media cpm ON p.profile_id = cpm.profile_id AND cpm.is_active = true
-            LEFT JOIN sys_occupations o ON a.occupation_id = o.occupation_id
-            -- 🌟 ลบเครื่องหมายขีดก่อนเปรียบเทียบ และใช้ Integer สำหรับ village_id
-            WHERE REPLACE(p.citizen_id::TEXT, '-', '') = $1 
-              AND a.village_id = $2 
-        `, [cleanCitizenId, cleanVillageId]);
-
-        if (result.rows.length > 0 && result.rows[0].account_id) {
-            res.json({ success: true, data: result.rows[0] });
-        } else if (result.rows.length > 0 && !result.rows[0].account_id) {
-            res.status(404).json({ success: false, message: 'บุคคลนี้ยังไม่มีบัญชีผู้ใช้งานในระบบ' });
-        } else {
-            // เช็คว่ามีคนนี้อยู่จริงไหม แต่ไม่ได้อยู่หมู่บ้านนี้
-            const checkOtherVillage = await client.query(`SELECT profile_id FROM user_profiles WHERE REPLACE(citizen_id::TEXT, '-', '') = $1`, [cleanCitizenId]);
-            if(checkOtherVillage.rows.length > 0){
-                res.status(404).json({ success: false, message: 'ไม่พบข้อมูลลูกบ้านนี้ในหมู่บ้านของคุณ' });
-            } else {
-                res.status(404).json({ success: false, message: 'ไม่พบข้อมูลเลขบัตรประชาชนนี้ในระบบ' });
-            }
-        }
-    } catch (error) {
-        console.error("Search Citizen Error:", error);
-        res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการค้นหาข้อมูล' });
-    } finally {
-        if (client) client.release(); 
+    if (result.rows.length > 0 && !result.rows[0].account_id) {
+      return res.status(404).json({ success: false, message: 'บุคคลนี้ยังไม่มีบัญชีผู้ใช้งานในระบบ' });
     }
+
+    const checkProfile = await client.query(
+      `SELECT profile_id FROM user_profiles WHERE REPLACE(TRIM(citizen_id::TEXT), '-', '') = $1`,
+      [cleanCitizenId]
+    );
+
+    if (checkProfile.rows.length > 0) {
+      return res.status(404).json({ success: false, message: 'ไม่พบข้อมูลลูกบ้านนี้ในหมู่บ้านที่เลือก' });
+    }
+
+    return res.status(404).json({ success: false, message: 'ไม่พบข้อมูลเลขบัตรประชาชนนี้ในระบบ' });
+  } catch (error) {
+    console.error('Search Citizen Error:', error);
+    return res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการค้นหาข้อมูล: ' + error.message });
+  } finally {
+    client.release();
+  }
 });
 
-
-// ==========================================
-// API สำหรับลบข้อมูลบุคคลออกจากตำแหน่ง (DELETE)
-// ==========================================
 app.delete('/api/community-leaders/:id', async (req, res) => {
-    const { id } = req.params;
-    const client = await pgPool.connect();
-    
-    try {
-        // ลบตำแหน่งของคนนั้นออก (แต่ไม่ได้ลบ User Account)
-        const result = await client.query('DELETE FROM user_positions WHERE position_record_id = $1 RETURNING *;', [id]);
+  const { id } = req.params;
+  const recordId = parseInt(id, 10);
 
-        if (result.rowCount === 0) {
-            return res.status(404).json({ success: false, message: 'ไม่พบข้อมูลตำแหน่งที่ต้องการลบ' });
-        }
+  if (isNaN(recordId)) {
+    return res.status(400).json({ success: false, message: 'รหัสรายการไม่ถูกต้อง' });
+  }
 
-        res.json({ success: true, message: 'ลบบุคลากรออกจากตำแหน่งสำเร็จ' });
-    } catch (error) {
-        console.error('Error deleting leader:', error);
-        res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการลบข้อมูล: ' + error.message });
-    } finally {
-        if (client) client.release();
+  const client = await pgPool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // ปลดการอ้างอิง parent_id ของรายการย่อยก่อนลบ เพื่อไม่ให้ติด foreign key
+    await client.query(
+      'UPDATE user_positions SET parent_id = NULL WHERE parent_id = $1',
+      [recordId]
+    );
+
+    const result = await client.query(
+      'DELETE FROM user_positions WHERE id = $1 RETURNING *',
+      [recordId]
+    );
+
+    if (result.rowCount === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ success: false, message: 'ไม่พบข้อมูลตำแหน่งที่ต้องการลบ' });
     }
-});
 
+    await client.query('COMMIT');
+    res.json({ success: true, message: 'ลบบุคลากรออกจากตำแหน่งสำเร็จ', data: result.rows[0] });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Error deleting leader:', error);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการลบข้อมูล: ' + error.message });
+  } finally {
+    client.release();
+  }
+});
 // ==========================================
 // API: ดึงข้อมูลผังผู้นำและคณะทำงาน (แก้ไขชื่อคอลัมน์)
 // ==========================================
