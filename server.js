@@ -1977,21 +1977,26 @@ app.put('/api/villages/:villageId/targets', async (req, res) => {
 // ==========================================
 // 🌟 API สำหรับลงทะเบียนหมู่บ้านและผู้ใหญ่บ้าน (แก้ปัญหา village_id เป็น NULL)
 // ==========================================
+// ==========================================
+// 🌟 API สำหรับลงทะเบียนผู้ใหญ่บ้าน (แก้ไขให้ใช้ village_id จาก Frontend)
+// ==========================================
 app.post('/api/villages/register', async (req, res) => {
     const {
-        village_no, village_name, province, district, sub_district,
+        village_id, // 🌟 รับ village_id ที่มีอยู่แล้วจาก Frontend
         latitude, longitude,
         citizen_id, first_name, last_name, nickname, phone_number, password,
         referrer_account_id
     } = req.body;
 
-    if (!phone_number || !password) return res.status(400).json({ success: false, message: 'กรุณากรอกข้อมูลเบอร์โทรศัพท์และรหัสผ่าน' });
+    if (!phone_number || !password || !village_id) {
+        return res.status(400).json({ success: false, message: 'ข้อมูลไม่ครบถ้วน กรุณาเลือกหมู่บ้าน' });
+    }
 
     const client = await pgPool.connect();
     try {
         await client.query('BEGIN'); 
 
-        // 1. ตรวจสอบข้อมูลซ้ำ
+        // 1. ตรวจสอบข้อมูลซ้ำ (เบอร์โทร และ บัตรประชาชน)
         const cleanCitizenId = citizen_id ? String(citizen_id).replace(/-/g, '').trim() : null;
         const checkPhone = await client.query('SELECT account_id FROM user_accounts WHERE username_phone = $1', [phone_number]);
         if (checkPhone.rows.length > 0) {
@@ -2006,36 +2011,14 @@ app.post('/api/villages/register', async (req, res) => {
             }
         }
 
-        // 2. ค้นหา tambon_id
-        let mappedTambonId = null;
-        if (sub_district && district && province) {
-            const searchSub = String(sub_district).replace(/ตำบล|แขวง|ต\./g, '').replace(/\s+/g, '');
-            const searchDist = String(district).replace(/อำเภอ|เขต|อ\./g, '').replace(/\s+/g, '');
-            const searchProv = String(province).replace(/จังหวัด|จ\./g, '').replace(/\s+/g, '');
+        // 🌟 2. ไม่ต้องสร้างหมู่บ้านใหม่แล้ว แค่อัปเดตพิกัด (Lat/Lng) ลงในหมู่บ้านเดิมที่เลือกมา
+        await client.query(`
+            UPDATE villages 
+            SET headman_lat = $1, headman_lng = $2 
+            WHERE village_id = $3
+        `, [latitude, longitude, village_id]);
 
-            const tambonQuery = `
-                SELECT t.tambon_id FROM sys_tambons t
-                JOIN sys_amphures a ON t.amphure_id = a.amphure_id
-                JOIN sys_provinces p ON a.province_id = p.province_id
-                WHERE REPLACE(t.tambon_name_th, ' ', '') LIKE '%' || $1 || '%'
-                  AND REPLACE(a.amphure_name_th, ' ', '') LIKE '%' || $2 || '%'
-                  AND REPLACE(p.province_name_th, ' ', '') LIKE '%' || $3 || '%'
-                LIMIT 1;
-            `;
-            const tResult = await client.query(tambonQuery, [searchSub, searchDist, searchProv]);
-            if (tResult.rows.length > 0) mappedTambonId = tResult.rows[0].tambon_id;
-        }
-
-        // 🌟 3. สร้าง ข้อมูลหมู่บ้าน (ทำก่อนเพื่อเอา village_id ไปใช้ต่อ)
-        const insertVillageQuery = `
-            INSERT INTO villages (village_id, village_no, village_name, tambon_id, headman_lat, headman_lng)
-            VALUES (gen_random_uuid(), $1, $2, $3, $4, $5)
-            RETURNING village_id;
-        `;
-        const villageResult = await client.query(insertVillageQuery, [village_no, village_name, mappedTambonId, latitude, longitude]);
-        const newVillageId = villageResult.rows[0].village_id;
-
-        // 4. สร้าง Profile
+        // 3. สร้าง Profile
         const finalCitizenId = cleanCitizenId || `999${Math.floor(Math.random() * 10000000000).toString().padStart(10, '0')}`;
         const insertProfileQuery = `
             INSERT INTO user_profiles (profile_id, first_name, last_name, nickname, citizen_id, dob)
@@ -2046,30 +2029,31 @@ app.post('/api/villages/register', async (req, res) => {
         const newProfileId = profileResult.rows[0].profile_id;
         const hashedPassword = await bcrypt.hash(password, 10);
 
-        // 🌟 5. สร้าง User Account (ใส่ village_id ลงไปตรงนี้เลย!)
+        // 4. สร้าง User Account โดยผูกกับ village_id เดิมที่มีตำบลสมบูรณ์อยู่แล้ว
         const finalReferrerId = referrer_account_id && referrer_account_id.trim() !== '' ? referrer_account_id : null;
         const insertUserQuery = `
             INSERT INTO user_accounts (account_id, username_phone, password_hash, is_active, area_code, profile_id, referrer_id, role, village_id)
             VALUES (gen_random_uuid(), $1, $2, true, '100000', $3, $4, 'HEADMAN', $5)
             RETURNING account_id;
         `;
-        const userResult = await client.query(insertUserQuery, [phone_number, hashedPassword, newProfileId, finalReferrerId, newVillageId]); 
+        const userResult = await client.query(insertUserQuery, [phone_number, hashedPassword, newProfileId, finalReferrerId, village_id]); 
         const newAccountId = userResult.rows[0].account_id;
 
-        // อัปเดต headman_account_id กลับไปที่หมู่บ้าน
-        await client.query('UPDATE villages SET headman_account_id = $1 WHERE village_id = $2', [newAccountId, newVillageId]);
+        // 5. อัปเดต headman_account_id กลับไปที่ตารางหมู่บ้าน
+        await client.query('UPDATE villages SET headman_account_id = $1 WHERE village_id = $2', [newAccountId, village_id]);
 
         // 6. สร้าง แท็บคณะทำงาน
         await client.query(`
             INSERT INTO village_committees (committee_id, village_id, account_id, position_name, committee_name, description, assigned_at)
             VALUES (gen_random_uuid(), $1, $2, 'ผู้ใหญ่บ้าน', 'คณะกรรมการหมู่บ้าน', 'บริหารจัดการหมู่บ้าน', CURRENT_TIMESTAMP)
-        `, [newVillageId, newAccountId]);
+        `, [village_id, newAccountId]);
 
-        // 7. บันทึกตำแหน่ง
+        // 7. บันทึกตำแหน่งลง user_positions
         let currentPositionId = null;
         const posResult = await client.query('SELECT position_id FROM sys_positions WHERE position_name = $1 LIMIT 1', ['ผู้ใหญ่บ้าน']);
-        if (posResult.rows.length > 0) currentPositionId = posResult.rows[0].position_id;
-        else {
+        if (posResult.rows.length > 0) {
+            currentPositionId = posResult.rows[0].position_id;
+        } else {
             const maxId = await client.query('SELECT COALESCE(MAX(position_id), 0) + 1 as next_id FROM sys_positions WHERE position_id < 999');
             currentPositionId = maxId.rows[0].next_id;
             await client.query(`INSERT INTO sys_positions (position_id, position_name, position_level) VALUES ($1, 'ผู้ใหญ่บ้าน', 'VILLAGE')`, [currentPositionId]);
@@ -2078,10 +2062,10 @@ app.post('/api/villages/register', async (req, res) => {
         await client.query(`
             INSERT INTO user_positions (account_id, position_id, scope_type, scope_id, start_date, is_active, responsibilities) 
             VALUES ($1, $2, 'VILLAGE', $3, CURRENT_DATE, true, 'ผู้นำสูงสุดของหมู่บ้าน')
-        `, [newAccountId, currentPositionId, newVillageId]);
+        `, [newAccountId, currentPositionId, village_id]);
 
         await client.query('COMMIT');
-        res.json({ success: true, message: 'ลงทะเบียนสำเร็จ', village_id: newVillageId, account_id: newAccountId });
+        res.json({ success: true, message: 'ลงทะเบียนสำเร็จ', village_id: village_id, account_id: newAccountId });
     } catch (error) {
         await client.query('ROLLBACK');
         console.error('Registration Error:', error);
