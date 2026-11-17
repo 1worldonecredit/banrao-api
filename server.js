@@ -1428,6 +1428,44 @@ app.get('/api/community-leaders/by-committee/:committeeId', async (req, res) => 
 
 
 // ==========================================
+// API: ดึงข้อมูลผังผู้นำ (V2) - ทางด่วนพิเศษ ป้องกัน API ชนกัน 100%
+// ==========================================
+app.get('/api/v2/committee-leaders/:committeeId', async (req, res) => {
+    const { committeeId } = req.params;
+
+    const client = await pgPool.connect();
+    try {
+        const result = await client.query(`
+            SELECT 
+                upos.id,
+                upos.parent_id,
+                upos.committee_id,
+                sp.position_name AS role_name,
+                upos.start_date,
+                upos.end_date,
+                upos.responsibilities,
+                upos.account_id,
+                COALESCE(p.first_name, hm.first_name) AS first_name,
+                COALESCE(p.last_name, hm.last_name) AS last_name,
+                COALESCE(p.profile_image, '/profile-img.jpg') AS user_image
+            FROM user_positions upos
+            LEFT JOIN sys_positions sp ON upos.position_id = sp.position_id 
+            LEFT JOIN user_accounts a ON upos.account_id::text = a.account_id::text
+            LEFT JOIN user_profiles p ON a.profile_id = p.profile_id
+            LEFT JOIN household_members hm ON upos.account_id::text = hm.member_id::text
+            WHERE upos.committee_id::integer = $1::integer
+        `, [committeeId]);
+
+        res.json({ success: true, data: result.rows });
+    } catch (error) {
+        console.error("Error fetching v2 leaders:", error);
+        res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการดึงข้อมูล', error: error.message });
+    } finally {
+        if (client) client.release();
+    }
+});
+
+// ==========================================
 // API: เพิ่มคณะทำงาน / โครงการใหม่
 // ==========================================
 app.post('/api/community-committees', async (req, res) => {
