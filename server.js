@@ -1492,30 +1492,59 @@ app.post('/api/community-committees', async (req, res) => {
 });
 
 // ==========================================
-// API: อัปเดต/เพิ่ม ข้อมูลผู้นำ (รวมถึงหน้าที่และวันที่)
+// API: อัปเดต/แก้ไข ข้อมูลผู้นำ (อัปเกรดให้เปลี่ยนชื่อตำแหน่งได้)
 // ==========================================
 app.put('/api/community-leaders/:recordId', async (req, res) => {
     const { recordId } = req.params;
-    // 🌟 รับ account_id เข้ามาด้วย เผื่อกรณีที่คุณเปลี่ยนตัวคนในตำแหน่งเดิม
-    const { account_id, start_date, end_date, responsibilities } = req.body; 
     
+    // 🌟 เพิ่มการรับ position_name เข้ามาด้วย
+    const { position_name, account_id, start_date, end_date, responsibilities } = req.body;
+
     const client = await pgPool.connect();
     try {
-        await client.query(`
+        await client.query('BEGIN');
+
+        // 🌟 1. ดักจับและแปลงชื่อตำแหน่งให้เป็น position_id ก่อน (เหมือนตอนเพิ่มข้อมูล)
+        let currentPositionId = null;
+        if (position_name) {
+            const posResult = await client.query('SELECT position_id FROM sys_positions WHERE position_name = $1 LIMIT 1', [position_name]);
+            if (posResult.rows.length > 0) {
+                currentPositionId = posResult.rows[0].position_id;
+            } else {
+                const maxIdResult = await client.query('SELECT COALESCE(MAX(position_id), 0) + 1 as next_id FROM sys_positions WHERE position_id < 999');
+                currentPositionId = maxIdResult.rows[0].next_id;
+                await client.query(`INSERT INTO sys_positions (position_id, position_name, position_level) VALUES ($1, $2, 'VILLAGE')`, [currentPositionId, position_name]);
+            }
+        }
+
+        // 🌟 2. อัปเดตข้อมูลทั้งหมด รวมถึง position_id ด้วย
+        const updateQuery = `
             UPDATE user_positions 
-            SET account_id = $1,        /* 🌟 เพิ่มการอัปเดตตัวบุคลากร */
+            SET account_id = $1, 
                 start_date = $2, 
                 end_date = $3, 
-                responsibilities = $4
-            WHERE id = $5
-        `, [account_id, start_date, end_date || null, responsibilities, recordId]);
+                responsibilities = $4,
+                position_id = COALESCE($5, position_id) 
+            WHERE id = $6
+        `;
         
+        await client.query(updateQuery, [
+            account_id, 
+            start_date, 
+            end_date || null, 
+            responsibilities, 
+            currentPositionId, 
+            recordId
+        ]);
+
+        await client.query('COMMIT');
         res.json({ success: true, message: 'อัปเดตข้อมูลสำเร็จ' });
     } catch (error) {
+        await client.query('ROLLBACK');
         console.error("Update Leader Error:", error);
         res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการอัปเดต' });
     } finally {
-        client.release();
+        if (client) client.release();
     }
 });
 
