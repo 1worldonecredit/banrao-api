@@ -1390,7 +1390,7 @@ app.get('/api/community-leaders/:villageId', async (req, res) => {
 
 
 // ==========================================
-// API: ดึงข้อมูลผังผู้นำด้วย Committee ID โดยตรง (GET)
+// API: ดึงข้อมูลผังผู้นำด้วย Committee ID (แก้ไขการ JOIN sys_positions)
 // ==========================================
 app.get('/api/community-leaders/by-committee/:committeeId', async (req, res) => {
     const { committeeId } = req.params;
@@ -1402,7 +1402,10 @@ app.get('/api/community-leaders/by-committee/:committeeId', async (req, res) => 
                 upos.id,
                 upos.parent_id,
                 upos.committee_id,
-                upos.position_name AS role_name,
+                
+                -- 🌟 1. ดึงชื่อตำแหน่ง (role_name) มาจากตาราง sys_positions
+                sp.position_name AS role_name,
+                
                 upos.start_date,
                 upos.end_date,
                 upos.responsibilities,
@@ -1413,6 +1416,10 @@ app.get('/api/community-leaders/by-committee/:committeeId', async (req, res) => 
                 COALESCE(cpm.image_url, p.profile_image, '/profile-img.jpg') AS user_image
                 
             FROM user_positions upos
+            
+            -- 🌟 2. เชื่อมตาราง sys_positions เพื่อแปลง id ตำแหน่ง ให้กลายเป็นตัวหนังสือ
+            LEFT JOIN sys_positions sp ON upos.position_id = sp.position_id 
+            
             LEFT JOIN user_accounts a ON upos.account_id::text = a.account_id::text
             LEFT JOIN user_profiles p ON a.profile_id = p.profile_id
             LEFT JOIN citizen_profiles_media cpm ON p.profile_id = cpm.profile_id AND cpm.is_active = true
