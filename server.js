@@ -1572,7 +1572,28 @@ app.delete('/api/community-leaders/:recordId', async (req, res) => {
     }
 });
 
-
+// ==========================================
+// API: ดึงรายชื่อแท็บคณะทำงาน (GET)
+// ==========================================
+app.get('/api/community-committees/:villageId', async (req, res) => {
+    const { villageId } = req.params;
+    const client = await pgPool.connect();
+    
+    try {
+        // 🌟 ดึงข้อมูลโดยแปลง village_id ให้เป็น text เพื่อป้องกัน error
+        const result = await client.query(
+            'SELECT * FROM community_committees WHERE village_id::text = $1::text ORDER BY committee_name ASC', 
+            [villageId]
+        );
+        
+        res.json({ success: true, data: result.rows });
+    } catch (error) {
+        console.error("Error fetching committees:", error);
+        res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการดึงข้อมูลคณะทำงาน' });
+    } finally {
+        if (client) client.release(); // คืน Connection เสมอ
+    }
+});
 // ==========================================
 // API: เพิ่มบุคลากรลงในผังคณะทำงาน (แก้ปัญหา $9 integer)
 // ==========================================
@@ -1718,50 +1739,6 @@ app.get('/api/community-committees/:villageId', async (req, res) => {
         if (client) client.release();
     }
 });
-
-// ==========================================
-// API: ดึงรายชื่อแท็บคณะทำงาน (GET)
-// ==========================================
-app.get('/api/community-committees/:villageId', async (req, res) => {
-    const { villageId } = req.params;
-    const client = await pgPool.connect();
-    
-    try {
-        // 🌟 ดึงข้อมูลโดยแปลง village_id ให้เป็น text เพื่อป้องกัน error
-        const result = await client.query(
-            'SELECT * FROM community_committees WHERE village_id::text = $1::text ORDER BY committee_name ASC', 
-            [villageId]
-        );
-        
-        res.json({ success: true, data: result.rows });
-    } catch (error) {
-        console.error("Error fetching committees:", error);
-        res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการดึงข้อมูลคณะทำงาน' });
-    } finally {
-        if (client) client.release(); // คืน Connection เสมอ
-    }
-});
-// ==========================================
-// API: แก้ไขชื่อและรายละเอียดแท็บคณะทำงาน (PUT)
-// ==========================================
-app.put('/api/community-committees/:id', async (req, res) => {
-    const { id } = req.params;
-    const { committee_name, description } = req.body;
-    const client = await pgPool.connect();
-    try {
-        await client.query(
-            `UPDATE village_committees SET committee_name = $1, description = $2 WHERE committee_id = $3`,
-            [committee_name, description, id]
-        );
-        res.json({ success: true, message: 'แก้ไขแท็บสำเร็จ' });
-    } catch (error) {
-        console.error("Update committee error:", error);
-        res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการแก้ไขแท็บ' });
-    } finally {
-        if (client) client.release();
-    }
-});
-
 // ==========================================
 // 🌟 API สำหรับลบคณะทำงาน (DELETE)
 // ==========================================
@@ -1788,42 +1765,6 @@ app.delete('/api/community-committees/:id', async (req, res) => {
     } catch (error) {
         await pgPool.query('ROLLBACK');
         console.error('Error deleting committee:', error);
-        res.status(500).json({ success: false, message: error.message });
-    }
-});
-
-
-// ==========================================
-// API: ดึงรายชื่อคณะทำงานและผู้นำชุมชน (Community Committees)
-// ==========================================
-app.get('/api/community-committees/:village_id', async (req, res) => {
-    try {
-        const { village_id } = req.params;
-        
-        // หมายเหตุ: ตรวจสอบชื่อตารางในคำสั่ง SQL ให้ตรงกับฐานข้อมูล Neon ของคุณ
-        // จากโปรเจกต์ของคุณ ตารางอาจชื่อ user_positions, committee_profiles หรือ community_committees
-        
-        const result = await pgPool.query(`
-            SELECT * 
-            FROM committee_profiles 
-            WHERE village_id = $1
-            ORDER BY created_at ASC
-        `, [village_id]);
-        
-        /* 
-        // 💡 ถ้าคุณมีการแยกตารางตำแหน่ง (sys_positions) ให้เปิดใช้ SQL ตัวนี้แทนครับ:
-        const result = await pgPool.query(\`
-            SELECT up.*, sp.position_name 
-            FROM user_positions up
-            LEFT JOIN sys_positions sp ON up.position_id = sp.position_id
-            WHERE up.village_id = $1
-            ORDER BY sp.level ASC, up.created_at ASC
-        \`, [village_id]);
-        */
-
-        res.json({ success: true, data: result.rows });
-    } catch (error) {
-        console.error("API Error (community-committees):", error);
         res.status(500).json({ success: false, message: error.message });
     }
 });
@@ -2583,6 +2524,40 @@ app.get('/api/location-context/:village_id', async (req, res) => {
     }
 });
 
+// ==========================================
+// API: ดึงรายชื่อคณะทำงานและผู้นำชุมชน (Community Committees)
+// ==========================================
+app.get('/api/community-committees/:village_id', async (req, res) => {
+    try {
+        const { village_id } = req.params;
+        
+        // หมายเหตุ: ตรวจสอบชื่อตารางในคำสั่ง SQL ให้ตรงกับฐานข้อมูล Neon ของคุณ
+        // จากโปรเจกต์ของคุณ ตารางอาจชื่อ user_positions, committee_profiles หรือ community_committees
+        
+        const result = await pgPool.query(`
+            SELECT * 
+            FROM committee_profiles 
+            WHERE village_id = $1
+            ORDER BY created_at ASC
+        `, [village_id]);
+        
+        /* 
+        // 💡 ถ้าคุณมีการแยกตารางตำแหน่ง (sys_positions) ให้เปิดใช้ SQL ตัวนี้แทนครับ:
+        const result = await pgPool.query(\`
+            SELECT up.*, sp.position_name 
+            FROM user_positions up
+            LEFT JOIN sys_positions sp ON up.position_id = sp.position_id
+            WHERE up.village_id = $1
+            ORDER BY sp.level ASC, up.created_at ASC
+        \`, [village_id]);
+        */
+
+        res.json({ success: true, data: result.rows });
+    } catch (error) {
+        console.error("API Error (community-committees):", error);
+        res.status(500).json({ success: false, message: error.message });
+    }
+});
 
 app.listen(port, () => {
     console.log(`Server is running on port ${port}`);
