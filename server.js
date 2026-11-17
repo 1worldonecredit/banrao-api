@@ -105,6 +105,55 @@ app.post('/api/sys-villages/batch', async (req, res) => {
 });
 
 // ==========================================
+// API: ดึงสถิติ Dashboard (จำนวนครัวเรือน และ ประชากร)
+// ==========================================
+app.get('/api/dashboard/:userId', async (req, res) => {
+    const { userId } = req.params;
+
+    const client = await pgPool.connect();
+    try {
+        // 1. หารหัสหมู่บ้าน (village_id) ของ User คนนี้ก่อน
+        const userResult = await client.query('SELECT village_id FROM user_accounts WHERE account_id = $1', [userId]);
+        
+        if (userResult.rows.length === 0) {
+            return res.status(404).json({ success: false, message: 'ไม่พบข้อมูลผู้ใช้งาน' });
+        }
+        
+        const villageId = userResult.rows[0].village_id;
+
+        // 2. นับจำนวนหลังคาเรือน (ที่ลงทะเบียนแล้วในระบบ)
+        const houseResult = await client.query(`
+            SELECT COUNT(DISTINCT house_id) as total_houses 
+            FROM village_households 
+            WHERE village_id = $1 AND is_active = true
+        `, [villageId]);
+
+        // 3. นับจำนวนประชากร (ที่มีในระบบ)
+        const popResult = await client.query(`
+            SELECT COUNT(member_id) as total_population 
+            FROM household_members 
+            WHERE village_id = $1 AND is_active = true
+        `, [villageId]);
+
+        // ส่งข้อมูลกลับไปให้หน้า Dashboard
+        res.json({
+            success: true,
+            village_id: villageId,
+            stats: {
+                total_houses: parseInt(houseResult.rows[0].total_houses) || 0,
+                total_population: parseInt(popResult.rows[0].total_population) || 0
+            }
+        });
+
+    } catch (error) {
+        console.error("Dashboard Stats Error:", error);
+        res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการดึงสถิติ' });
+    } finally {
+        if (client) client.release();
+    }
+});
+
+// ==========================================
 // API 1: ดึงรายชื่อหมู่บ้านตามชื่อตำบล (สำหรับ Dropdown)
 // ==========================================
 app.get('/api/villages/by-tambon', async (req, res) => {
