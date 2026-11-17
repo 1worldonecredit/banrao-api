@@ -104,18 +104,18 @@ app.post('/api/sys-villages/batch', async (req, res) => {
     }
 });
 // ==========================================
-// API: ดึงสถิติ Dashboard (อัปเดตชื่อตารางให้ถูกต้อง 100%)
+// API: ดึงสถิติ Dashboard (อัปเดตชื่อตารางและฟิลด์ให้ถูกต้องเป๊ะ 100%)
 // ==========================================
 app.get('/api/dashboard/:userId', async (req, res) => {
     const { userId } = req.params;
 
     const client = await pgPool.connect();
     try {
-        // 1. หารหัสหมู่บ้าน และดึง "เป้าหมาย" จาก sys_villages
+        // 🌟 1. ดึง "เป้าหมาย" จากตาราง villages (ใช้ชื่อคอลัมน์ household_count, population_count)
         const userResult = await client.query(`
-            SELECT u.village_id, v.target_houses, v.target_population
+            SELECT u.village_id, v.household_count, v.population_count
             FROM user_accounts u
-            LEFT JOIN sys_villages v ON u.village_id = v.village_id
+            LEFT JOIN villages v ON u.village_id = v.village_id
             WHERE u.account_id = $1
         `, [userId]);
         
@@ -124,17 +124,19 @@ app.get('/api/dashboard/:userId', async (req, res) => {
         }
         
         const villageId = userResult.rows[0].village_id;
-        const targetHouses = userResult.rows[0].target_houses || 0;
-        const targetPop = userResult.rows[0].target_population || 0;
+        
+        // แปลงชื่อให้ตรงกับที่หน้า Dashboard.jsx รอรับอยู่
+        const targetHouses = userResult.rows[0].household_count || 0;
+        const targetPop = userResult.rows[0].population_count || 0;
 
-        // 🌟 2. นับจำนวน "ครัวเรือนที่ลงทะเบียนจริง" (จากตาราง households)
+        // 2. นับจำนวน "ครัวเรือนที่ลงทะเบียนจริง"
         const houseResult = await client.query(`
             SELECT COUNT(household_id) as total_houses 
             FROM households 
             WHERE village_id = $1
         `, [villageId]);
 
-        // 🌟 3. นับจำนวน "ประชากรที่ลงทะเบียนจริง" (เชื่อมตาราง household_members กับ households)
+        // 3. นับจำนวน "ประชากรที่ลงทะเบียนจริง"
         const popResult = await client.query(`
             SELECT COUNT(hm.member_id) as total_population 
             FROM household_members hm
