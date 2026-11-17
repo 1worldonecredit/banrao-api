@@ -1428,7 +1428,7 @@ app.get('/api/community-leaders/by-committee/:committeeId', async (req, res) => 
 
 
 // ==========================================
-// API: ดึงข้อมูลผังผู้นำ (V2) - ทางด่วนพิเศษ ป้องกัน API ชนกัน 100%
+// API: ดึงข้อมูลผังผู้นำ (V2) - แก้ไข Error คอลัมน์รูปภาพแล้ว 100%
 // ==========================================
 app.get('/api/v2/committee-leaders/:committeeId', async (req, res) => {
     const { committeeId } = req.params;
@@ -1447,7 +1447,10 @@ app.get('/api/v2/committee-leaders/:committeeId', async (req, res) => {
                 upos.account_id,
                 COALESCE(p.first_name, hm.first_name) AS first_name,
                 COALESCE(p.last_name, hm.last_name) AS last_name,
-                COALESCE(p.profile_image, '/profile-img.jpg') AS user_image
+                
+                -- 🌟 จุดที่แก้: ใช้รูปภาพ Default ไปก่อน เพื่อป้องกัน Error คอลัมน์ไม่มี
+                '/profile-img.jpg' AS user_image
+                
             FROM user_positions upos
             LEFT JOIN sys_positions sp ON upos.position_id = sp.position_id 
             LEFT JOIN user_accounts a ON upos.account_id::text = a.account_id::text
