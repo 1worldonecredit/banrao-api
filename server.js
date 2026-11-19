@@ -2921,6 +2921,37 @@ app.get('/api/sys-tambons-with-count/:amphureCode', async (req, res) => {
         res.status(500).json({ error: err.message });
     }
 });
+
+// ==========================================
+// แก้ไข หมู่ที่ / ชื่อหมู่บ้าน (ปลอดภัย ไม่กระทบบ้านเลขที่และประชากร)
+// ==========================================
+app.put('/api/villages/:villageId', async (req, res) => {
+    const { villageId } = req.params;
+    const { village_no, village_name } = req.body;
+
+    if (!village_name || !village_name.trim()) {
+        return res.status(400).json({ success: false, message: 'กรุณาระบุชื่อหมู่บ้าน' });
+    }
+
+    try {
+        const result = await pgPool.query(
+            `UPDATE villages 
+             SET village_no = $1, village_name = $2 
+             WHERE village_id = $3 
+             RETURNING village_id, village_no, village_name`,
+            [village_no ? String(village_no).trim() : '', village_name.trim(), villageId]
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({ success: false, message: 'ไม่พบข้อมูลหมู่บ้านนี้' });
+        }
+
+        res.json({ success: true, message: 'แก้ไขข้อมูลหมู่บ้านสำเร็จ!', data: result.rows[0] });
+    } catch (err) {
+        console.error('Update Village Error:', err);
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
 // ==========================================
 // โครงสร้างการแยก ย้าย แยกตำบล / ยกฐานะหมู่บ้านเป็นตำบล (สร้างตำบลใหม่ + ย้ายหมู่บ้าน)
 // ==========================================
