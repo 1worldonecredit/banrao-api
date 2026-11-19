@@ -3100,6 +3100,26 @@ app.get('/api/admin/dashboard/overview', verifyAdminToken, async (req, res) => {
     }
 });
 
+
+// ==========================================
+// รองรับ Layout ของ emp.banrao.life (ไม่ให้ติด 404 และ Crash)
+// ==========================================
+app.get('/api/admin/user-banks', (req, res) => {
+    res.json({ success: true, data: [] });
+});
+
+// ดักจับเส้น .../user-permissions ทุกแบบ (เช่น /api/admin/user-permissions หรือ /api/menus/user-permissions)
+app.get('/api/*/user-permissions', async (req, res) => {
+    try {
+        // ดึงรายการเมนูจากตาราง sys_menus ที่มีอยู่จริง (ถ้ายังไม่มีข้อมูลจะคืนค่า [] ไม่พัง)
+        const result = await pgPool.query('SELECT * FROM sys_menus ORDER BY menu_id ASC');
+        res.json(result.rows);
+    } catch (err) {
+        // กันเหนียว คืนค่า Array ว่างเสมอ เพื่อให้ .filter() ไม่พัง
+        res.json([]);
+    }
+});
+
 app.listen(port, () => {
     console.log(`Server is running on port ${port}`);
 });
