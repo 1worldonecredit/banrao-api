@@ -1,62 +1,67 @@
-const { Pool } = require('pg');
-const fs = require('fs'); // 🌟 เพิ่มบรรทัดนี้เพื่อเรียกใช้ File System ของ Node.js
 require('dotenv').config();
+const fs = require('fs');
+const path = require('path');
+const { Pool } = require('pg');
 
 const pgPool = new Pool({
-    connectionString: process.env.DATABASE_URL, 
-    ssl: { rejectUnauthorized: false } 
+    connectionString: process.env.DATABASE_URL,
+    ssl: { rejectUnauthorized: false } // ปิด/เปิดตามการตั้งค่าใน server.js ของคุณวิทยาครับ
 });
 
-const BATCH_SIZE = 200;
-const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+const BATCH_SIZE = 500; // 🌟 กำหนดจำนวนการบันทึกทีละ 500 รายชื่อ
 
 async function importVillages() {
-    console.log('⏳ กำลังอ่านข้อมูลหมู่บ้านจากไฟล์ในเครื่อง...');
-    
+    const client = await pgPool.connect();
     try {
-        // 🌟 1. อ่านข้อมูลจากไฟล์ JSON ในเครื่อง (เช็คชื่อไฟล์ให้ตรงกับที่คุณมี)
-        const fileData = fs.readFileSync('./api_village.json', 'utf8');
-        const villagesData = JSON.parse(fileData);
-        
-        console.log(`✅ อ่านไฟล์สำเร็จ! พบข้อมูลทั้งหมด ${villagesData.length} รายการ`);
-        console.log(`🚀 จะทำการบันทึกทีละ ${BATCH_SIZE} รายการ...\n`);
+        console.log('กำลังอ่านไฟล์ api_villages.json...');
+        const filePath = path.join(__dirname, 'api_villages.json');
+        const rawData = fs.readFileSync(filePath, 'utf8');
+        const villages = JSON.parse(rawData);
 
-        const client = await pgPool.connect();
+        console.log(`พบข้อมูลหมู่บ้านทั้งหมด ${villages.length} รายการ เริ่มทำการ Import ทีละ ${BATCH_SIZE} รายการ...`);
 
-        try {
-            for (let i = 0; i < villagesData.length; i += BATCH_SIZE) {
-                const chunk = villagesData.slice(i, i + BATCH_SIZE);
-                await client.query('BEGIN'); 
-                
-                for (const v of chunk) {
-                    await client.query(`
-                        INSERT INTO sys_villages (tambon_id, village_no, village_name) 
-                        VALUES ($1, $2, $3)
-                        ON CONFLICT DO NOTHING
-                    `, [v.tambon_id, v.village_no, v.village_name]);
-                }
+        let totalInserted = 0;
 
-                await client.query('COMMIT'); 
-                
-                const progress = Math.min(i + BATCH_SIZE, villagesData.length);
-                const percent = ((progress / villagesData.length) * 100).toFixed(2);
-                console.log(`[${percent}%] 💾 บันทึกแล้ว: ${progress} / ${villagesData.length} รายการ`);
-                
-                await sleep(500); 
-            }
-            console.log('\n🎉 นำเข้าข้อมูลหมู่บ้านทั้งประเทศเสร็จสมบูรณ์!');
+        // วนลูปตัดแบ่งข้อมูลทีละ 500 รายชื่อ
+        for (let i = 0; i < villages.length; i += BATCH_SIZE) {
+            const batch = villages.slice(i, i + BATCH_SIZE);
 
-        } catch (error) {
-            await client.query('ROLLBACK');
-            console.error('\n❌ เกิดข้อผิดพลาดในการบันทึกข้อมูล:', error);
-        } finally {
-            client.release();
-            pgPool.end(); 
+            const values = [];
+            const placeholders = [];
+
+            batch.forEach((v, index) => {
+                const offset = index * 3;
+                placeholders.push(`($${offset + 1}, $${offset + 2}, $${offset + 3})`);
+
+                // 🌟 จุดเช็กชื่อ Key ในไฟล์ api_villages.json (ดักเผื่อไว้หลายชื่อที่ใช้บ่อยใน GitHub)
+                const tambonId = v.tambon_id || v.sub_district_id || v.subdistrict_id;
+                const villageNo = v.village_no || v.moo || v.moo_no || '-';
+                const villageName = v.name_th || v.village_name || v.name || '';
+
+                values.push(tambonId, String(villageNo), villageName);
+            });
+
+            const query = `
+                INSERT INTO villages (tambon_id, village_no, village_name)
+                VALUES ${placeholders.join(', ')}
+                ON CONFLICT DO NOTHING;
+            `;
+
+            await client.query('BEGIN');
+            await client.query(query, values);
+            await client.query('COMMIT');
+
+            totalInserted += batch.length;
+            console.log(`✅ นำเข้าแล้ว ${totalInserted} / ${villages.length} รายการ`);
         }
 
+        console.log('🎉 Import รายชื่อหมู่บ้านทั้งหมดเสร็จสมบูรณ์!');
     } catch (error) {
-        console.error('\n❌ ไม่สามารถอ่านไฟล์ JSON ได้ (ตรวจสอบว่ามีไฟล์นี้และชื่อถูกต้อง):', error.message);
-        pgPool.end();
+        await client.query('ROLLBACK');
+        console.error('❌ เกิดข้อผิดพลาดในการ Import:', error);
+    } finally {
+        client.release();
+        await pgPool.end();
     }
 }
 
