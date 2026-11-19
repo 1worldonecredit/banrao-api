@@ -2955,6 +2955,125 @@ app.put('/api/villages/:villageId', async (req, res) => {
 // ==========================================
 // โครงสร้างการแยก ย้าย แยกตำบล / ยกฐานะหมู่บ้านเป็นตำบล (สร้างตำบลใหม่ + ย้ายหมู่บ้าน)
 // ==========================================
+
+
+// ==========================================
+
+//API ADMIN  เริ่ม
+// 1. Middleware ตรวจ Token สำหรับหน้า Admin / Employee
+// ==========================================
+const verifyAdminToken = (req, res, next) => {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+    if (!token) return res.status(401).json({ success: false, message: 'กรุณาเข้าสู่ระบบก่อนใช้งาน' });
+
+    jwt.verify(token, JWT_SECRET, (err, decoded) => {
+        if (err) return res.status(403).json({ success: false, message: 'Token หมดอายุหรือไม่ถูกต้อง' });
+        req.adminUser = decoded;
+        next();
+    });
+};
+
+app.post('/api/admin/login', async (req, res) => {
+    const { username, password } = req.body;
+    if (!username || !password) {
+        return res.status(400).json({ success: false, message: 'กรุณากรอกชื่อผู้ใช้งานและรหัสผ่าน' });
+    }
+
+    try {
+        // 1. ดึงข้อมูลบุคคล
+        const userQuery = await pgPool.query(`
+            SELECT 
+                ua.account_id, ua.profile_id, ua.username_phone, ua.password_hash,
+                ua.role, ua.area_code, ua.is_active,
+                up.first_name, up.last_name, up.nickname
+            FROM user_accounts ua
+            JOIN user_profiles up ON ua.profile_id = up.profile_id
+            WHERE ua.username_phone = $1
+            LIMIT 1
+        `, [username.trim()]);
+
+        if (userQuery.rows.length === 0) {
+            return res.status(401).json({ success: false, message: 'ไม่พบรหัสผู้ใช้งานนี้ในระบบ' });
+        }
+
+        const user = userQuery.rows[0];
+        if (!user.is_active) {
+            return res.status(403).json({ success: false, message: 'บัญชีนี้ถูกระงับการใช้งาน' });
+        }
+
+        const isMatch = await bcrypt.compare(password, user.password_hash);
+        if (!isMatch) {
+            return res.status(401).json({ success: false, message: 'รหัสผ่านไม่ถูกต้อง' });
+        }
+
+        // 2. ดึงตำแหน่งทั้งหมดของบุคคลนี้
+        const posQuery = await pgPool.query(`
+            SELECT sp.position_id, sp.position_name, sp.position_level, sp.department_id
+            FROM user_positions upos
+            JOIN sys_positions sp ON upos.position_id = sp.position_id
+            WHERE upos.account_id = $1
+        `, [user.account_id]);
+
+        // 3. ดึงสิทธิ์ (permission_code) ทั้งหมดจากตำแหน่งที่ถืออยู่
+        const isSuperAdmin = user.username_phone === '0000000000' || (user.role || '').toUpperCase() === 'SUPER_ADMIN';
+        let permissions = [];
+
+        if (isSuperAdmin) {
+            // Super Admin ได้สิทธิ์ทั้งหมดในระบบ
+            const allPerm = await pgPool.query('SELECT permission_code FROM sys_permissions');
+            permissions = ['*', ...allPerm.rows.map(r => r.permission_code)];
+        } else {
+            const permQuery = await pgPool.query(`
+                SELECT DISTINCT p.permission_code
+                FROM user_positions upos
+                JOIN position_permissions pp ON upos.position_id = pp.position_id
+                JOIN sys_permissions p ON pp.permission_id = p.permission_id
+                WHERE upos.account_id = $1
+            `, [user.account_id]);
+            permissions = permQuery.rows.map(r => r.permission_code);
+        }
+
+        // 4. ถ้าไม่มีสิทธิ์หลังบ้านเลยแม้แต่สิทธิ์เดียว ห้ามเข้า emp.banrao.life
+        if (permissions.length === 0) {
+            return res.status(403).json({ success: false, message: 'บัญชีนี้ยังไม่ได้รับกำหนดสิทธิ์เข้าใช้งานระบบหลังบ้าน' });
+        }
+
+        // 5. สร้าง Token พร้อมฝัง permissions ไว้ตรวจสอบทุก API
+        const token = jwt.sign(
+            {
+                account_id: user.account_id,
+                profile_id: user.profile_id,
+                username: user.username_phone,
+                is_super_admin: isSuperAdmin,
+                permissions
+            },
+            JWT_SECRET,
+            { expiresIn: '12h' }
+        );
+
+        res.json({
+            success: true,
+            message: 'เข้าสู่ระบบสำเร็จ',
+            token,
+            user: {
+                account_id: user.account_id,
+                profile_id: user.profile_id,
+                username: user.username_phone,
+                full_name: `${user.first_name} ${user.last_name}`.trim(),
+                area_code: user.area_code,
+                is_super_admin: isSuperAdmin,
+                positions: posQuery.rows,
+                permissions // <-- Frontend เอา Array นี้ไปเช็กเปิด/ปิดเมนูได้เลย
+            }
+        });
+    } catch (err) {
+        console.error('Admin Login Error:', err);
+        res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดที่เซิร์ฟเวอร์: ' + err.message });
+    }
+});
+
+
 app.listen(port, () => {
     console.log(`Server is running on port ${port}`);
 });
