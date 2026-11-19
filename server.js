@@ -2620,6 +2620,129 @@ app.get('/api/community-committees/:village_id', async (req, res) => {
     }
 });
 
+
+
+// ==========================================
+// 1. แยกจังหวัด / ยกฐานะอำเภอเป็นจังหวัด (สร้างจังหวัดใหม่ + ย้ายอำเภอ)
+// ==========================================
+app.post('/api/area/restructure-province', async (req, res) => {
+    const { new_province_name, amphure_codes } = req.body;
+    if (!new_province_name || !amphure_codes || amphure_codes.length === 0) {
+        return res.status(400).json({ success: false, message: 'กรุณาระบุชื่อจังหวัดใหม่และเลือกอำเภออย่างน้อย 1 อำเภอ' });
+    }
+
+    const client = await pgPool.connect();
+    try {
+        await client.query('BEGIN');
+
+        // สร้างรหัสจังหวัดใหม่ (เอาค่ามากสุด + 1)
+        const maxRes = await client.query('SELECT COALESCE(MAX(province_code::int), 90) + 1 AS next_code FROM sys_provinces');
+        const newProvinceCode = maxRes.rows[0].next_code;
+
+        // 1. เพิ่มจังหวัดใหม่
+        await client.query(
+            'INSERT INTO sys_provinces (province_code, province_name_th) VALUES ($1, $2)',
+            [newProvinceCode, new_province_name.trim()]
+        );
+
+        // 2. ย้ายอำเภอที่เลือกมาสังกัดจังหวัดใหม่ (ตำบล/หมู่บ้าน/บ้าน/ประชากร จะตามมาอัตโนมัติ)
+        await client.query(
+            'UPDATE sys_amphures SET province_code = $1 WHERE amphure_code = ANY($2)',
+            [newProvinceCode, amphure_codes]
+        );
+
+        await client.query('COMMIT');
+        res.json({ success: true, message: `สร้างจังหวัด "${new_province_name}" และย้าย ${amphure_codes.length} อำเภอสำเร็จ!` });
+    } catch (error) {
+        await client.query('ROLLBACK');
+        console.error('Restructure Province Error:', error);
+        res.status(500).json({ success: false, message: error.message });
+    } finally {
+        client.release();
+    }
+});
+
+// ==========================================
+// 2. แยกอำเภอ / ยกฐานะตำบลเป็นอำเภอ (สร้างอำเภอใหม่ + ย้ายตำบล)
+// ==========================================
+app.post('/api/area/restructure-amphure', async (req, res) => {
+    const { target_province_code, new_amphure_name, tambon_ids } = req.body;
+    if (!target_province_code || !new_amphure_name || !tambon_ids || tambon_ids.length === 0) {
+        return res.status(400).json({ success: false, message: 'กรุณากรอกข้อมูลให้ครบและเลือกตำบลอย่างน้อย 1 ตำบล' });
+    }
+
+    const client = await pgPool.connect();
+    try {
+        await client.query('BEGIN');
+
+        const maxRes = await client.query('SELECT COALESCE(MAX(amphure_code::int), 9000) + 1 AS next_code FROM sys_amphures');
+        const newAmphureCode = maxRes.rows[0].next_code;
+
+        // 1. เพิ่มอำเภอใหม่
+        await client.query(
+            'INSERT INTO sys_amphures (amphure_code, amphure_name_th, province_code) VALUES ($1, $2, $3)',
+            [newAmphureCode, new_amphure_name.trim(), target_province_code]
+        );
+
+        // 2. ย้ายตำบลที่เลือกมาสังกัดอำเภอใหม่
+        await client.query(
+            'UPDATE sys_tambons SET amphure_code = $1 WHERE tambon_id = ANY($2)',
+            [newAmphureCode, tambon_ids]
+        );
+
+        await client.query('COMMIT');
+        res.json({ success: true, message: `สร้างอำเภอ "${new_amphure_name}" และย้าย ${tambon_ids.length} ตำบลสำเร็จ!` });
+    } catch (error) {
+        await client.query('ROLLBACK');
+        console.error('Restructure Amphure Error:', error);
+        res.status(500).json({ success: false, message: error.message });
+    } finally {
+        client.release();
+    }
+});
+
+// ==========================================
+// 3. แยกตำบล / ยกฐานะหมู่บ้านเป็นตำบล (สร้างตำบลใหม่ + ย้ายหมู่บ้าน)
+// ==========================================
+app.post('/api/area/restructure-tambon', async (req, res) => {
+    const { target_amphure_code, new_tambon_name, village_ids } = req.body;
+    if (!target_amphure_code || !new_tambon_name || !village_ids || village_ids.length === 0) {
+        return res.status(400).json({ success: false, message: 'กรุณากรอกข้อมูลให้ครบและเลือกหมู่บ้านอย่างน้อย 1 หมู่บ้าน' });
+    }
+
+    const client = await pgPool.connect();
+    try {
+        await client.query('BEGIN');
+
+        const maxRes = await client.query('SELECT COALESCE(MAX(tambon_id::int), 900000) + 1 AS next_id FROM sys_tambons');
+        const newTambonId = maxRes.rows[0].next_id;
+
+        // 1. เพิ่มตำบลใหม่
+        await client.query(
+            'INSERT INTO sys_tambons (tambon_id, tambon_name_th, amphure_code) VALUES ($1, $2, $3)',
+            [newTambonId, new_tambon_name.trim(), target_amphure_code]
+        );
+
+        // 2. ย้ายหมู่บ้านที่เลือกมาสังกัดตำบลใหม่ (village_id เดิมไม่เปลี่ยน ข้อมูลบ้านและคนไม่หาย)
+        await client.query(
+            'UPDATE villages SET tambon_id = $1 WHERE village_id = ANY($2)',
+            [newTambonId, village_ids]
+        );
+
+        await client.query('COMMIT');
+        res.json({ success: true, message: `สร้างตำบล "${new_tambon_name}" และย้าย ${village_ids.length} หมู่บ้านสำเร็จ!` });
+    } catch (error) {
+        await client.query('ROLLBACK');
+        console.error('Restructure Tambon Error:', error);
+        res.status(500).json({ success: false, message: error.message });
+    } finally {
+        client.release();
+    }
+});
+
+// ==========================================
+// โครงสร้างการแยก ย้าย แยกตำบล / ยกฐานะหมู่บ้านเป็นตำบล (สร้างตำบลใหม่ + ย้ายหมู่บ้าน)
+// ==========================================
 app.listen(port, () => {
     console.log(`Server is running on port ${port}`);
 });
