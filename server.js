@@ -3100,7 +3100,57 @@ app.get('/api/admin/dashboard/overview', verifyAdminToken, async (req, res) => {
     }
 });
 
+// ==========================================
+// API ดึงรายชื่อผู้ใช้งานทั้งหมด พร้อมตำแหน่ง (แยกสิทธิ์)
+// ==========================================
+app.get('/api/admin/users', verifyAdminToken, async (req, res) => {
+    try {
+        const usersQuery = await pgPool.query(`
+            SELECT 
+                ua.account_id,
+                ua.username_phone,
+                ua.role,
+                ua.area_code,
+                ua.is_active,
+                ua.created_at,
+                up.first_name,
+                up.last_name,
+                up.nickname,
+                COALESCE(
+                    json_agg(
+                        json_build_object(
+                            'position_id', sp.position_id,
+                            'position_name', sp.position_name,
+                            'position_level', sp.position_level
+                        )
+                    ) FILTER (WHERE sp.position_id IS NOT NULL),
+                    '[]'
+                ) AS positions
+            FROM user_accounts ua
+            JOIN user_profiles up ON ua.profile_id = up.profile_id
+            LEFT JOIN user_positions upos ON ua.account_id = upos.account_id
+            LEFT JOIN sys_positions sp ON upos.position_id = sp.position_id
+            GROUP BY ua.account_id, up.profile_id
+            ORDER BY ua.created_at DESC
+        `);
 
+        // ดึงรายชื่อตำแหน่งทั้งหมดที่มีในระบบ เพื่อนำไปสร้างปุ่มกรอง
+        const positionsQuery = await pgPool.query(`
+            SELECT position_id, position_name, position_level
+            FROM sys_positions
+            ORDER BY position_id ASC
+        `);
+
+        res.json({
+            success: true,
+            users: usersQuery.rows,
+            positions: positionsQuery.rows
+        });
+    } catch (err) {
+        console.error('Get Admin Users Error:', err);
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
 
 
 app.listen(port, () => {
