@@ -3231,6 +3231,135 @@ app.delete('/api/admin/positions/:positionId', verifyAdminToken, async (req, res
     }
 });
 
+
+// ==========================================
+// 1. ดึงเมนูที่ผู้ใช้ปัจจุบันมีสิทธิ์เห็น (สำหรับ Sidebar)
+// ==========================================
+app.get('/api/admin/my-menus', verifyAdminToken, async (req, res) => {
+    try {
+        const user = req.adminUser;
+        // Super Admin เห็นทุกเมนูที่เปิดใช้งาน
+        if (user.is_super_admin) {
+            const result = await pgPool.query(
+                `SELECT * FROM admin_menus WHERE is_active = true ORDER BY display_order ASC, menu_id ASC`
+            );
+            return res.json({ success: true, data: result.rows });
+        }
+
+        // พนักงานทั่วไป เห็นเฉพาะเมนูที่ถูกกำหนดสิทธิ์ไว้ใน admin_user_menus
+        const result = await pgPool.query(`
+            SELECT m.*
+            FROM admin_menus m
+            JOIN admin_user_menus um ON m.menu_id = um.menu_id
+            WHERE um.account_id = $1 AND m.is_active = true
+            ORDER BY m.display_order ASC, m.menu_id ASC
+        `, [user.account_id]);
+
+        res.json({ success: true, data: result.rows });
+    } catch (err) {
+        console.error('Get My Menus Error:', err);
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// ==========================================
+// 2. จัดการเมนูหลังบ้าน (ดู / เพิ่ม / แก้ไข / ลบ)
+// ==========================================
+app.get('/api/admin/menus', verifyAdminToken, async (req, res) => {
+    try {
+        const result = await pgPool.query(
+            `SELECT * FROM admin_menus ORDER BY display_order ASC, menu_id ASC`
+        );
+        res.json({ success: true, data: result.rows });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+app.post('/api/admin/menus', verifyAdminToken, async (req, res) => {
+    const { menu_name, route_path, icon_name, display_order } = req.body;
+    if (!menu_name || !route_path) {
+        return res.status(400).json({ success: false, message: 'กรุณาระบุชื่อเมนูและ Route Path' });
+    }
+    try {
+        const result = await pgPool.query(
+            `INSERT INTO admin_menus (menu_name, route_path, icon_name, display_order)
+             VALUES ($1, $2, $3, $4) RETURNING *`,
+            [menu_name.trim(), route_path.trim(), icon_name || 'Circle', Number(display_order) || 0]
+        );
+        res.json({ success: true, message: 'เพิ่มเมนูสำเร็จ', data: result.rows[0] });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+app.put('/api/admin/menus/:menuId', verifyAdminToken, async (req, res) => {
+    const { menuId } = req.params;
+    const { menu_name, route_path, icon_name, display_order, is_active } = req.body;
+    try {
+        const result = await pgPool.query(
+            `UPDATE admin_menus
+             SET menu_name = $1, route_path = $2, icon_name = $3, display_order = $4, is_active = $5
+             WHERE menu_id = $6 RETURNING *`,
+            [menu_name.trim(), route_path.trim(), icon_name || 'Circle', Number(display_order) || 0, is_active !== false, menuId]
+        );
+        res.json({ success: true, message: 'แก้ไขเมนูสำเร็จ', data: result.rows[0] });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+app.delete('/api/admin/menus/:menuId', verifyAdminToken, async (req, res) => {
+    try {
+        await pgPool.query('DELETE FROM admin_menus WHERE menu_id = $1', [req.params.menuId]);
+        res.json({ success: true, message: 'ลบเมนูสำเร็จ' });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// ==========================================
+// 3. กำหนดสิทธิ์เมนูรายบุคคล (ดึงสิทธิ์ / บันทึกสิทธิ์)
+// ==========================================
+app.get('/api/admin/user-menus/:accountId', verifyAdminToken, async (req, res) => {
+    try {
+        const result = await pgPool.query(
+            `SELECT menu_id FROM admin_user_menus WHERE account_id = $1`,
+            [req.params.accountId]
+        );
+        res.json({ success: true, menu_ids: result.rows.map(r => r.menu_id) });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+app.put('/api/admin/user-menus/:accountId', verifyAdminToken, async (req, res) => {
+    const { accountId } = req.params;
+    const { menu_ids } = req.body; // Array เช่น [1, 2, 4]
+    const client = await pgPool.connect();
+    try {
+        await client.query('BEGIN');
+        await client.query('DELETE FROM admin_user_menus WHERE account_id = $1', [accountId]);
+
+        if (Array.isArray(menu_ids) && menu_ids.length > 0) {
+            for (const menuId of menu_ids) {
+                await client.query(
+                    `INSERT INTO admin_user_menus (account_id, menu_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+                    [accountId, menuId]
+                );
+            }
+        }
+        await client.query('COMMIT');
+        res.json({ success: true, message: 'บันทึกสิทธิ์การใช้งานเมนูสำเร็จ!' });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        res.status(500).json({ success: false, message: err.message });
+    } finally {
+        client.release();
+    }
+});
+
+
 app.listen(port, () => {
     console.log(`Server is running on port ${port}`);
 });
