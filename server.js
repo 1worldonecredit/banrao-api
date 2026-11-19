@@ -243,17 +243,14 @@ app.get('/api/sys-provinces', async (req, res) => {
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 2. ดึงอำเภอ (เชื่อมผ่าน province_id รองรับการแยก/ย้ายจังหวัด 100%)
+// 2. ดึงอำเภอ (กลับไปใช้ LIKE เหมือนเดิม)
 app.get('/api/sys-amphures/:provinceCode', async (req, res) => {
     try {
         const pCode = req.params.provinceCode;
-        const result = await pgPool.query(`
-            SELECT a.amphure_code, a.amphure_name_th
-            FROM sys_amphures a
-            JOIN sys_provinces p ON a.province_id = p.province_id
-            WHERE p.province_code = $1
-            ORDER BY a.amphure_name_th ASC
-        `, [String(pCode)]);
+        const result = await pgPool.query(
+            'SELECT amphure_code, amphure_name_th FROM sys_amphures WHERE amphure_code LIKE $1 ORDER BY amphure_name_th ASC',
+            [`${pCode}%`]
+        );
         res.json(result.rows);
     } catch (err) { res.status(500).json({ error: err.message }); }
 });
