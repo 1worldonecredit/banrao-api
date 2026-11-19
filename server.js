@@ -2661,7 +2661,6 @@ app.post('/api/area/restructure-province', async (req, res) => {
         client.release();
     }
 });
-
 // ==========================================
 // 2. แยกอำเภอ / ยกฐานะตำบลเป็นอำเภอ (สร้างอำเภอใหม่ + ย้ายตำบล)
 // ==========================================
@@ -2678,13 +2677,13 @@ app.post('/api/area/restructure-amphure', async (req, res) => {
         const maxRes = await client.query('SELECT COALESCE(MAX(amphure_code::int), 9000) + 1 AS next_code FROM sys_amphures');
         const newAmphureCode = maxRes.rows[0].next_code;
 
-        // 1. เพิ่มอำเภอใหม่
+        // 1. เพิ่มอำเภอใหม่ (ลงตาราง sys_amphures)
         await client.query(
-            'INSERT INTO sys_tambons (tambon_id, tambon_name_th, amphure_id) VALUES ($1, $2, $3)',
-            [newTambonId, new_tambon_name.trim(), target_amphure_code]
+            'INSERT INTO sys_amphures (amphure_code, amphure_name_th, province_code) VALUES ($1, $2, $3)',
+            [newAmphureCode, new_amphure_name.trim(), target_province_code]
         );
 
-        // 2. ย้ายตำบลที่เลือกมาสังกัดอำเภอใหม่
+        // 2. ย้ายตำบลที่เลือกมาสังกัดอำเภอใหม่ (ใช้ amphure_id)
         await client.query(
             'UPDATE sys_tambons SET amphure_id = $1 WHERE tambon_id = ANY($2)',
             [newAmphureCode, tambon_ids]
@@ -2717,13 +2716,13 @@ app.post('/api/area/restructure-tambon', async (req, res) => {
         const maxRes = await client.query('SELECT COALESCE(MAX(tambon_id::int), 900000) + 1 AS next_id FROM sys_tambons');
         const newTambonId = maxRes.rows[0].next_id;
 
-        // 1. เพิ่มตำบลใหม่
+        // 1. เพิ่มตำบลใหม่ (ใช้ amphure_id)
         await client.query(
-            'INSERT INTO sys_tambons (tambon_id, tambon_name_th, amphure_code) VALUES ($1, $2, $3)',
+            'INSERT INTO sys_tambons (tambon_id, tambon_name_th, amphure_id) VALUES ($1, $2, $3)',
             [newTambonId, new_tambon_name.trim(), target_amphure_code]
         );
 
-        // 2. ย้ายหมู่บ้านที่เลือกมาสังกัดตำบลใหม่ (village_id เดิมไม่เปลี่ยน ข้อมูลบ้านและคนไม่หาย)
+        // 2. ย้ายหมู่บ้านที่เลือกมาสังกัดตำบลใหม่
         await client.query(
             'UPDATE villages SET tambon_id = $1 WHERE village_id = ANY($2)',
             [newTambonId, village_ids]
