@@ -2873,6 +2873,54 @@ app.delete('/api/area/delete-empty', async (req, res) => {
     }
 });
 
+
+// ==========================================
+// 1. ดึงสถิติภาพรวมพื้นที่ทั้งประเทศ (สำหรับหน้า AddVillageMaster)
+// ==========================================
+app.get('/api/area/village-stats', async (req, res) => {
+    try {
+        const result = await pgPool.query(`
+            SELECT
+                (SELECT COUNT(*)::int FROM sys_provinces) AS total_provinces,
+                (SELECT COUNT(*)::int FROM sys_amphures) AS total_amphures,
+                (SELECT COUNT(*)::int FROM sys_tambons) AS total_tambons,
+                (SELECT COUNT(*)::int FROM villages) AS total_villages,
+                (SELECT COUNT(DISTINCT tambon_id)::int FROM villages) AS tambons_with_villages,
+                (SELECT COUNT(DISTINCT t.amphure_id)::int 
+                 FROM villages v 
+                 JOIN sys_tambons t ON v.tambon_id = t.tambon_id) AS amphures_with_villages,
+                (SELECT COUNT(DISTINCT LEFT(a.amphure_code, 2))::int 
+                 FROM villages v 
+                 JOIN sys_tambons t ON v.tambon_id = t.tambon_id
+                 JOIN sys_amphures a ON t.amphure_id = a.amphure_id) AS provinces_with_villages
+        `);
+        res.json({ success: true, data: result.rows[0] });
+    } catch (err) {
+        console.error('Village Stats Error:', err);
+        res.status(500).json({ success: false, error: err.message });
+    }
+});
+
+// ==========================================
+// 2. ดึงรายชื่อตำบลพร้อมนับจำนวนหมู่บ้านที่มีอยู่แล้ว
+// ==========================================
+app.get('/api/sys-tambons-with-count/:amphureCode', async (req, res) => {
+    try {
+        const aCode = req.params.amphureCode;
+        const result = await pgPool.query(`
+            SELECT t.tambon_id, t.tambon_name_th, COUNT(v.village_id)::int AS village_count
+            FROM sys_tambons t
+            JOIN sys_amphures a ON t.amphure_id = a.amphure_id
+            LEFT JOIN villages v ON t.tambon_id = v.tambon_id
+            WHERE a.amphure_code = $1
+            GROUP BY t.tambon_id, t.tambon_name_th
+            ORDER BY t.tambon_name_th ASC
+        `, [String(aCode)]);
+        res.json(result.rows);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
 // ==========================================
 // โครงสร้างการแยก ย้าย แยกตำบล / ยกฐานะหมู่บ้านเป็นตำบล (สร้างตำบลใหม่ + ย้ายหมู่บ้าน)
 // ==========================================
