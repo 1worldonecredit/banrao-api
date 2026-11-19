@@ -2680,13 +2680,13 @@ app.post('/api/area/restructure-amphure', async (req, res) => {
 
         // 1. เพิ่มอำเภอใหม่
         await client.query(
-            'INSERT INTO sys_amphures (amphure_code, amphure_name_th, province_code) VALUES ($1, $2, $3)',
-            [newAmphureCode, new_amphure_name.trim(), target_province_code]
+            'INSERT INTO sys_tambons (tambon_id, tambon_name_th, amphure_id) VALUES ($1, $2, $3)',
+            [newTambonId, new_tambon_name.trim(), target_amphure_code]
         );
 
         // 2. ย้ายตำบลที่เลือกมาสังกัดอำเภอใหม่
         await client.query(
-            'UPDATE sys_tambons SET amphure_code = $1 WHERE tambon_id = ANY($2)',
+            'UPDATE sys_tambons SET amphure_id = $1 WHERE tambon_id = ANY($2)',
             [newAmphureCode, tambon_ids]
         );
 
