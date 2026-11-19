@@ -2784,7 +2784,94 @@ app.post('/api/area/restructure-tambon', async (req, res) => {
         client.release();
     }
 });
+// ==========================================
+// 4. ย้ายรายการไปสังกัดพื้นที่เดิมที่มีอยู่แล้ว (ย้ายกลับ / ย้ายข้ามเขต)
+// ==========================================
+app.post('/api/area/move-to-existing', async (req, res) => {
+    const { level, item_ids, target_parent_id } = req.body;
+    // level: 'tambon' (ย้ายหมู่บ้านไปตำบลเดิม), 'amphure' (ย้ายตำบลไปอำเภอเดิม), 'province' (ย้ายอำเภอไปจังหวัดเดิม)
+    if (!level || !item_ids || item_ids.length === 0 || !target_parent_id) {
+        return res.status(400).json({ success: false, message: 'กรุณาเลือกรายการและพื้นที่ปลายทางให้ครบ' });
+    }
 
+    const client = await pgPool.connect();
+    try {
+        await client.query('BEGIN');
+
+        if (level === 'tambon') {
+            // ย้ายหมู่บ้าน -> ไปตำบลที่มีอยู่แล้ว
+            await client.query(
+                'UPDATE villages SET tambon_id = $1 WHERE village_id = ANY($2)',
+                [target_parent_id, item_ids]
+            );
+        } else if (level === 'amphure') {
+            // ย้ายตำบล -> ไปอำเภอที่มีอยู่แล้ว
+            const ampRes = await client.query('SELECT amphure_id FROM sys_amphures WHERE amphure_code = $1 LIMIT 1', [String(target_parent_id)]);
+            if (ampRes.rows.length === 0) throw new Error('ไม่พบอำเภอปลายทาง');
+            await client.query(
+                'UPDATE sys_tambons SET amphure_id = $1 WHERE tambon_id = ANY($2)',
+                [ampRes.rows[0].amphure_id, item_ids]
+            );
+        } else if (level === 'province') {
+            // ย้ายอำเภอ -> ไปจังหวัดที่มีอยู่แล้ว
+            const provRes = await client.query('SELECT province_id FROM sys_provinces WHERE province_code = $1 LIMIT 1', [String(target_parent_id)]);
+            if (provRes.rows.length === 0) throw new Error('ไม่พบจังหวัดปลายทาง');
+            await client.query(
+                'UPDATE sys_amphures SET province_id = $1 WHERE amphure_code = ANY($2)',
+                [provRes.rows[0].province_id, item_ids.map(String)]
+            );
+        }
+
+        await client.query('COMMIT');
+        res.json({ success: true, message: `ย้าย ${item_ids.length} รายการไปยังพื้นที่ปลายทางสำเร็จ!` });
+    } catch (error) {
+        await client.query('ROLLBACK');
+        console.error('Move to existing Error:', error);
+        res.status(500).json({ success: false, message: error.message });
+    } finally {
+        client.release();
+    }
+});
+
+// ==========================================
+// 5. ลบตำบล หรือ อำเภอ (ลบได้เฉพาะเมื่อไม่มีข้อมูลลูกค้างอยู่)
+// ==========================================
+app.delete('/api/area/delete-empty', async (req, res) => {
+    const { level, id } = req.body; // level: 'tambon' หรือ 'amphure'
+    if (!level || !id) {
+        return res.status(400).json({ success: false, message: 'ข้อมูลไม่ครบถ้วน' });
+    }
+
+    const client = await pgPool.connect();
+    try {
+        if (level === 'tambon') {
+            const check = await client.query('SELECT COUNT(*)::int AS cnt FROM villages WHERE tambon_id = $1', [id]);
+            if (check.rows[0].cnt > 0) {
+                return res.status(400).json({ success: false, message: `ไม่สามารถลบได้ เนื่องจากยังมีหมู่บ้านสังกัดอยู่ ${check.rows[0].cnt} หมู่บ้าน กรุณาย้ายออกก่อน` });
+            }
+            await client.query('DELETE FROM sys_tambons WHERE tambon_id = $1', [id]);
+            return res.json({ success: true, message: 'ลบรายชื่อตำบลสำเร็จ!' });
+        }
+
+        if (level === 'amphure') {
+            const ampRes = await client.query('SELECT amphure_id FROM sys_amphures WHERE amphure_code = $1 LIMIT 1', [String(id)]);
+            if (ampRes.rows.length === 0) return res.status(404).json({ success: false, message: 'ไม่พบอำเภอนี้' });
+            const amphureId = ampRes.rows[0].amphure_id;
+
+            const check = await client.query('SELECT COUNT(*)::int AS cnt FROM sys_tambons WHERE amphure_id = $1', [amphureId]);
+            if (check.rows[0].cnt > 0) {
+                return res.status(400).json({ success: false, message: `ไม่สามารถลบได้ เนื่องจากยังมีตำบลสังกัดอยู่ ${check.rows[0].cnt} ตำบล กรุณาย้ายออกก่อน` });
+            }
+            await client.query('DELETE FROM sys_amphures WHERE amphure_id = $1', [amphureId]);
+            return res.json({ success: true, message: 'ลบรายชื่ออำเภอสำเร็จ!' });
+        }
+    } catch (error) {
+        console.error('Delete Empty Area Error:', error);
+        res.status(500).json({ success: false, message: error.message });
+    } finally {
+        client.release();
+    }
+});
 
 // ==========================================
 // โครงสร้างการแยก ย้าย แยกตำบล / ยกฐานะหมู่บ้านเป็นตำบล (สร้างตำบลใหม่ + ย้ายหมู่บ้าน)
