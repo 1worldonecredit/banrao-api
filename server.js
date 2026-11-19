@@ -2716,10 +2716,10 @@ app.post('/api/area/restructure-tambon', async (req, res) => {
         const maxRes = await client.query('SELECT COALESCE(MAX(tambon_id::int), 900000) + 1 AS next_id FROM sys_tambons');
         const newTambonId = maxRes.rows[0].next_id;
 
-        // 1. เพิ่มตำบลใหม่ (ใช้ amphure_id)
+       // 1. เพิ่มตำบลใหม่ (ใส่ tambon_code ด้วย)
         await client.query(
-            'INSERT INTO sys_tambons (tambon_id, tambon_name_th, amphure_id) VALUES ($1, $2, $3)',
-            [newTambonId, new_tambon_name.trim(), target_amphure_code]
+            'INSERT INTO sys_tambons (tambon_id, tambon_code, tambon_name_th, amphure_id) VALUES ($1, $2, $3, $4)',
+            [newTambonId, String(newTambonId), new_tambon_name.trim(), target_amphure_code]
         );
 
         // 2. ย้ายหมู่บ้านที่เลือกมาสังกัดตำบลใหม่
