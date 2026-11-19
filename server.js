@@ -2721,7 +2721,7 @@ app.post('/api/area/restructure-amphure', async (req, res) => {
 });
 
 // ==========================================
-// 3. แยกตำบล / ยกฐานะหมู่บ้านเป็นตำบล (สร้างตำบลใหม่ + ย้ายหมู่บ้าน)
+// 3. แยกตำบล / ยกฐานะหมู่บ้านเป็นตำบล (สร้างรหัสเข้ากลุ่ม เช่น 670608)
 // ==========================================
 app.post('/api/area/restructure-tambon', async (req, res) => {
     const { target_amphure_code, new_tambon_name, village_ids } = req.body;
@@ -2733,7 +2733,7 @@ app.post('/api/area/restructure-tambon', async (req, res) => {
     try {
         await client.query('BEGIN');
 
-        // หา amphure_id จาก amphure_code ที่ส่งมา
+        // 1. หา amphure_id จาก amphure_code ที่ส่งมา
         const ampRes = await client.query(
             'SELECT amphure_id FROM sys_amphures WHERE amphure_code = $1 LIMIT 1',
             [String(target_amphure_code)]
@@ -2741,31 +2741,33 @@ app.post('/api/area/restructure-tambon', async (req, res) => {
         if (ampRes.rows.length === 0) throw new Error('ไม่พบข้อมูลอำเภอต้นทาง');
         const targetAmphureId = ampRes.rows[0].amphure_id;
 
-        // สร้าง tambon_code ใหม่ และดึง zip_code เดิมของอำเภอนั้นมาใช้ (กัน NOT NULL)
+        // 2. หาเลข tambon_id สูงสุด "เฉพาะในอำเภอนี้" แล้ว +1 (เช่น 670607 -> 670608)
         const maxRes = await client.query(`
-            SELECT COALESCE(MAX(NULLIF(regexp_replace(tambon_code, '\\D', '', 'g'), '')::int), 900000) + 1 AS next_code,
+            SELECT COALESCE(MAX(tambon_id), $1 * 100) + 1 AS next_id,
                    COALESCE((SELECT zip_code FROM sys_tambons WHERE amphure_id = $1 LIMIT 1), '00000') AS zip_code
             FROM sys_tambons
+            WHERE amphure_id = $1
         `, [targetAmphureId]);
-        const newTambonCode = String(maxRes.rows[0].next_code);
+
+        const newTambonId = parseInt(maxRes.rows[0].next_id, 10);
+        const newTambonCode = String(newTambonId);
         const zipCode = maxRes.rows[0].zip_code;
 
-        // 1. เพิ่มตำบลใหม่ (ใส่ครบทั้ง amphure_id, tambon_code, tambon_name_th, zip_code)
-        const insertRes = await client.query(
-            `INSERT INTO sys_tambons (amphure_id, tambon_code, tambon_name_th, zip_code)
-             VALUES ($1, $2, $3, $4) RETURNING tambon_id`,
-            [targetAmphureId, newTambonCode, new_tambon_name.trim(), zipCode]
+        // 3. เพิ่มตำบลใหม่ โดยระบุ tambon_id และ tambon_code ให้เข้ากลุ่มเดียวกัน
+        await client.query(
+            `INSERT INTO sys_tambons (tambon_id, amphure_id, tambon_code, tambon_name_th, zip_code)
+             VALUES ($1, $2, $3, $4, $5)`,
+            [newTambonId, targetAmphureId, newTambonCode, new_tambon_name.trim(), zipCode]
         );
-        const newTambonId = insertRes.rows[0].tambon_id;
 
-        // 2. ย้ายหมู่บ้านที่เลือกมาสังกัดตำบลใหม่
+        // 4. ย้ายหมู่บ้านที่เลือกมาสังกัดตำบลใหม่
         await client.query(
             'UPDATE villages SET tambon_id = $1 WHERE village_id = ANY($2)',
             [newTambonId, village_ids]
         );
 
         await client.query('COMMIT');
-        res.json({ success: true, message: `สร้างตำบล "${new_tambon_name}" และย้าย ${village_ids.length} หมู่บ้านสำเร็จ!` });
+        res.json({ success: true, message: `สร้างตำบล "${new_tambon_name}" (รหัส ${newTambonCode}) และย้าย ${village_ids.length} หมู่บ้านสำเร็จ!` });
     } catch (error) {
         await client.query('ROLLBACK');
         console.error('Restructure Tambon Error:', error);
@@ -2774,6 +2776,8 @@ app.post('/api/area/restructure-tambon', async (req, res) => {
         client.release();
     }
 });
+
+
 // ==========================================
 // โครงสร้างการแยก ย้าย แยกตำบล / ยกฐานะหมู่บ้านเป็นตำบล (สร้างตำบลใหม่ + ย้ายหมู่บ้าน)
 // ==========================================
