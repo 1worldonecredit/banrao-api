@@ -3153,6 +3153,84 @@ app.get('/api/admin/users', verifyAdminToken, async (req, res) => {
 });
 
 
+// ==========================================
+// 1. เพิ่มตำแหน่งใหม่ (sys_positions)
+// ==========================================
+app.post('/api/admin/positions', verifyAdminToken, async (req, res) => {
+    const { position_name, position_level } = req.body;
+    if (!position_name || !position_name.trim()) {
+        return res.status(400).json({ success: false, message: 'กรุณาระบุชื่อตำแหน่ง' });
+    }
+    try {
+        const result = await pgPool.query(
+            `INSERT INTO sys_positions (position_name, position_level)
+             VALUES ($1, $2)
+             RETURNING position_id, position_name, position_level`,
+            [position_name.trim(), (position_level || 'LOCAL').trim()]
+        );
+        res.json({ success: true, message: 'เพิ่มตำแหน่งสำเร็จ', data: result.rows[0] });
+    } catch (err) {
+        console.error('Add Position Error:', err);
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// ==========================================
+// 2. แก้ไขชื่อ / ระดับตำแหน่ง (sys_positions)
+// ==========================================
+app.put('/api/admin/positions/:positionId', verifyAdminToken, async (req, res) => {
+    const { positionId } = req.params;
+    const { position_name, position_level } = req.body;
+    if (!position_name || !position_name.trim()) {
+        return res.status(400).json({ success: false, message: 'กรุณาระบุชื่อตำแหน่ง' });
+    }
+    try {
+        const result = await pgPool.query(
+            `UPDATE sys_positions
+             SET position_name = $1, position_level = $2
+             WHERE position_id = $3
+             RETURNING position_id, position_name, position_level`,
+            [position_name.trim(), (position_level || 'LOCAL').trim(), positionId]
+        );
+        if (result.rows.length === 0) {
+            return res.status(404).json({ success: false, message: 'ไม่พบตำแหน่งนี้ในระบบ' });
+        }
+        res.json({ success: true, message: 'แก้ไขตำแหน่งสำเร็จ', data: result.rows[0] });
+    } catch (err) {
+        console.error('Update Position Error:', err);
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// ==========================================
+// 3. ลบตำแหน่ง (ลบได้เฉพาะตำแหน่งที่ยังไม่มีคนถืออยู่ เพื่อความปลอดภัย)
+// ==========================================
+app.delete('/api/admin/positions/:positionId', verifyAdminToken, async (req, res) => {
+    const { positionId } = req.params;
+    try {
+        // เช็กก่อนว่ามีผู้ใช้งานถือตำแหน่งนี้อยู่หรือไม่
+        const checkUser = await pgPool.query(
+            'SELECT COUNT(*)::int AS cnt FROM user_positions WHERE position_id = $1',
+            [positionId]
+        );
+        if (checkUser.rows[0].cnt > 0) {
+            return res.status(400).json({
+                success: false,
+                message: `ไม่สามารถลบได้ เนื่องจากมีผู้ใช้งานถือตำแหน่งนี้อยู่ ${checkUser.rows[0].cnt} คน`
+            });
+        }
+
+        // ลบสิทธิ์ที่ผูกกับตำแหน่งนี้ก่อน (ถ้ามี) แล้วค่อยลบตำแหน่ง
+        await pgPool.query('DELETE FROM position_permissions WHERE position_id = $1', [positionId]);
+        await pgPool.query('DELETE FROM sys_positions WHERE position_id = $1', [positionId]);
+
+        res.json({ success: true, message: 'ลบตำแหน่งสำเร็จ' });
+    } catch (err) {
+        console.error('Delete Position Error:', err);
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
 app.listen(port, () => {
     console.log(`Server is running on port ${port}`);
 });
