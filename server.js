@@ -3072,7 +3072,33 @@ app.post('/api/admin/login', async (req, res) => {
         res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดที่เซิร์ฟเวอร์: ' + err.message });
     }
 });
+// ==========================================
+// API ภาพรวมระบบ (Admin Dashboard Overview)
+// ==========================================
+app.get('/api/admin/dashboard/overview', verifyAdminToken, async (req, res) => {
+    try {
+        const result = await pgPool.query(`
+            SELECT
+                (SELECT COUNT(*)::int FROM user_accounts) AS total_accounts,
+                (SELECT COUNT(*)::int FROM user_accounts WHERE is_active = true) AS active_accounts,
+                (SELECT COUNT(*)::int FROM households) AS total_households,
+                (SELECT COUNT(*)::int FROM household_members) AS total_members,
+                (SELECT COUNT(*)::int FROM sys_provinces) AS total_provinces,
+                (SELECT COUNT(*)::int FROM sys_amphures) AS total_amphures,
+                (SELECT COUNT(*)::int FROM sys_tambons) AS total_tambons,
+                (SELECT COUNT(*)::int FROM villages) AS total_villages,
+                (SELECT COUNT(DISTINCT tambon_id)::int FROM villages) AS tambons_with_villages
+        `);
 
+        res.json({
+            success: true,
+            data: result.rows[0]
+        });
+    } catch (err) {
+        console.error('Admin Dashboard Overview Error:', err);
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
 
 app.listen(port, () => {
     console.log(`Server is running on port ${port}`);
