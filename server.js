@@ -2621,7 +2621,6 @@ app.get('/api/community-committees/:village_id', async (req, res) => {
 });
 
 
-
 // ==========================================
 // 1. แยกจังหวัด / ยกฐานะอำเภอเป็นจังหวัด (สร้างจังหวัดใหม่ + ย้ายอำเภอ)
 // ==========================================
@@ -2635,20 +2634,27 @@ app.post('/api/area/restructure-province', async (req, res) => {
     try {
         await client.query('BEGIN');
 
-        // สร้างรหัสจังหวัดใหม่ (เอาค่ามากสุด + 1)
-        const maxRes = await client.query('SELECT COALESCE(MAX(province_code::int), 90) + 1 AS next_code FROM sys_provinces');
-        const newProvinceCode = maxRes.rows[0].next_code;
+        // สร้างรหัสจังหวัดใหม่ และดึง country_id เดิม
+        const maxRes = await client.query(`
+            SELECT COALESCE(MAX(NULLIF(regexp_replace(province_code, '\\D', '', 'g'), '')::int), 90) + 1 AS next_code,
+                   (SELECT country_id FROM sys_provinces LIMIT 1) AS country_id
+            FROM sys_provinces
+        `);
+        const newProvinceCode = String(maxRes.rows[0].next_code);
+        const countryId = maxRes.rows[0].country_id;
 
-        // 1. เพิ่มจังหวัดใหม่
-        await client.query(
-            'INSERT INTO sys_provinces (province_code, province_name_th) VALUES ($1, $2)',
-            [newProvinceCode, new_province_name.trim()]
+        // 1. เพิ่มจังหวัดใหม่ (ให้ SERIAL สร้าง province_id อัตโนมัติ)
+        const insertRes = await client.query(
+            `INSERT INTO sys_provinces (country_id, province_code, province_name_th)
+             VALUES ($1, $2, $3) RETURNING province_id`,
+            [countryId, newProvinceCode, new_province_name.trim()]
         );
+        const newProvinceId = insertRes.rows[0].province_id;
 
-        // 2. ย้ายอำเภอที่เลือกมาสังกัดจังหวัดใหม่ (ตำบล/หมู่บ้าน/บ้าน/ประชากร จะตามมาอัตโนมัติ)
+        // 2. ย้ายอำเภอที่เลือกมาสังกัดจังหวัดใหม่ (ใช้ province_id)
         await client.query(
-            'UPDATE sys_amphures SET province_code = $1 WHERE amphure_code = ANY($2)',
-            [newProvinceCode, amphure_codes]
+            'UPDATE sys_amphures SET province_id = $1 WHERE amphure_code = ANY($2)',
+            [newProvinceId, amphure_codes.map(String)]
         );
 
         await client.query('COMMIT');
@@ -2661,6 +2667,7 @@ app.post('/api/area/restructure-province', async (req, res) => {
         client.release();
     }
 });
+
 // ==========================================
 // 2. แยกอำเภอ / ยกฐานะตำบลเป็นอำเภอ (สร้างอำเภอใหม่ + ย้ายตำบล)
 // ==========================================
@@ -2674,19 +2681,32 @@ app.post('/api/area/restructure-amphure', async (req, res) => {
     try {
         await client.query('BEGIN');
 
-        const maxRes = await client.query('SELECT COALESCE(MAX(amphure_code::int), 9000) + 1 AS next_code FROM sys_amphures');
-        const newAmphureCode = maxRes.rows[0].next_code;
-
-        // 1. เพิ่มอำเภอใหม่ (ลงตาราง sys_amphures)
-        await client.query(
-            'INSERT INTO sys_amphures (amphure_code, amphure_name_th, province_code) VALUES ($1, $2, $3)',
-            [newAmphureCode, new_amphure_name.trim(), target_province_code]
+        // หา province_id จาก province_code ที่ส่งมา
+        const provRes = await client.query(
+            'SELECT province_id FROM sys_provinces WHERE province_code = $1 LIMIT 1',
+            [String(target_province_code)]
         );
+        if (provRes.rows.length === 0) throw new Error('ไม่พบข้อมูลจังหวัดต้นทาง');
+        const targetProvinceId = provRes.rows[0].province_id;
+
+        const maxRes = await client.query(`
+            SELECT COALESCE(MAX(NULLIF(regexp_replace(amphure_code, '\\D', '', 'g'), '')::int), 9000) + 1 AS next_code
+            FROM sys_amphures
+        `);
+        const newAmphureCode = String(maxRes.rows[0].next_code);
+
+        // 1. เพิ่มอำเภอใหม่ (ให้ SERIAL สร้าง amphure_id อัตโนมัติ)
+        const insertRes = await client.query(
+            `INSERT INTO sys_amphures (province_id, amphure_code, amphure_name_th)
+             VALUES ($1, $2, $3) RETURNING amphure_id`,
+            [targetProvinceId, newAmphureCode, new_amphure_name.trim()]
+        );
+        const newAmphureId = insertRes.rows[0].amphure_id;
 
         // 2. ย้ายตำบลที่เลือกมาสังกัดอำเภอใหม่ (ใช้ amphure_id)
         await client.query(
             'UPDATE sys_tambons SET amphure_id = $1 WHERE tambon_id = ANY($2)',
-            [newAmphureCode, tambon_ids]
+            [newAmphureId, tambon_ids]
         );
 
         await client.query('COMMIT');
@@ -2713,14 +2733,30 @@ app.post('/api/area/restructure-tambon', async (req, res) => {
     try {
         await client.query('BEGIN');
 
-        const maxRes = await client.query('SELECT COALESCE(MAX(tambon_id::int), 900000) + 1 AS next_id FROM sys_tambons');
-        const newTambonId = maxRes.rows[0].next_id;
-
-       // 1. เพิ่มตำบลใหม่ (ใส่ tambon_code ด้วย)
-        await client.query(
-            'INSERT INTO sys_tambons (tambon_id, tambon_code, tambon_name_th, amphure_id) VALUES ($1, $2, $3, $4)',
-            [newTambonId, String(newTambonId), new_tambon_name.trim(), target_amphure_code]
+        // หา amphure_id จาก amphure_code ที่ส่งมา
+        const ampRes = await client.query(
+            'SELECT amphure_id FROM sys_amphures WHERE amphure_code = $1 LIMIT 1',
+            [String(target_amphure_code)]
         );
+        if (ampRes.rows.length === 0) throw new Error('ไม่พบข้อมูลอำเภอต้นทาง');
+        const targetAmphureId = ampRes.rows[0].amphure_id;
+
+        // สร้าง tambon_code ใหม่ และดึง zip_code เดิมของอำเภอนั้นมาใช้ (กัน NOT NULL)
+        const maxRes = await client.query(`
+            SELECT COALESCE(MAX(NULLIF(regexp_replace(tambon_code, '\\D', '', 'g'), '')::int), 900000) + 1 AS next_code,
+                   COALESCE((SELECT zip_code FROM sys_tambons WHERE amphure_id = $1 LIMIT 1), '00000') AS zip_code
+            FROM sys_tambons
+        `, [targetAmphureId]);
+        const newTambonCode = String(maxRes.rows[0].next_code);
+        const zipCode = maxRes.rows[0].zip_code;
+
+        // 1. เพิ่มตำบลใหม่ (ใส่ครบทั้ง amphure_id, tambon_code, tambon_name_th, zip_code)
+        const insertRes = await client.query(
+            `INSERT INTO sys_tambons (amphure_id, tambon_code, tambon_name_th, zip_code)
+             VALUES ($1, $2, $3, $4) RETURNING tambon_id`,
+            [targetAmphureId, newTambonCode, new_tambon_name.trim(), zipCode]
+        );
+        const newTambonId = insertRes.rows[0].tambon_id;
 
         // 2. ย้ายหมู่บ้านที่เลือกมาสังกัดตำบลใหม่
         await client.query(
@@ -2738,7 +2774,6 @@ app.post('/api/area/restructure-tambon', async (req, res) => {
         client.release();
     }
 });
-
 // ==========================================
 // โครงสร้างการแยก ย้าย แยกตำบล / ยกฐานะหมู่บ้านเป็นตำบล (สร้างตำบลใหม่ + ย้ายหมู่บ้าน)
 // ==========================================
