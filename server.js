@@ -198,7 +198,7 @@ app.get('/api/villages/by-tambon-id/:tambonId', async (req, res) => {
         const { tambonId } = req.params;
         // เรียงลำดับหมู่บ้านตามตัวอักษร
         const result = await pgPool.query(
-            'SELECT village_no, village_name FROM villages WHERE tambon_id = $1 ORDER BY village_no ASC',
+            'SELECT village_id, village_no, village_name FROM villages WHERE tambon_id = $1 ORDER BY village_no ASC',
             [tambonId]
         );
         res.json(result.rows);
