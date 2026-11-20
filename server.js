@@ -614,9 +614,8 @@ async function syncExpiredPositions(dbClient = pgPool) {
         console.error('Sync Expired Positions Error:', err.message);
     }
 }
-
 // ==========================================
-// 🌟 API เข้าสู่ระบบ (Login) - แก้ไขปัญหา Connection Pool ค้าง
+// 🌟 API เข้าสู่ระบบ (Login) - ดึงรูป Profile จริง + ตำแหน่งตาม Position + รอผู้นำคนใหม่ใน Card 2
 // ==========================================
 app.post('/api/login', async (req, res) => {
     console.log('👉 มีคนกด Login! ข้อมูลที่ส่งมาคือ:', req.body);
@@ -627,7 +626,6 @@ app.post('/api/login', async (req, res) => {
         return res.status(400).json({ success: false, message: 'กรุณากรอกเบอร์โทรศัพท์และรหัสผ่าน' });
     }
 
-    // 🌟 ดึง client ออกมาจาก Pool อย่างถูกต้อง
     const client = await pgPool.connect(); 
 
     try {
@@ -639,10 +637,27 @@ app.post('/api/login', async (req, res) => {
                 a.account_id, a.username_phone, a.password_hash, a.occupation_id, a.is_active, a.household_member_count, a.role,
                 p.first_name, p.last_name, p.nickname, p.dob, p.citizen_id, p.gender, p.house_no,
                 o.occupation_name, 
+
+                -- ✨ 1. ดึงรูป Profile จริงของผู้ใช้งาน (Card 1)
+                (
+                    SELECT cpm.image_url
+                    FROM citizen_profiles_media cpm
+                    WHERE cpm.profile_id = a.profile_id AND cpm.is_active = true
+                    LIMIT 1
+                ) AS user_image,
+
+                -- ✨ 2. ดึงรูป Profile จริงของผู้ใหญ่บ้านปัจจุบัน (Card 2)
+                (
+                    SELECT hcpm.image_url
+                    FROM citizen_profiles_media hcpm
+                    WHERE hcpm.profile_id = ha.profile_id AND hcpm.is_active = true
+                    LIMIT 1
+                ) AS headman_image,
                 
                 v.village_id, v.village_no, v.village_name, v.headman_lat, v.headman_lng, 
                 v.headman_account_id,
                 
+                -- ✨ ข้อมูลหมู่บ้าน ครัวเรือน ประชากร (คงไว้ครบไม่ให้หาย)
                 v.household_count AS target_household_count, 
                 v.population_count AS target_population_count,
                 (SELECT COUNT(*) FROM households h WHERE h.village_id = v.village_id) AS actual_household_count,
@@ -723,7 +738,8 @@ app.post('/api/login', async (req, res) => {
         const dayNameTh = (birthDate && !isDummyDate) ? daysTh[birthDate.getDay()] : '-';
         const genderTh = user.gender === 'MALE' ? 'ชาย' : (user.gender === 'FEMALE' ? 'หญิง' : '-');
 
-        let finalPositionName = null;
+        // ✨ 3. กำหนดตำแหน่ง Card 1 ให้ตรงตาม Position จริงเท่านั้น
+        let finalPositionName = 'ประชาชนทั่วไป';
         let finalPositionLevel = null;
         let isSuperAdmin = false; 
 
@@ -732,17 +748,9 @@ app.post('/api/login', async (req, res) => {
             finalPositionLevel = 'SYSTEM';
             isSuperAdmin = true;
         } 
-        else if (user.position_name && user.position_level) {
+        else if (user.position_name) {
             finalPositionName = user.position_name;
-            finalPositionLevel = user.position_level;
-        }
-        else if (user.role === 'HEADMAN' || (user.account_id && user.headman_account_id && user.account_id === user.headman_account_id)) {
-            finalPositionName = 'ผู้ใหญ่บ้าน';
-            finalPositionLevel = 'VILLAGE';
-        }
-        else {
-            finalPositionName = user.occupation_name || 'ประชาชนทั่วไป';
-            finalPositionLevel = null;
+            finalPositionLevel = user.position_level || 'VILLAGE';
         }
 
         const responseData = {
@@ -776,8 +784,9 @@ app.post('/api/login', async (req, res) => {
             actual_household_count: user.actual_household_count || 0,
             actual_population_count: user.actual_population_count || 0,
             
-            userImage: '/profile-img.jpg', 
-            headmanImage: 'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=150&q=80',
+            // ✨ รูป Profile จริงของ Card 1 และ Card 2 (ถ้ายังไม่มีผู้นำจะใช้ /profile-img.jpg รอคนใหม่)
+            userImage: user.user_image || '/profile-img.jpg', 
+            headmanImage: user.headman_account_id ? (user.headman_image || '/profile-img.jpg') : '/profile-img.jpg',
             
             position_name: finalPositionName,
             position_level: finalPositionLevel,
@@ -798,10 +807,11 @@ app.post('/api/login', async (req, res) => {
         console.error('Login API Error:', error);
         res.status(500).json({ success: false, message: 'Internal Server Error', error: error.message });
     } finally {
-        // 🌟 ต้องแน่ใจว่าคืน Connection ให้ Pool เสมอ!
         if (client) client.release();
     }
 });
+
+
 // ==========================================
 // API: ดึงเมนู Sidebar 
 // ==========================================
