@@ -2551,6 +2551,7 @@ app.post('/api/villages/register', async (req, res) => {
         village_id, // 🌟 รับ village_id ที่มีอยู่แล้วจาก Frontend
         latitude, longitude,
         citizen_id, first_name, last_name, nickname, phone_number, password,
+        gender, dob, // ✨ รับค่าเพศ และ วันเดือนปีเกิด (YYYY-MM-DD)
         referrer_account_id
     } = req.body;
 
@@ -2577,21 +2578,26 @@ app.post('/api/villages/register', async (req, res) => {
             }
         }
 
-        // 🌟 2. ไม่ต้องสร้างหมู่บ้านใหม่แล้ว แค่อัปเดตพิกัด (Lat/Lng) ลงในหมู่บ้านเดิมที่เลือกมา
+        // 🌟 2. อัปเดตพิกัด (Lat/Lng) ลงในหมู่บ้านเดิมที่เลือกมา
         await client.query(`
             UPDATE villages 
             SET headman_lat = $1, headman_lng = $2 
             WHERE village_id = $3
         `, [latitude, longitude, village_id]);
 
-        // 3. สร้าง Profile
+        // ✨ 3. สร้าง Profile พร้อมบันทึก gender และ dob จริง
         const finalCitizenId = cleanCitizenId || `999${Math.floor(Math.random() * 10000000000).toString().padStart(10, '0')}`;
+        const finalGender = gender && gender.trim() !== '' ? gender.trim() : null;
+        const finalDob = dob && dob.trim() !== '' ? dob.trim() : '1900-01-01';
+
         const insertProfileQuery = `
-            INSERT INTO user_profiles (profile_id, first_name, last_name, nickname, citizen_id, dob)
-            VALUES (gen_random_uuid(), $1, $2, $3, $4, '1900-01-01')
+            INSERT INTO user_profiles (profile_id, first_name, last_name, nickname, citizen_id, gender, dob)
+            VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6)
             RETURNING profile_id;
         `;
-        const profileResult = await client.query(insertProfileQuery, [first_name, last_name, nickname, finalCitizenId]);
+        const profileResult = await client.query(insertProfileQuery, [
+            first_name, last_name, nickname, finalCitizenId, finalGender, finalDob
+        ]);
         const newProfileId = profileResult.rows[0].profile_id;
         const hashedPassword = await bcrypt.hash(password, 10);
 
