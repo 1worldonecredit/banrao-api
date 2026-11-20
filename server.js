@@ -2200,9 +2200,12 @@ app.post('/api/demote-position', async (req, res) => {
         return res.status(400).json({ success: false, message: 'ข้อมูลไม่ครบถ้วน' });
     }
 
+    const client = await pgPool.connect();
     try {
-        // ปรับสถานะตำแหน่งที่ยัง Active อยู่ให้กลายเป็นอดีต (is_active = false)
-        const result = await pgPool.query(`
+        await client.query('BEGIN');
+
+        // 1. ปรับสถานะตำแหน่งที่ยัง Active อยู่ให้กลายเป็นอดีต (is_active = false)
+        const result = await client.query(`
             UPDATE user_positions
             SET is_active = false,
                 status = 'FORMER',
@@ -2213,8 +2216,17 @@ app.post('/api/demote-position', async (req, res) => {
         `, [reason || 'พ้นจากตำแหน่ง (ปรับระดับเป็นประชาชน)', target_account_id]);
 
         if (result.rows.length === 0) {
+            await client.query('ROLLBACK');
             return res.status(404).json({ success: false, message: 'ไม่พบตำแหน่งที่ยังดำรงอยู่ของบุคคลนี้' });
         }
+
+        // 2. รีเซ็ต role ในตาราง user_accounts กลับเป็นประชาชน (CITIZEN)
+        await client.query(
+            `UPDATE user_accounts SET role = 'CITIZEN' WHERE account_id = $1`,
+            [target_account_id]
+        );
+
+        await client.query('COMMIT');
 
         res.json({
             success: true,
@@ -2222,8 +2234,11 @@ app.post('/api/demote-position', async (req, res) => {
             data: result.rows[0]
         });
     } catch (err) {
+        await client.query('ROLLBACK');
         console.error('Demote Position Error:', err);
         res.status(500).json({ success: false, message: err.message });
+    } finally {
+        client.release();
     }
 });
 
