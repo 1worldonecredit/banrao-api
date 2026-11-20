@@ -1940,8 +1940,9 @@ app.get('/api/villages-list', async (req, res) => {
         res.status(500).json({ success: false, message: 'ไม่สามารถดึงข้อมูลหมู่บ้านได้' });
     }
 });
+
 // ==========================================
-// API ค้นหาข้อมูลประชาชนแบบละเอียด (ดึงเพศ + ที่อยู่เต็ม + ตำแหน่งเดิม)
+// API ค้นหาข้อมูลประชาชนแบบละเอียด (ดึงรูป Profile + ต.อ.จ. + วันเริ่ม/หมดวาระเดิม)
 // ==========================================
 app.get('/api/search-citizen-full/:citizenId', async (req, res) => {
     const { citizenId } = req.params;
@@ -1960,25 +1961,33 @@ app.get('/api/search-citizen-full/:citizenId', async (req, res) => {
                 up.gender,
                 up.dob,
                 up.house_no,
+                -- ✨ จุดที่ 1: ดึงรูป Profile (ถ้าคอลัมน์ใน DB ชื่ออื่น เช่น avatar_url หรือ user_image ให้แก้ชื่อตรงนี้)
+                up.profile_image AS user_image,
+                -- ✨ จุดที่ 2: ดึงหมู่บ้าน + ตำบล + อำเภอ + จังหวัด
                 v.village_no,
                 v.village_name,
                 t.tambon_name_th AS tambon_name,
                 t.zip_code,
                 a.amphure_name_th AS amphure_name,
                 p.province_name_th AS province_name,
-                COALESCE(
-                    (SELECT string_agg(sp.position_name, ', ')
-                     FROM user_positions upos
-                     JOIN sys_positions sp ON upos.position_id = sp.position_id
-                     WHERE upos.account_id = ua.account_id),
-                    'ประชาชนทั่วไป'
-                ) AS prev_position
+                -- ✨ จุดที่ 3: ดึงตำแหน่งเดิม + วันเริ่มดำรงตำแหน่ง + วันหมดวาระ (ล่าสุด)
+                COALESCE(latest_pos.position_name, 'ประชาชนทั่วไป') AS prev_position,
+                latest_pos.start_date AS current_start_date,
+                latest_pos.end_date AS current_end_date
             FROM user_profiles up
             JOIN user_accounts ua ON up.profile_id = ua.profile_id
             LEFT JOIN villages v ON ua.village_id = v.village_id
             LEFT JOIN sys_tambons t ON v.tambon_id = t.tambon_id
             LEFT JOIN sys_amphures a ON t.amphure_id = a.amphure_id
             LEFT JOIN sys_provinces p ON a.province_id = p.province_id
+            LEFT JOIN LATERAL (
+                SELECT sp.position_name, upos.start_date, upos.end_date
+                FROM user_positions upos
+                JOIN sys_positions sp ON upos.position_id = sp.position_id
+                WHERE upos.account_id = ua.account_id
+                ORDER BY upos.start_date DESC NULLS LAST
+                LIMIT 1
+            ) latest_pos ON true
             WHERE up.citizen_id = $1
             LIMIT 1
         `, [citizenId.trim()]);
@@ -1988,26 +1997,31 @@ app.get('/api/search-citizen-full/:citizenId', async (req, res) => {
         }
 
         const row = result.rows[0];
+        const thMonths = ['มกราคม','กุมภาพันธ์','มีนาคม','เมษายน','พฤษภาคม','มิถุนายน','กรกฎาคม','สิงหาคม','กันยายน','ตุลาคม','พฤศจิกายน','ธันวาคม'];
 
-        // 1. แปลงเพศเป็นภาษาไทย
+        // ฟังก์ชันช่วยแปลงวันที่เป็นภาษาไทย (เช่น 20 พฤศจิกายน 2569)
+        const toThaiDate = (dateVal) => {
+            if (!dateVal) return 'ไม่ระบุ';
+            const d = new Date(dateVal);
+            if (isNaN(d.getTime())) return 'ไม่ระบุ';
+            return `${d.getDate()} ${thMonths[d.getMonth()]} ${d.getFullYear() + 543}`;
+        };
+
+        // แปลงเพศ
         const genderMap = { MALE: 'ชาย', FEMALE: 'หญิง', OTHER: 'อื่นๆ' };
         const genderText = genderMap[(row.gender || '').toUpperCase()] || row.gender || 'ไม่ระบุ';
 
-        // 2. คำนวณอายุ และแปลงวันเกิดเป็นภาษาไทย
+        // คำนวณอายุ
         let age = '-';
-        let birthDateThai = 'ไม่ระบุ';
         if (row.dob) {
             const dobDate = new Date(row.dob);
             const today = new Date();
             age = today.getFullYear() - dobDate.getFullYear();
             const m = today.getMonth() - dobDate.getMonth();
             if (m < 0 || (m === 0 && today.getDate() < dobDate.getDate())) age--;
-
-            const thMonths = ['มกราคม','กุมภาพันธ์','มีนาคม','เมษายน','พฤษภาคม','มิถุนายน','กรกฎาคม','สิงหาคม','กันยายน','ตุลาคม','พฤศจิกายน','ธันวาคม'];
-            birthDateThai = `${dobDate.getDate()} ${thMonths[dobDate.getMonth()]} ${dobDate.getFullYear() + 543}`;
         }
 
-        // 3. ประกอบที่อยู่เต็ม (บ้านเลขที่ หมู่ บ้าน ต. อ. จ. รหัสไปรษณีย์)
+        // ประกอบที่อยู่เต็ม
         const addressParts = [
             row.house_no ? `บ้านเลขที่ ${row.house_no}` : null,
             row.village_no ? `หมู่ ${row.village_no}` : null,
@@ -2018,16 +2032,17 @@ app.get('/api/search-citizen-full/:citizenId', async (req, res) => {
             row.zip_code ? `${row.zip_code}` : null
         ].filter(Boolean);
 
-        const fullAddress = addressParts.length > 0 ? addressParts.join(' ') : 'ยังไม่ระบุที่อยู่';
-
         res.json({
             success: true,
             data: {
                 ...row,
                 gender: genderText,
                 age,
-                birth_date: birthDateThai,
-                address: fullAddress
+                birth_date: toThaiDate(row.dob),
+                address: addressParts.length > 0 ? addressParts.join(' ') : 'ยังไม่ระบุที่อยู่',
+                // ส่งวันที่เริ่ม-หมดวาระ แบบภาษาไทยไปแสดงหน้าเว็บได้เลย
+                current_start_date_thai: toThaiDate(row.current_start_date),
+                current_end_date_thai: toThaiDate(row.current_end_date)
             }
         });
     } catch (err) {
