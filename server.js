@@ -4039,6 +4039,168 @@ app.delete('/api/admin/frontend-menus/:id', async (req, res) => {
 //---------------------------------------------------------
 //สิ้นสุดใช้ชั่วคราว 
 //---------------------------------------------------------
+//---------------------------------------------------------
+//เริ่มต้น API  ปรับโครงสร้างระบบใหม่ให้มีแผนก 
+//---------------------------------------------------------
+// =========================================================================
+// 🏢 เฟส 2: API จัดการโครงสร้างองค์กร 4 มิติ (Apps -> Orgs -> Depts -> Positions)
+// =========================================================================
+
+// 1. ดึงข้อมูลภาพรวมทั้งหมดในครั้งเดียว
+app.get('/api/admin/org-structure/overview', async (req, res) => {
+    try {
+        const [appsRes, orgsRes, deptsRes, posRes] = await Promise.all([
+            pgPool.query(`SELECT * FROM sys_apps ORDER BY created_at ASC`),
+            pgPool.query(`SELECT * FROM sys_organizations ORDER BY org_id ASC`),
+            pgPool.query(`
+                SELECT d.*, o.org_name
+                FROM sys_departments d
+                LEFT JOIN sys_organizations o ON d.org_id = o.org_id
+                ORDER BY d.org_id ASC NULLS LAST, d.department_id ASC
+            `),
+            pgPool.query(`
+                SELECT p.*, o.org_name, d.department_name
+                FROM sys_positions p
+                LEFT JOIN sys_organizations o ON p.org_id = o.org_id
+                LEFT JOIN sys_departments d ON p.dept_id = d.department_id
+                ORDER BY p.org_id ASC NULLS LAST, p.dept_id ASC NULLS LAST, p.position_id ASC
+            `)
+        ]);
+
+        res.json({
+            success: true,
+            apps: appsRes.rows,
+            organizations: orgsRes.rows,
+            departments: deptsRes.rows,
+            positions: posRes.rows
+        });
+    } catch (err) {
+        console.error('Org Structure Overview Error:', err);
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// --- 2. จัดการแอปพลิเคชัน (sys_apps) ---
+app.post('/api/admin/org-structure/apps', async (req, res) => {
+    const { app_code, app_name, description } = req.body;
+    if (!app_code || !app_name) return res.status(400).json({ success: false, message: 'กรุณาระบุรหัสแอปและชื่อแอป' });
+    try {
+        const cleanCode = app_code.trim().toUpperCase().replace(/\s+/g, '_');
+        const result = await pgPool.query(
+            `INSERT INTO sys_apps (app_code, app_name, description, is_active) VALUES ($1, $2, $3, true) RETURNING *`,
+            [cleanCode, app_name.trim(), description || null]
+        );
+        res.json({ success: true, data: result.rows[0] });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+app.put('/api/admin/org-structure/apps/:code', async (req, res) => {
+    const { app_name, description, is_active } = req.body;
+    try {
+        const result = await pgPool.query(
+            `UPDATE sys_apps SET app_name = $1, description = $2, is_active = $3 WHERE app_code = $4 RETURNING *`,
+            [app_name.trim(), description || null, is_active !== false, req.params.code]
+        );
+        res.json({ success: true, data: result.rows[0] });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// --- 3. จัดการหน่วยงานหลัก (sys_organizations) ---
+app.post('/api/admin/org-structure/orgs', async (req, res) => {
+    const { org_name, org_type } = req.body;
+    if (!org_name) return res.status(400).json({ success: false, message: 'กรุณาระบุชื่อหน่วยงาน' });
+    try {
+        const result = await pgPool.query(
+            `INSERT INTO sys_organizations (org_name, org_type, is_active) VALUES ($1, $2, true) RETURNING *`,
+            [org_name.trim(), org_type || 'GOVERNMENT']
+        );
+        res.json({ success: true, data: result.rows[0] });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+app.put('/api/admin/org-structure/orgs/:id', async (req, res) => {
+    const { org_name, org_type, is_active } = req.body;
+    try {
+        const result = await pgPool.query(
+            `UPDATE sys_organizations SET org_name = $1, org_type = $2, is_active = $3 WHERE org_id = $4 RETURNING *`,
+            [org_name.trim(), org_type || 'GOVERNMENT', is_active !== false, req.params.id]
+        );
+        res.json({ success: true, data: result.rows[0] });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// --- 4. จัดการแผนก (sys_departments) ---
+app.post('/api/admin/org-structure/depts', async (req, res) => {
+    const { org_id, department_name, department_type } = req.body;
+    if (!department_name) return res.status(400).json({ success: false, message: 'กรุณาระบุชื่อแผนก' });
+    try {
+        const result = await pgPool.query(
+            `INSERT INTO sys_departments (org_id, department_name, department_type, is_active)
+             VALUES ($1, $2, $3, true) RETURNING *`,
+            [org_id ? Number(org_id) : null, department_name.trim(), department_type || 'GENERAL']
+        );
+        res.json({ success: true, data: result.rows[0] });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+app.put('/api/admin/org-structure/depts/:id', async (req, res) => {
+    const { org_id, department_name, department_type, is_active } = req.body;
+    try {
+        const result = await pgPool.query(
+            `UPDATE sys_departments
+             SET org_id = $1, department_name = $2, department_type = $3, is_active = $4
+             WHERE department_id = $5 RETURNING *`,
+            [org_id ? Number(org_id) : null, department_name.trim(), department_type || 'GENERAL', is_active !== false, req.params.id]
+        );
+        res.json({ success: true, data: result.rows[0] });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// --- 5. จัดการตำแหน่ง (sys_positions) ---
+app.post('/api/admin/org-structure/positions', async (req, res) => {
+    const { org_id, dept_id, position_name, position_level } = req.body;
+    if (!position_name) return res.status(400).json({ success: false, message: 'กรุณาระบุชื่อตำแหน่ง' });
+    try {
+        const result = await pgPool.query(
+            `INSERT INTO sys_positions (org_id, dept_id, position_name, position_level, is_active)
+             VALUES ($1, $2, $3, $4, true) RETURNING *`,
+            [org_id ? Number(org_id) : null, dept_id ? Number(dept_id) : null, position_name.trim(), position_level || 'VILLAGE']
+        );
+        res.json({ success: true, data: result.rows[0] });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+app.put('/api/admin/org-structure/positions/:id', async (req, res) => {
+    const { org_id, dept_id, position_name, position_level, is_active } = req.body;
+    try {
+        const result = await pgPool.query(
+            `UPDATE sys_positions
+             SET org_id = $1, dept_id = $2, position_name = $3, position_level = $4, is_active = $5
+             WHERE position_id = $6 RETURNING *`,
+            [org_id ? Number(org_id) : null, dept_id ? Number(dept_id) : null, position_name.trim(), position_level || 'VILLAGE', is_active !== false, req.params.id]
+        );
+        res.json({ success: true, data: result.rows[0] });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+//   สิ้นสุด
+//--------------------------------------------------------
 app.listen(port, () => {
     console.log(`Server is running on port ${port}`);
 });
