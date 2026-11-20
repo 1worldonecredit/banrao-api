@@ -589,6 +589,35 @@ app.delete('/api/menus/:id', async (req, res) => {
 // ==========================================
 // 🌟 API เข้าสู่ระบบ (Login) - แก้ไขปัญหา Connection Pool ค้าง
 // ==========================================
+// ==========================================
+// ฟังก์ชันปรับหมดวาระอัตโนมัติ (ล้างทั้ง user_positions, user_accounts.role และ villages.headman_account_id)
+// ==========================================
+async function syncExpiredPositions(dbClient = pgPool) {
+    try {
+        const expired = await dbClient.query(`
+            UPDATE user_positions
+            SET is_active = false,
+                status = 'EXPIRED',
+                end_reason = 'หมดวาระอัตโนมัติตามกำหนด'
+            WHERE is_active = true
+              AND end_date IS NOT NULL
+              AND end_date < CURRENT_DATE
+            RETURNING account_id
+        `);
+
+        // ถ้ามีคนหมดวาระ ให้ล้าง role และ headman_account_id ออกด้วย
+        for (const row of expired.rows) {
+            await dbClient.query(`UPDATE user_accounts SET role = 'CITIZEN' WHERE account_id = $1`, [row.account_id]);
+            await dbClient.query(`UPDATE villages SET headman_account_id = NULL WHERE headman_account_id = $1`, [row.account_id]);
+        }
+    } catch (err) {
+        console.error('Sync Expired Positions Error:', err.message);
+    }
+}
+
+// ==========================================
+// 🌟 API เข้าสู่ระบบ (Login) - แก้ไขปัญหา Connection Pool ค้าง
+// ==========================================
 app.post('/api/login', async (req, res) => {
     console.log('👉 มีคนกด Login! ข้อมูลที่ส่งมาคือ:', req.body);
     const usernameInput = req.body.username || req.body.phone_number;
@@ -600,7 +629,11 @@ app.post('/api/login', async (req, res) => {
 
     // 🌟 ดึง client ออกมาจาก Pool อย่างถูกต้อง
     const client = await pgPool.connect(); 
+
     try {
+        // ✨ เคลียร์ตำแหน่งที่หมดวาระอัตโนมัติก่อนดึงข้อมูล Login
+        await syncExpiredPositions(client);
+
         const userQuery = await client.query(
             `SELECT 
                 a.account_id, a.username_phone, a.password_hash, a.occupation_id, a.is_active, a.household_member_count, a.role,
@@ -2085,7 +2118,6 @@ async function syncExpiredPositions(dbClient = pgPool) {
         console.error('Sync Expired Positions Error:', err.message);
     }
 }
-
 // ==========================================
 // 2. API ปรับพ้นจากตำแหน่งด้วยมือ (เปลี่ยนจาก ผู้ใหญ่บ้าน -> อดีตผู้ใหญ่บ้าน ระดับประชาชน)
 // ==========================================
@@ -2095,9 +2127,12 @@ app.post('/api/demote-position', async (req, res) => {
         return res.status(400).json({ success: false, message: 'ข้อมูลไม่ครบถ้วน' });
     }
 
+    const client = await pgPool.connect();
     try {
-        // ปรับสถานะตำแหน่งที่ยัง Active อยู่ให้กลายเป็นอดีต (is_active = false)
-        const result = await pgPool.query(`
+        await client.query('BEGIN');
+
+        // 1. ปรับสถานะตำแหน่งที่ยัง Active อยู่ให้กลายเป็นอดีต (is_active = false)
+        const result = await client.query(`
             UPDATE user_positions
             SET is_active = false,
                 status = 'FORMER',
@@ -2108,8 +2143,23 @@ app.post('/api/demote-position', async (req, res) => {
         `, [reason || 'พ้นจากตำแหน่ง (ปรับระดับเป็นประชาชน)', target_account_id]);
 
         if (result.rows.length === 0) {
+            await client.query('ROLLBACK');
             return res.status(404).json({ success: false, message: 'ไม่พบตำแหน่งที่ยังดำรงอยู่ของบุคคลนี้' });
         }
+
+        // 2. รีเซ็ต role ในตาราง user_accounts กลับเป็นประชาชน (CITIZEN)
+        await client.query(
+            `UPDATE user_accounts SET role = 'CITIZEN' WHERE account_id = $1`,
+            [target_account_id]
+        );
+
+        // 3. ล้างชื่อผู้ใหญ่บ้านคนเก่าออกจากตาราง villages เพื่อให้ตำแหน่งว่างรอคนใหม่
+        await client.query(
+            `UPDATE villages SET headman_account_id = NULL WHERE headman_account_id = $1`,
+            [target_account_id]
+        );
+
+        await client.query('COMMIT');
 
         res.json({
             success: true,
@@ -2117,8 +2167,11 @@ app.post('/api/demote-position', async (req, res) => {
             data: result.rows[0]
         });
     } catch (err) {
+        await client.query('ROLLBACK');
         console.error('Demote Position Error:', err);
         res.status(500).json({ success: false, message: err.message });
+    } finally {
+        client.release();
     }
 });
 
