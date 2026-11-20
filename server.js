@@ -1961,16 +1961,21 @@ app.get('/api/search-citizen-full/:citizenId', async (req, res) => {
                 up.gender,
                 up.dob,
                 up.house_no,
-                -- ✨ จุดที่ 1: ดึงรูป Profile (ถ้าคอลัมน์ใน DB ชื่ออื่น เช่น avatar_url หรือ user_image ให้แก้ชื่อตรงนี้)
-                up.profile_image AS user_image,
-                -- ✨ จุดที่ 2: ดึงหมู่บ้าน + ตำบล + อำเภอ + จังหวัด
+                -- ✨ ดึงรูป Profile ล่าสุดที่เปิดใช้งานจากตาราง citizen_profiles_media
+                (
+                    SELECT cpm.image_url
+                    FROM citizen_profiles_media cpm
+                    WHERE cpm.profile_id = up.profile_id AND cpm.is_active = true
+                    LIMIT 1
+                ) AS user_image,
+                -- ✨ ดึงหมู่บ้าน + ตำบล + อำเภอ + จังหวัด
                 v.village_no,
                 v.village_name,
                 t.tambon_name_th AS tambon_name,
                 t.zip_code,
                 a.amphure_name_th AS amphure_name,
                 p.province_name_th AS province_name,
-                -- ✨ จุดที่ 3: ดึงตำแหน่งเดิม + วันเริ่มดำรงตำแหน่ง + วันหมดวาระ (ล่าสุด)
+                -- ✨ ดึงตำแหน่งเดิม + วันเริ่มดำรงตำแหน่ง + วันหมดวาระ (ล่าสุด)
                 COALESCE(latest_pos.position_name, 'ประชาชนทั่วไป') AS prev_position,
                 latest_pos.start_date AS current_start_date,
                 latest_pos.end_date AS current_end_date
@@ -1999,7 +2004,7 @@ app.get('/api/search-citizen-full/:citizenId', async (req, res) => {
         const row = result.rows[0];
         const thMonths = ['มกราคม','กุมภาพันธ์','มีนาคม','เมษายน','พฤษภาคม','มิถุนายน','กรกฎาคม','สิงหาคม','กันยายน','ตุลาคม','พฤศจิกายน','ธันวาคม'];
 
-        // ฟังก์ชันช่วยแปลงวันที่เป็นภาษาไทย (เช่น 20 พฤศจิกายน 2569)
+        // แปลงวันที่เป็นภาษาไทย
         const toThaiDate = (dateVal) => {
             if (!dateVal) return 'ไม่ระบุ';
             const d = new Date(dateVal);
@@ -2040,7 +2045,6 @@ app.get('/api/search-citizen-full/:citizenId', async (req, res) => {
                 age,
                 birth_date: toThaiDate(row.dob),
                 address: addressParts.length > 0 ? addressParts.join(' ') : 'ยังไม่ระบุที่อยู่',
-                // ส่งวันที่เริ่ม-หมดวาระ แบบภาษาไทยไปแสดงหน้าเว็บได้เลย
                 current_start_date_thai: toThaiDate(row.current_start_date),
                 current_end_date_thai: toThaiDate(row.current_end_date)
             }
@@ -2050,7 +2054,6 @@ app.get('/api/search-citizen-full/:citizenId', async (req, res) => {
         res.status(500).json({ success: false, message: err.message });
     }
 });
-
 // ==========================================
 // API: เพิ่มข้อมูลบ้าน
 // ==========================================
