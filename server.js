@@ -2065,6 +2065,221 @@ app.get('/api/search-citizen-full/:citizenId', async (req, res) => {
         res.status(500).json({ success: false, message: err.message });
     }
 });
+
+
+// ==========================================
+// 1. ฟังก์ชันปรับหมดวาระอัตโนมัติ (ทำงานทุกครั้งที่มีการค้นหา / แต่งตั้ง / Login)
+// ==========================================
+async function syncExpiredPositions(dbClient = pgPool) {
+    try {
+        await dbClient.query(`
+            UPDATE user_positions
+            SET is_active = false,
+                status = 'EXPIRED',
+                end_reason = 'หมดวาระอัตโนมัติตามกำหนด'
+            WHERE is_active = true
+              AND end_date IS NOT NULL
+              AND end_date < CURRENT_DATE
+        `);
+    } catch (err) {
+        console.error('Sync Expired Positions Error:', err.message);
+    }
+}
+
+// ==========================================
+// 2. API ปรับพ้นจากตำแหน่งด้วยมือ (เปลี่ยนจาก ผู้ใหญ่บ้าน -> อดีตผู้ใหญ่บ้าน ระดับประชาชน)
+// ==========================================
+app.post('/api/demote-position', async (req, res) => {
+    const { target_account_id, approval_pin, reason } = req.body;
+    if (!target_account_id || !approval_pin) {
+        return res.status(400).json({ success: false, message: 'ข้อมูลไม่ครบถ้วน' });
+    }
+
+    try {
+        // ปรับสถานะตำแหน่งที่ยัง Active อยู่ให้กลายเป็นอดีต (is_active = false)
+        const result = await pgPool.query(`
+            UPDATE user_positions
+            SET is_active = false,
+                status = 'FORMER',
+                end_date = CURRENT_DATE,
+                end_reason = $1
+            WHERE account_id = $2 AND is_active = true
+            RETURNING *
+        `, [reason || 'พ้นจากตำแหน่ง (ปรับระดับเป็นประชาชน)', target_account_id]);
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({ success: false, message: 'ไม่พบตำแหน่งที่ยังดำรงอยู่ของบุคคลนี้' });
+        }
+
+        res.json({
+            success: true,
+            message: 'ปรับสถานะเป็น "อดีตผู้ใหญ่บ้าน (ระดับประชาชน)" เรียบร้อยแล้ว สามารถแต่งตั้งคนใหม่แทนได้ทันที',
+            data: result.rows[0]
+        });
+    } catch (err) {
+        console.error('Demote Position Error:', err);
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// ==========================================
+// 3. อัปเดต API แต่งตั้งตำแหน่ง (/api/assign-role)
+//    - ปลดคนเก่าของหมู่บ้านเดียวกันเป็น "อดีตผู้ใหญ่บ้าน" อัตโนมัติ
+//    - แต่งตั้งคนใหม่เป็น "ผู้ใหญ่บ้าน" (is_active = true) เพื่อให้ Login ทำงานต่อได้ทันที
+// ==========================================
+app.post('/api/assign-role', async (req, res) => {
+    const { target_account_id, position_id, scope_type, scope_id, start_date, end_date, approval_pin } = req.body;
+    if (!target_account_id || !position_id || !scope_id) {
+        return res.status(400).json({ success: false, message: 'ข้อมูลไม่ครบถ้วน' });
+    }
+
+    const client = await pgPool.connect();
+    try {
+        await client.query('BEGIN');
+
+        // 3.1 เคลียร์ตำแหน่งที่หมดวาระอัตโนมัติก่อน
+        await syncExpiredPositions(client);
+
+        // 3.2 ถ้าหมู่บ้านนี้ (scope_id) มีผู้ใหญ่บ้านคนเก่าที่ยัง Active อยู่ -> ปรับเป็น "อดีตผู้ใหญ่บ้าน" อัตโนมัติ
+        await client.query(`
+            UPDATE user_positions
+            SET is_active = false,
+                status = 'FORMER',
+                end_date = CURRENT_DATE,
+                end_reason = 'พ้นจากตำแหน่งเนื่องจากมีการแต่งตั้งคนใหม่แทน'
+            WHERE position_id = $1
+              AND scope_id = $2
+              AND is_active = true
+        `, [position_id, scope_id]);
+
+        // 3.3 บันทึกคนใหม่เป็นผู้ใหญ่บ้านปัจจุบัน (is_active = true)
+        const insertRes = await client.query(`
+            INSERT INTO user_positions (account_id, position_id, scope_type, scope_id, start_date, end_date, is_active, status)
+            VALUES ($1, $2, $3, $4, $5, $6, true, 'ACTIVE')
+            RETURNING *
+        `, [target_account_id, position_id, scope_type || 'VILLAGE', scope_id, start_date, end_date]);
+
+        await client.query('COMMIT');
+        res.json({
+            success: true,
+            message: 'แต่งตั้งผู้ใหญ่บ้านคนใหม่สำเร็จ (คนเก่าถูกปรับเป็นอดีตผู้ใหญ่บ้านอัตโนมัติ)',
+            data: insertRes.rows[0]
+        });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error('Assign Role Error:', err);
+        res.status(500).json({ success: false, message: err.message });
+    } finally {
+        client.release();
+    }
+});// ==========================================
+// 1. ฟังก์ชันปรับหมดวาระอัตโนมัติ (ทำงานทุกครั้งที่มีการค้นหา / แต่งตั้ง / Login)
+// ==========================================
+async function syncExpiredPositions(dbClient = pgPool) {
+    try {
+        await dbClient.query(`
+            UPDATE user_positions
+            SET is_active = false,
+                status = 'EXPIRED',
+                end_reason = 'หมดวาระอัตโนมัติตามกำหนด'
+            WHERE is_active = true
+              AND end_date IS NOT NULL
+              AND end_date < CURRENT_DATE
+        `);
+    } catch (err) {
+        console.error('Sync Expired Positions Error:', err.message);
+    }
+}
+
+// ==========================================
+// 2. API ปรับพ้นจากตำแหน่งด้วยมือ (เปลี่ยนจาก ผู้ใหญ่บ้าน -> อดีตผู้ใหญ่บ้าน ระดับประชาชน)
+// ==========================================
+app.post('/api/demote-position', async (req, res) => {
+    const { target_account_id, approval_pin, reason } = req.body;
+    if (!target_account_id || !approval_pin) {
+        return res.status(400).json({ success: false, message: 'ข้อมูลไม่ครบถ้วน' });
+    }
+
+    try {
+        // ปรับสถานะตำแหน่งที่ยัง Active อยู่ให้กลายเป็นอดีต (is_active = false)
+        const result = await pgPool.query(`
+            UPDATE user_positions
+            SET is_active = false,
+                status = 'FORMER',
+                end_date = CURRENT_DATE,
+                end_reason = $1
+            WHERE account_id = $2 AND is_active = true
+            RETURNING *
+        `, [reason || 'พ้นจากตำแหน่ง (ปรับระดับเป็นประชาชน)', target_account_id]);
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({ success: false, message: 'ไม่พบตำแหน่งที่ยังดำรงอยู่ของบุคคลนี้' });
+        }
+
+        res.json({
+            success: true,
+            message: 'ปรับสถานะเป็น "อดีตผู้ใหญ่บ้าน (ระดับประชาชน)" เรียบร้อยแล้ว สามารถแต่งตั้งคนใหม่แทนได้ทันที',
+            data: result.rows[0]
+        });
+    } catch (err) {
+        console.error('Demote Position Error:', err);
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// ==========================================
+// 3. อัปเดต API แต่งตั้งตำแหน่ง (/api/assign-role)
+//    - ปลดคนเก่าของหมู่บ้านเดียวกันเป็น "อดีตผู้ใหญ่บ้าน" อัตโนมัติ
+//    - แต่งตั้งคนใหม่เป็น "ผู้ใหญ่บ้าน" (is_active = true) เพื่อให้ Login ทำงานต่อได้ทันที
+// ==========================================
+app.post('/api/assign-role', async (req, res) => {
+    const { target_account_id, position_id, scope_type, scope_id, start_date, end_date, approval_pin } = req.body;
+    if (!target_account_id || !position_id || !scope_id) {
+        return res.status(400).json({ success: false, message: 'ข้อมูลไม่ครบถ้วน' });
+    }
+
+    const client = await pgPool.connect();
+    try {
+        await client.query('BEGIN');
+
+        // 3.1 เคลียร์ตำแหน่งที่หมดวาระอัตโนมัติก่อน
+        await syncExpiredPositions(client);
+
+        // 3.2 ถ้าหมู่บ้านนี้ (scope_id) มีผู้ใหญ่บ้านคนเก่าที่ยัง Active อยู่ -> ปรับเป็น "อดีตผู้ใหญ่บ้าน" อัตโนมัติ
+        await client.query(`
+            UPDATE user_positions
+            SET is_active = false,
+                status = 'FORMER',
+                end_date = CURRENT_DATE,
+                end_reason = 'พ้นจากตำแหน่งเนื่องจากมีการแต่งตั้งคนใหม่แทน'
+            WHERE position_id = $1
+              AND scope_id = $2
+              AND is_active = true
+        `, [position_id, scope_id]);
+
+        // 3.3 บันทึกคนใหม่เป็นผู้ใหญ่บ้านปัจจุบัน (is_active = true)
+        const insertRes = await client.query(`
+            INSERT INTO user_positions (account_id, position_id, scope_type, scope_id, start_date, end_date, is_active, status)
+            VALUES ($1, $2, $3, $4, $5, $6, true, 'ACTIVE')
+            RETURNING *
+        `, [target_account_id, position_id, scope_type || 'VILLAGE', scope_id, start_date, end_date]);
+
+        await client.query('COMMIT');
+        res.json({
+            success: true,
+            message: 'แต่งตั้งผู้ใหญ่บ้านคนใหม่สำเร็จ (คนเก่าถูกปรับเป็นอดีตผู้ใหญ่บ้านอัตโนมัติ)',
+            data: insertRes.rows[0]
+        });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error('Assign Role Error:', err);
+        res.status(500).json({ success: false, message: err.message });
+    } finally {
+        client.release();
+    }
+});
+
+
 // ==========================================
 // API: เพิ่มข้อมูลบ้าน
 // ==========================================
