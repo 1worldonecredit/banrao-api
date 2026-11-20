@@ -1940,7 +1940,6 @@ app.get('/api/villages-list', async (req, res) => {
         res.status(500).json({ success: false, message: 'ไม่สามารถดึงข้อมูลหมู่บ้านได้' });
     }
 });
-
 // ==========================================
 // API ค้นหาข้อมูลประชาชนแบบละเอียด (ดึงเพศ + ที่อยู่เต็ม + ตำแหน่งเดิม)
 // ==========================================
@@ -1963,9 +1962,10 @@ app.get('/api/search-citizen-full/:citizenId', async (req, res) => {
                 up.house_no,
                 v.village_no,
                 v.village_name,
-                t.name_th AS tambon_name,
-                a.name_th AS amphure_name,
-                p.name_th AS province_name,
+                t.tambon_name_th AS tambon_name,
+                t.zip_code,
+                a.amphure_name_th AS amphure_name,
+                p.province_name_th AS province_name,
                 COALESCE(
                     (SELECT string_agg(sp.position_name, ', ')
                      FROM user_positions upos
@@ -1976,9 +1976,9 @@ app.get('/api/search-citizen-full/:citizenId', async (req, res) => {
             FROM user_profiles up
             JOIN user_accounts ua ON up.profile_id = ua.profile_id
             LEFT JOIN villages v ON ua.village_id = v.village_id
-            LEFT JOIN sys_tambons t ON v.tambon_id = t.id
-            LEFT JOIN sys_amphures a ON t.amphure_id = a.id
-            LEFT JOIN sys_provinces p ON a.province_id = p.id
+            LEFT JOIN sys_tambons t ON v.tambon_id = t.tambon_id
+            LEFT JOIN sys_amphures a ON t.amphure_id = a.amphure_id
+            LEFT JOIN sys_provinces p ON a.province_id = p.province_id
             WHERE up.citizen_id = $1
             LIMIT 1
         `, [citizenId.trim()]);
@@ -2007,14 +2007,15 @@ app.get('/api/search-citizen-full/:citizenId', async (req, res) => {
             birthDateThai = `${dobDate.getDate()} ${thMonths[dobDate.getMonth()]} ${dobDate.getFullYear() + 543}`;
         }
 
-        // 3. ประกอบที่อยู่เต็ม (บ้านเลขที่ หมู่ บ้าน ต. อ. จ.)
+        // 3. ประกอบที่อยู่เต็ม (บ้านเลขที่ หมู่ บ้าน ต. อ. จ. รหัสไปรษณีย์)
         const addressParts = [
             row.house_no ? `บ้านเลขที่ ${row.house_no}` : null,
             row.village_no ? `หมู่ ${row.village_no}` : null,
             row.village_name ? `${row.village_name}` : null,
             row.tambon_name ? `ต.${row.tambon_name}` : null,
             row.amphure_name ? `อ.${row.amphure_name}` : null,
-            row.province_name ? `จ.${row.province_name}` : null
+            row.province_name ? `จ.${row.province_name}` : null,
+            row.zip_code ? `${row.zip_code}` : null
         ].filter(Boolean);
 
         const fullAddress = addressParts.length > 0 ? addressParts.join(' ') : 'ยังไม่ระบุที่อยู่';
