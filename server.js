@@ -1982,9 +1982,20 @@ app.get('/api/search-citizen-full/:citizenId', async (req, res) => {
             FROM user_profiles up
             JOIN user_accounts ua ON up.profile_id = ua.profile_id
             LEFT JOIN villages v ON ua.village_id = v.village_id
-            LEFT JOIN sys_tambons t ON v.tambon_id = t.tambon_id
-            LEFT JOIN sys_amphures a ON t.amphure_id = a.amphure_id
-            LEFT JOIN sys_provinces p ON a.province_id = p.province_id
+            -- ✨ เชื่อมตำบลแบบรองรับทั้ง tambon_id, tambon_code และ area_code
+            LEFT JOIN sys_tambons t ON (
+                CAST(v.tambon_id AS TEXT) = CAST(t.tambon_id AS TEXT)
+                OR CAST(v.tambon_id AS TEXT) = CAST(t.tambon_code AS TEXT)
+                OR CAST(ua.area_code AS TEXT) = CAST(t.tambon_code AS TEXT)
+            )
+            LEFT JOIN sys_amphures a ON (
+                CAST(t.amphure_id AS TEXT) = CAST(a.amphure_id AS TEXT)
+                OR CAST(t.amphure_id AS TEXT) = CAST(a.amphure_code AS TEXT)
+            )
+            LEFT JOIN sys_provinces p ON (
+                CAST(a.province_id AS TEXT) = CAST(p.province_id AS TEXT)
+                OR CAST(a.province_id AS TEXT) = CAST(p.province_code AS TEXT)
+            )
             LEFT JOIN LATERAL (
                 SELECT sp.position_name, upos.start_date, upos.end_date
                 FROM user_positions upos
