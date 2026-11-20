@@ -1942,80 +1942,96 @@ app.get('/api/villages-list', async (req, res) => {
 });
 
 // ==========================================
-// 🌟 API ค้นหาประชาชนแบบละเอียด 
+// API ค้นหาข้อมูลประชาชนแบบละเอียด (ดึงเพศ + ที่อยู่เต็ม + ตำแหน่งเดิม)
 // ==========================================
 app.get('/api/search-citizen-full/:citizenId', async (req, res) => {
     const { citizenId } = req.params;
-    const client = await pgPool.connect();
-
     try {
-        const query = `
+        const result = await pgPool.query(`
             SELECT 
-                a.account_id AS real_account_id, -- 🌟 ดึง account_id ของจริงมาด้วย
-                p.profile_id as account_id,      -- (ส่งชื่อเดิมเผื่อไว้กันระบบพัง)
-                p.first_name, 
-                p.last_name, 
-                p.gender,
-                p.dob,
-                p.house_no,
-                EXTRACT(YEAR FROM age(CURRENT_DATE, p.dob)) as age_years,
-                cpm.image_url AS user_image,
-                t.tambon_name_th, 
-                am.amphure_name_th, 
-                pr.province_name_th,
-                pos.position_name as prev_position,
-                v.village_id,
-                v.village_name
-            FROM user_profiles p
-            LEFT JOIN user_accounts a ON p.profile_id = a.profile_id
-            LEFT JOIN villages v ON a.village_id = v.village_id
-            LEFT JOIN sys_tambons t ON v.tambon_id = t.tambon_id
-            LEFT JOIN sys_amphures am ON t.amphure_id = am.amphure_id
-            LEFT JOIN sys_provinces pr ON am.province_id = pr.province_id
-            LEFT JOIN citizen_profiles_media cpm ON p.profile_id = cpm.profile_id AND cpm.is_active = true
-            LEFT JOIN user_positions up ON a.account_id = up.account_id AND up.is_active = TRUE AND (up.end_date IS NULL OR up.end_date >= CURRENT_DATE)
-            LEFT JOIN sys_positions pos ON up.position_id = pos.position_id
-            WHERE TRIM(p.citizen_id) = TRIM($1)
-            LIMIT 1;
-        `;
-        const result = await client.query(query, [citizenId]);
+                ua.account_id AS real_account_id,
+                ua.account_id,
+                ua.village_id,
+                ua.area_code,
+                up.profile_id,
+                up.citizen_id,
+                up.first_name,
+                up.last_name,
+                up.nickname,
+                up.gender,
+                up.dob,
+                up.house_no,
+                v.village_no,
+                v.village_name,
+                t.name_th AS tambon_name,
+                a.name_th AS amphure_name,
+                p.name_th AS province_name,
+                COALESCE(
+                    (SELECT string_agg(sp.position_name, ', ')
+                     FROM user_positions upos
+                     JOIN sys_positions sp ON upos.position_id = sp.position_id
+                     WHERE upos.account_id = ua.account_id),
+                    'ประชาชนทั่วไป'
+                ) AS prev_position
+            FROM user_profiles up
+            JOIN user_accounts ua ON up.profile_id = ua.profile_id
+            LEFT JOIN villages v ON ua.village_id = v.village_id
+            LEFT JOIN sys_tambons t ON v.tambon_id = t.id
+            LEFT JOIN sys_amphures a ON t.amphure_id = a.id
+            LEFT JOIN sys_provinces p ON a.province_id = p.id
+            WHERE up.citizen_id = $1
+            LIMIT 1
+        `, [citizenId.trim()]);
 
         if (result.rows.length === 0) {
-            return res.status(404).json({ success: false, message: 'ไม่พบข้อมูลลูกบ้าน หรือยังไม่ได้เปิดบัญชี' });
+            return res.status(404).json({ success: false, message: 'ไม่พบข้อมูลประชาชนจากเลขบัตรนี้' });
         }
 
-        const user = result.rows[0];
-        
-        if (!user.real_account_id && !user.account_id) {
-            return res.status(400).json({ success: false, message: 'ประชาชนท่านนี้ยังมีแค่โปรไฟล์ แต่ยังไม่ได้สร้างบัญชีผู้ใช้' });
+        const row = result.rows[0];
+
+        // 1. แปลงเพศเป็นภาษาไทย
+        const genderMap = { MALE: 'ชาย', FEMALE: 'หญิง', OTHER: 'อื่นๆ' };
+        const genderText = genderMap[(row.gender || '').toUpperCase()] || row.gender || 'ไม่ระบุ';
+
+        // 2. คำนวณอายุ และแปลงวันเกิดเป็นภาษาไทย
+        let age = '-';
+        let birthDateThai = 'ไม่ระบุ';
+        if (row.dob) {
+            const dobDate = new Date(row.dob);
+            const today = new Date();
+            age = today.getFullYear() - dobDate.getFullYear();
+            const m = today.getMonth() - dobDate.getMonth();
+            if (m < 0 || (m === 0 && today.getDate() < dobDate.getDate())) age--;
+
+            const thMonths = ['มกราคม','กุมภาพันธ์','มีนาคม','เมษายน','พฤษภาคม','มิถุนายน','กรกฎาคม','สิงหาคม','กันยายน','ตุลาคม','พฤศจิกายน','ธันวาคม'];
+            birthDateThai = `${dobDate.getDate()} ${thMonths[dobDate.getMonth()]} ${dobDate.getFullYear() + 543}`;
         }
-        
-        const birthDate = user.dob ? new Date(user.dob) : null;
-        const formattedDate = birthDate ? birthDate.toLocaleDateString('th-TH', { year: 'numeric', month: 'long', day: 'numeric' }) : 'ไม่ระบุ';
-        const formattedAddress = `บ้านเลขที่ ${user.house_no || '-'} ต.${user.tambon_name_th || '-'} อ.${user.amphure_name_th || '-'} จ.${user.province_name_th || '-'}`;
 
-        const fullData = {
-            real_account_id: user.real_account_id, // 🌟 ส่งค่านี้กลับไปให้ Frontend
-            account_id: user.account_id, 
-            first_name: user.first_name,
-            last_name: user.last_name,
-            gender: user.gender === 'MALE' ? 'ชาย' : (user.gender === 'FEMALE' ? 'หญิง' : '-'),
-            age: user.age_years || 0,
-            birth_date: formattedDate,
-            address: formattedAddress,
-            prev_position: user.prev_position || 'ไม่มีตำแหน่ง (ประชาชนทั่วไป)',
-            user_image: user.user_image || '/profile-img.jpg',
-            village_id: user.village_id,
-            village_name: user.village_name
-        };
+        // 3. ประกอบที่อยู่เต็ม (บ้านเลขที่ หมู่ บ้าน ต. อ. จ.)
+        const addressParts = [
+            row.house_no ? `บ้านเลขที่ ${row.house_no}` : null,
+            row.village_no ? `หมู่ ${row.village_no}` : null,
+            row.village_name ? `${row.village_name}` : null,
+            row.tambon_name ? `ต.${row.tambon_name}` : null,
+            row.amphure_name ? `อ.${row.amphure_name}` : null,
+            row.province_name ? `จ.${row.province_name}` : null
+        ].filter(Boolean);
 
-        res.json({ success: true, data: fullData });
+        const fullAddress = addressParts.length > 0 ? addressParts.join(' ') : 'ยังไม่ระบุที่อยู่';
 
-    } catch (error) {
-        console.error('Error searching citizen full:', error.message);
-        res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการค้นหา' });
-    } finally {
-        client.release();
+        res.json({
+            success: true,
+            data: {
+                ...row,
+                gender: genderText,
+                age,
+                birth_date: birthDateThai,
+                address: fullAddress
+            }
+        });
+    } catch (err) {
+        console.error('Search Citizen Full Error:', err);
+        res.status(500).json({ success: false, message: err.message });
     }
 });
 
