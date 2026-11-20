@@ -3697,8 +3697,196 @@ app.put('/api/admin/user-menus/:accountId', verifyAdminToken, async (req, res) =
         client.release();
     }
 });
+//---------------------------------------------------------
+//เริม   ใช้ชั่วคราว สิบหาข้อมูล
+//---------------------------------------------------------
+// =========================================================================
+// 🔍 1. API เอกซเรย์ข้อมูลบุคคลทุกตาราง (ค้นจากเลขบัตรประชาชน หรือ เบอร์โทร)
+// =========================================================================
+app.get('/api/admin/inspect-user', async (req, res) => {
+    const rawQuery = (req.query.q || '').replace(/-/g, '').trim();
+    if (!rawQuery) {
+        return res.status(400).json({ success: false, message: 'กรุณาระบุเลขบัตรประชาชนหรือเบอร์โทรศัพท์' });
+    }
 
+    try {
+        // ค้นหาจากทั้ง user_profiles (citizen_id) และ user_accounts (username_phone)
+        const matched = await pgPool.query(`
+            SELECT DISTINCT p.profile_id, a.account_id
+            FROM user_profiles p
+            FULL OUTER JOIN user_accounts a ON p.profile_id = a.profile_id
+            WHERE p.citizen_id = $1 OR a.username_phone = $1
+        `, [rawQuery]);
 
+        if (matched.rows.length === 0) {
+            return res.status(404).json({ success: false, message: 'ไม่พบข้อมูลจากเลขบัตรหรือเบอร์โทรนี้' });
+        }
+
+        const profileIds = [...new Set(matched.rows.map(r => r.profile_id).filter(Boolean))];
+        const accountIds = [...new Set(matched.rows.map(r => r.account_id).filter(Boolean))];
+
+        // ดึงข้อมูลจริงแบบ SELECT * เพื่อเห็นชื่อคอลัมน์ครบทุกตัว
+        const profilesRes = profileIds.length > 0
+            ? await pgPool.query(`SELECT * FROM user_profiles WHERE profile_id = ANY($1)`, [profileIds])
+            : { rows: [] };
+
+        const accountsRes = accountIds.length > 0
+            ? await pgPool.query(`SELECT * FROM user_accounts WHERE account_id = ANY($1)`, [accountIds])
+            : { rows: [] };
+
+        // ซ่อน password_hash เพื่อความปลอดภัย
+        const safeAccounts = accountsRes.rows.map(({ password_hash, ...rest }) => ({
+            ...rest,
+            password_hash: password_hash ? '*** (มีรหัสผ่านแล้ว) ***' : null
+        }));
+
+        const mediaRes = profileIds.length > 0
+            ? await pgPool.query(`SELECT * FROM citizen_profiles_media WHERE profile_id = ANY($1) ORDER BY is_active DESC`, [profileIds])
+            : { rows: [] };
+
+        const positionsRes = accountIds.length > 0
+            ? await pgPool.query(`
+                SELECT up.*, sp.position_name, sp.position_level
+                FROM user_positions up
+                LEFT JOIN sys_positions sp ON up.position_id = sp.position_id
+                WHERE up.account_id = ANY($1)
+                ORDER BY up.start_date DESC NULLS LAST
+            `, [accountIds])
+            : { rows: [] };
+
+        const villageIds = [...new Set(accountsRes.rows.map(a => a.village_id).filter(Boolean))];
+        const villagesRes = (villageIds.length > 0 || accountIds.length > 0)
+            ? await pgPool.query(`
+                SELECT v.*, t.tambon_name_th, a.amphure_name_th, p.province_name_th
+                FROM villages v
+                LEFT JOIN sys_tambons t ON CAST(v.tambon_id AS TEXT) = CAST(t.tambon_id AS TEXT) OR CAST(v.tambon_id AS TEXT) = CAST(t.tambon_code AS TEXT)
+                LEFT JOIN sys_amphures a ON CAST(t.amphure_id AS TEXT) = CAST(a.amphure_id AS TEXT)
+                LEFT JOIN sys_provinces p ON CAST(a.province_id AS TEXT) = CAST(p.province_id AS TEXT)
+                WHERE v.village_id = ANY($1) OR v.headman_account_id = ANY($2)
+            `, [villageIds, accountIds])
+            : { rows: [] };
+
+        // วิเคราะห์จุดผิดปกติ / ข้อมูลซ้ำซ้อน / ข้อมูลไม่ครบ
+        const warnings = [];
+        if (profilesRes.rows.length > 1) warnings.push(`พบข้อมูลซ้ำในตาราง user_profiles จำนวน ${profilesRes.rows.length} แถว`);
+        if (safeAccounts.length > 1) warnings.push(`พบข้อมูลซ้ำในตาราง user_accounts จำนวน ${safeAccounts.length} แถว`);
+        if (profilesRes.rows[0] && !profilesRes.rows[0].gender) warnings.push('user_profiles.gender ยังเป็นค่าว่าง');
+        if (profilesRes.rows[0] && !profilesRes.rows[0].house_no) warnings.push('user_profiles.house_no ยังเป็นค่าว่าง');
+        if (safeAccounts[0] && !safeAccounts[0].village_id) warnings.push('user_accounts.village_id ยังไม่ได้ผูกหมู่บ้าน');
+        if (mediaRes.rows.filter(m => m.is_active).length > 1) warnings.push('พบรูปโปรไฟล์ที่ is_active = true มากกว่า 1 รูป');
+
+        res.json({
+            success: true,
+            summary: { profileIds, accountIds, warnings },
+            tables: {
+                user_profiles: profilesRes.rows,
+                user_accounts: safeAccounts,
+                citizen_profiles_media: mediaRes.rows,
+                user_positions: positionsRes.rows,
+                villages: villagesRes.rows
+            }
+        });
+    } catch (err) {
+        console.error('Inspect User Error:', err);
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// =========================================================================
+// ✏️ 2. API แก้ไขข้อมูลพื้นฐานให้ครบ (user_profiles + user_accounts)
+// =========================================================================
+app.put('/api/admin/inspect-user/update', async (req, res) => {
+    const { profile_id, account_id, first_name, last_name, nickname, gender, dob, house_no, role, is_active } = req.body;
+    const client = await pgPool.connect();
+    try {
+        await client.query('BEGIN');
+
+        if (profile_id) {
+            await client.query(`
+                UPDATE user_profiles
+                SET first_name = COALESCE($1, first_name),
+                    last_name = COALESCE($2, last_name),
+                    nickname = $3,
+                    gender = $4,
+                    dob = $5,
+                    house_no = $6
+                WHERE profile_id = $7
+            `, [first_name, last_name, nickname || null, gender || null, dob || null, house_no || null, profile_id]);
+        }
+
+        if (account_id) {
+            await client.query(`
+                UPDATE user_accounts
+                SET role = COALESCE($1, role),
+                    is_active = COALESCE($2, is_active)
+                WHERE account_id = $3
+            `, [role, is_active, account_id]);
+        }
+
+        await client.query('COMMIT');
+        res.json({ success: true, message: 'อัปเดตข้อมูลเรียบร้อยแล้ว' });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error('Update Inspect User Error:', err);
+        res.status(500).json({ success: false, message: err.message });
+    } finally {
+        client.release();
+    }
+});
+
+// =========================================================================
+// 🗑️ 3. API ลบข้อมูลบุคคลนี้ให้สะอาดทุกตาราง (Purge Clean)
+// =========================================================================
+app.delete('/api/admin/inspect-user/purge', async (req, res) => {
+    const { profileIds = [], accountIds = [] } = req.body;
+    if (profileIds.length === 0 && accountIds.length === 0) {
+        return res.status(400).json({ success: false, message: 'ไม่มีรหัสข้อมูลสำหรับลบ' });
+    }
+
+    const client = await pgPool.connect();
+    try {
+        await client.query('BEGIN');
+
+        // 1. ปลดชื่อออกจาก villages.headman_account_id ก่อน (ไม่ลบหมู่บ้าน)
+        if (accountIds.length > 0) {
+            await client.query(`UPDATE villages SET headman_account_id = NULL WHERE headman_account_id = ANY($1)`, [accountIds]);
+            await client.query(`DELETE FROM user_positions WHERE account_id = ANY($1)`, [accountIds]);
+            // ลบสิทธิ์เมนู (ถ้ามีตาราง admin_user_menus)
+            await client.query(`SAVEPOINT sp_menus`);
+            try {
+                await client.query(`DELETE FROM admin_user_menus WHERE account_id = ANY($1)`, [accountIds]);
+            } catch (_) {
+                await client.query(`ROLLBACK TO SAVEPOINT sp_menus`);
+            }
+        }
+
+        // 2. ลบรูปโปรไฟล์
+        if (profileIds.length > 0) {
+            await client.query(`DELETE FROM citizen_profiles_media WHERE profile_id = ANY($1)`, [profileIds]);
+        }
+
+        // 3. ลบบัญชีและโปรไฟล์หลัก
+        if (accountIds.length > 0) {
+            await client.query(`DELETE FROM user_accounts WHERE account_id = ANY($1)`, [accountIds]);
+        }
+        if (profileIds.length > 0) {
+            await client.query(`DELETE FROM user_profiles WHERE profile_id = ANY($1)`, [profileIds]);
+        }
+
+        await client.query('COMMIT');
+        res.json({ success: true, message: 'ลบข้อมูลทั้งหมดของบุคคลนี้ออกจากทุกตารางเรียบร้อยแล้ว (สะอาดไม่มีขยะค้าง)' });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error('Purge User Error:', err);
+        res.status(500).json({ success: false, message: 'ลบไม่สำเร็จ: ' + err.message });
+    } finally {
+        client.release();
+    }
+});
+
+//---------------------------------------------------------
+//สิ้นสุดใช้ชั่วคราว 
+//---------------------------------------------------------
 app.listen(port, () => {
     console.log(`Server is running on port ${port}`);
 });
