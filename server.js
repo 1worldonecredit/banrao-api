@@ -4045,13 +4045,17 @@ app.delete('/api/admin/frontend-menus/:id', async (req, res) => {
 // =========================================================================
 // 🏢 เฟส 2: API จัดการโครงสร้างองค์กร 4 มิติ (Apps -> Orgs -> Depts -> Positions)
 // =========================================================================
-
 // 1. ดึงข้อมูลภาพรวมทั้งหมดในครั้งเดียว
 app.get('/api/admin/org-structure/overview', async (req, res) => {
     try {
         const [appsRes, orgsRes, deptsRes, posRes] = await Promise.all([
             pgPool.query(`SELECT * FROM sys_apps ORDER BY created_at ASC`),
-            pgPool.query(`SELECT * FROM sys_organizations ORDER BY org_id ASC`),
+            pgPool.query(`
+                SELECT o.*, a.app_name
+                FROM sys_organizations o
+                LEFT JOIN sys_apps a ON o.app_code = a.app_code
+                ORDER BY o.org_id ASC
+            `),
             pgPool.query(`
                 SELECT d.*, o.org_name
                 FROM sys_departments d
@@ -4079,16 +4083,13 @@ app.get('/api/admin/org-structure/overview', async (req, res) => {
         res.status(500).json({ success: false, message: err.message });
     }
 });
-
-// --- 2. จัดการแอปพลิเคชัน (sys_apps) ---
-app.post('/api/admin/org-structure/apps', async (req, res) => {
-    const { app_code, app_name, description } = req.body;
-    if (!app_code || !app_name) return res.status(400).json({ success: false, message: 'กรุณาระบุรหัสแอปและชื่อแอป' });
+app.post('/api/admin/org-structure/orgs', async (req, res) => {
+    const { org_name, org_type, app_code } = req.body;
+    if (!org_name) return res.status(400).json({ success: false, message: 'กรุณาระบุชื่อหน่วยงาน' });
     try {
-        const cleanCode = app_code.trim().toUpperCase().replace(/\s+/g, '_');
         const result = await pgPool.query(
-            `INSERT INTO sys_apps (app_code, app_name, description, is_active) VALUES ($1, $2, $3, true) RETURNING *`,
-            [cleanCode, app_name.trim(), description || null]
+            `INSERT INTO sys_organizations (org_name, org_type, app_code, is_active) VALUES ($1, $2, $3, true) RETURNING *`,
+            [org_name.trim(), org_type || 'GOVERNMENT', app_code || null]
         );
         res.json({ success: true, data: result.rows[0] });
     } catch (err) {
@@ -4096,12 +4097,12 @@ app.post('/api/admin/org-structure/apps', async (req, res) => {
     }
 });
 
-app.put('/api/admin/org-structure/apps/:code', async (req, res) => {
-    const { app_name, description, is_active } = req.body;
+app.put('/api/admin/org-structure/orgs/:id', async (req, res) => {
+    const { org_name, org_type, app_code, is_active } = req.body;
     try {
         const result = await pgPool.query(
-            `UPDATE sys_apps SET app_name = $1, description = $2, is_active = $3 WHERE app_code = $4 RETURNING *`,
-            [app_name.trim(), description || null, is_active !== false, req.params.code]
+            `UPDATE sys_organizations SET org_name = $1, org_type = $2, app_code = $3, is_active = $4 WHERE org_id = $5 RETURNING *`,
+            [org_name.trim(), org_type || 'GOVERNMENT', app_code || null, is_active !== false, req.params.id]
         );
         res.json({ success: true, data: result.rows[0] });
     } catch (err) {
