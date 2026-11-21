@@ -811,9 +811,8 @@ app.post('/api/login', async (req, res) => {
     }
 });
 
-
 // ==========================================
-// API: ดึงเมนู Sidebar 
+// API: ดึงเมนู Sidebar ฝั่งหน้าบ้าน (กรองตามสิทธิ์ selected_roles + ตำแหน่งจริงที่ Active)
 // ==========================================
 app.get('/api/sidebar-menus/:accountId', async (req, res) => {
     const { accountId } = req.params;
@@ -825,36 +824,61 @@ app.get('/api/sidebar-menus/:accountId', async (req, res) => {
     const client = await pgPool.connect();
 
     try {
-        const query = `
-           WITH UserInfo AS (
-                SELECT account_id, village_id 
-                FROM user_accounts 
-                WHERE account_id = $1
-            ),
-            UserPermissions AS (
-                -- ⚠️ เวอร์ชันทดสอบ: ดึงสิทธิ์ทั้งหมดที่คนคนนี้มี โดยไม่ต้องสน scope หรือวันหมดอายุ
-                SELECT pp.permission_id
-                FROM user_positions up
-                JOIN position_permissions pp ON up.position_id = pp.position_id
-                WHERE up.account_id = $1 
-            )
+        // 1. ตรวจสอบข้อมูลบัญชี (เช็กว่าเป็น Super Admin หรือไม่)
+        const userRes = await client.query(
+            `SELECT account_id, username_phone, role FROM user_accounts WHERE account_id = $1`,
+            [accountId]
+        );
+        if (userRes.rows.length === 0) {
+            return res.json({ success: true, data: [] });
+        }
+        const user = userRes.rows[0];
+        const isSuperAdmin = user.username_phone === '0000000000' || user.role === 'SUPER_ADMIN';
+
+        // 2. ดึงตำแหน่งที่กำลังดำรงตำแหน่งอยู่จริง (Active และยังไม่หมดวาระ)
+        const posRes = await client.query(`
+            SELECT sp.position_id, sp.position_name
+            FROM user_positions up
+            JOIN sys_positions sp ON up.position_id = sp.position_id
+            WHERE up.account_id = $1
+              AND up.is_active = TRUE
+              AND (up.end_date IS NULL OR up.end_date >= CURRENT_DATE)
+        `, [accountId]);
+
+        const userPosIds = new Set(posRes.rows.map(r => String(r.position_id)));
+        const userPosNames = new Set(posRes.rows.map(r => String(r.position_name).trim()));
+
+        // 3. ดึงเมนูทั้งหมดที่เปิดใช้งานอยู่ (เฉพาะฝั่งหน้าบ้าน BANRAO_WEB)
+        const menuRes = await client.query(`
             SELECT 
                 mg.group_name, 
                 m.menu_name AS name, 
                 m.icon_name AS icon, 
-                m.route_path AS path
+                COALESCE(m.route_path, m.path) AS path,
+                m.selected_roles
             FROM sys_menus m
             JOIN sys_menu_groups mg ON m.group_id = mg.group_id
-            WHERE m.is_active = TRUE 
-              -- เมนูนี้ต้องเป็นแบบ Public (NULL) หรือ ผู้ใช้มีสิทธิ์เข้าถึง (อยู่ใน UserPermissions)
-              AND (m.permission_id IS NULL OR m.permission_id IN (SELECT permission_id FROM UserPermissions))
-            ORDER BY mg.display_order, m.display_order;
-        `;
+            WHERE m.is_active = TRUE
+              AND (m.app_code IS NULL OR m.app_code = 'BANRAO_WEB')
+            ORDER BY mg.display_order ASC NULLS LAST, m.display_order ASC NULLS LAST, m.menu_id ASC
+        `);
 
-        const result = await client.query(query, [accountId]);
+        // 4. กรองสิทธิ์การมองเห็นตาม selected_roles
+        const allowedMenus = menuRes.rows.filter((m) => {
+            // Super Admin เห็นทุกเมนูที่เปิดใช้งาน
+            if (isSuperAdmin) return true;
 
-        // จัดกลุ่มข้อมูล (Group By)
-        const groupedMenus = result.rows.reduce((acc, row) => {
+            const roles = Array.isArray(m.selected_roles) ? m.selected_roles : [];
+
+            // ถ้าไม่ได้กำหนดตำแหน่งใดเลย ([]) = ทุกคน / ประชาชนพื้นฐานเห็นได้ทันที
+            if (roles.length === 0) return true;
+
+            // ถ้ามีการกำหนดตำแหน่งไว้ ให้เช็กว่าผู้ใช้มีตำแหน่งตรงกันหรือไม่ (รองรับทั้ง position_id และชื่อตำแหน่ง)
+            return roles.some((r) => userPosIds.has(String(r)) || userPosNames.has(String(r).trim()));
+        });
+
+        // 5. จัดกลุ่มตาม group_name
+        const groupedMenus = allowedMenus.reduce((acc, row) => {
             const group = acc.find(g => g.group_name === row.group_name);
             const menuData = { name: row.name, icon: row.icon, path: row.path };
             
@@ -875,7 +899,6 @@ app.get('/api/sidebar-menus/:accountId', async (req, res) => {
         client.release();
     }
 });
-
 
 // ==========================================
 // API: ดึงรายชื่อตำแหน่งเพื่อไปแสดงเป็น Checkbox (ดึงเฉพาะระดับ VILLAGE)
