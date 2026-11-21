@@ -615,30 +615,31 @@ async function syncExpiredPositions(dbClient = pgPool) {
     }
 }
 // ==========================================
-// 🌟 API เข้าสู่ระบบ (Login) - ดึงรูป Profile จริง + ตำแหน่งตาม Position + รอผู้นำคนใหม่ใน Card 2
+// 🌟 API เข้าสู่ระบบ (Login) - เวอร์ชัน 4 มิติ (App + หน่วยงาน + แผนก + ตำแหน่ง + Scope)
 // ==========================================
 app.post('/api/login', async (req, res) => {
     console.log('👉 มีคนกด Login! ข้อมูลที่ส่งมาคือ:', req.body);
     const usernameInput = req.body.username || req.body.phone_number;
     const password = req.body.password;
+    const appCode = (req.body.app_code || 'BANRAO_WEB').trim().toUpperCase();
 
     if (!usernameInput || !password) {
         return res.status(400).json({ success: false, message: 'กรุณากรอกเบอร์โทรศัพท์และรหัสผ่าน' });
     }
 
-    const client = await pgPool.connect(); 
+    const client = await pgPool.connect();
 
     try {
-        // ✨ เคลียร์ตำแหน่งที่หมดวาระอัตโนมัติก่อนดึงข้อมูล Login
+        // ✨ 1. เคลียร์ตำแหน่งที่หมดวาระอัตโนมัติก่อนดึงข้อมูล Login
         await syncExpiredPositions(client);
 
+        // ✨ 2. ดึงข้อมูลส่วนตัว บัญชี หมู่บ้าน และรูปโปรไฟล์ (1 บัญชี = 1 แถว ไม่ซ้ำ)
         const userQuery = await client.query(
             `SELECT 
                 a.account_id, a.username_phone, a.password_hash, a.occupation_id, a.is_active, a.household_member_count, a.role,
                 p.first_name, p.last_name, p.nickname, p.dob, p.citizen_id, p.gender, p.house_no,
                 o.occupation_name, 
 
-                -- ✨ 1. ดึงรูป Profile จริงของผู้ใช้งาน (Card 1)
                 (
                     SELECT cpm.image_url
                     FROM citizen_profiles_media cpm
@@ -646,7 +647,6 @@ app.post('/api/login', async (req, res) => {
                     LIMIT 1
                 ) AS user_image,
 
-                -- ✨ 2. ดึงรูป Profile จริงของผู้ใหญ่บ้านปัจจุบัน (Card 2)
                 (
                     SELECT hcpm.image_url
                     FROM citizen_profiles_media hcpm
@@ -656,8 +656,6 @@ app.post('/api/login', async (req, res) => {
                 
                 v.village_id, v.village_no, v.village_name, v.headman_lat, v.headman_lng, 
                 v.headman_account_id,
-                
-                -- ✨ ข้อมูลหมู่บ้าน ครัวเรือน ประชากร (คงไว้ครบไม่ให้หาย)
                 v.household_count AS target_household_count, 
                 v.population_count AS target_population_count,
                 (SELECT COUNT(*) FROM households h WHERE h.village_id = v.village_id) AS actual_household_count,
@@ -665,32 +663,21 @@ app.post('/api/login', async (req, res) => {
                 
                 hp.first_name AS headman_first_name, 
                 hp.last_name AS headman_last_name,
-                
                 t.tambon_name_th, am.amphure_name_th, pr.province_name_th,
                 
                 EXTRACT(YEAR FROM age(CURRENT_DATE, p.dob)) AS age_years,
                 EXTRACT(MONTH FROM age(CURRENT_DATE, p.dob)) AS age_months,
-                EXTRACT(DAY FROM age(CURRENT_DATE, p.dob)) AS age_days,
-                
-                pos.position_name, 
-                pos.position_level,
-                up.start_date AS term_start_date,
-                up.end_date AS term_end_date 
+                EXTRACT(DAY FROM age(CURRENT_DATE, p.dob)) AS age_days
 
              FROM user_accounts a
              LEFT JOIN user_profiles p ON a.profile_id = p.profile_id
              LEFT JOIN sys_occupations o ON a.occupation_id = o.occupation_id
-             
              LEFT JOIN villages v ON a.village_id = v.village_id
              LEFT JOIN user_accounts ha ON v.headman_account_id = ha.account_id
              LEFT JOIN user_profiles hp ON ha.profile_id = hp.profile_id
              LEFT JOIN sys_tambons t ON v.tambon_id = t.tambon_id
              LEFT JOIN sys_amphures am ON t.amphure_id = am.amphure_id
              LEFT JOIN sys_provinces pr ON am.province_id = pr.province_id
-             
-             LEFT JOIN user_positions up ON a.account_id = up.account_id AND up.is_active = TRUE AND (up.end_date IS NULL OR up.end_date >= CURRENT_DATE)
-             LEFT JOIN sys_positions pos ON up.position_id = pos.position_id
-
              WHERE a.username_phone = $1`,
             [usernameInput]
         );
@@ -710,9 +697,40 @@ app.post('/api/login', async (req, res) => {
             return res.status(401).json({ success: false, message: 'เบอร์โทรศัพท์หรือรหัสผ่านไม่ถูกต้อง' });
         }
 
+        // ✨ 3. ดึงโครงสร้าง 4 มิติทั้งหมดที่ Active ของบุคคลนี้ (หน่วยงาน -> แผนก -> ตำแหน่ง -> พื้นที่)
+        const posQuery = await client.query(
+            `SELECT 
+                up.id AS user_position_id,
+                pos.position_id,
+                pos.position_name,
+                pos.position_level,
+                COALESCE(up.org_id, pos.org_id) AS org_id,
+                org.org_name,
+                org.app_code AS org_app_code,
+                COALESCE(up.dept_id, pos.dept_id) AS dept_id,
+                dept.department_name,
+                up.scope_type,
+                up.scope_id,
+                up.start_date AS term_start_date,
+                up.end_date AS term_end_date
+             FROM user_positions up
+             JOIN sys_positions pos ON up.position_id = pos.position_id
+             LEFT JOIN sys_organizations org ON COALESCE(up.org_id, pos.org_id) = org.org_id
+             LEFT JOIN sys_departments dept ON COALESCE(up.dept_id, pos.dept_id) = dept.department_id
+             WHERE up.account_id = $1
+               AND up.is_active = TRUE
+               AND (up.end_date IS NULL OR up.end_date >= CURRENT_DATE)
+             ORDER BY up.start_date DESC NULLS LAST, up.id DESC`,
+            [user.account_id]
+        );
+
+        const activePositions = posQuery.rows;
+        const primaryPos = activePositions[0] || null;
+
+        // ดึงสิทธิ์พื้นฐานตามอาชีพ (คงไว้เพื่อรองรับโค้ดเดิม)
         let permissions = [];
         if (user.occupation_id) {
-             try {
+            try {
                 const permQuery = await client.query(
                     `SELECT sp.permission_code
                      FROM occupation_permissions op
@@ -721,13 +739,38 @@ app.post('/api/login', async (req, res) => {
                     [user.occupation_id]
                 );
                 permissions = permQuery.rows.map(row => row.permission_code);
-             } catch(e) {
+            } catch (e) {
                 console.log("ไม่มีตาราง Permissions หรือข้อผิดพลาดในการดึงสิทธิ์:", e.message);
-             }
+            }
         }
 
+        // ✨ 4. กำหนดตำแหน่งหลัก & สังกัด 4 มิติ
+        const isSuperAdmin = user.username_phone === '0000000000' || user.role === 'SUPER_ADMIN';
+        let finalPositionName = 'ประชาชนทั่วไป';
+        let finalPositionLevel = null;
+
+        if (isSuperAdmin) {
+            finalPositionName = 'Super Admin';
+            finalPositionLevel = 'SYSTEM';
+        } else if (primaryPos) {
+            finalPositionName = primaryPos.position_name;
+            finalPositionLevel = primaryPos.position_level || 'VILLAGE';
+        }
+
+        // ✨ 5. สร้าง JWT Token ที่ฝังบริบท 4 มิติไว้ภายใน
         const token = jwt.sign(
-            { account_id: user.account_id, occupation_id: user.occupation_id, village_id: user.village_id },
+            {
+                account_id: user.account_id,
+                app_code: appCode,
+                is_super_admin: isSuperAdmin,
+                occupation_id: user.occupation_id,
+                village_id: user.village_id,
+                org_id: primaryPos?.org_id || null,
+                dept_id: primaryPos?.dept_id || null,
+                position_id: primaryPos?.position_id || null,
+                scope_type: primaryPos?.scope_type || null,
+                scope_id: primaryPos?.scope_id || null
+            },
             process.env.JWT_SECRET || 'banrao_secret_key',
             { expiresIn: '1d' }
         );
@@ -738,39 +781,27 @@ app.post('/api/login', async (req, res) => {
         const dayNameTh = (birthDate && !isDummyDate) ? daysTh[birthDate.getDay()] : '-';
         const genderTh = user.gender === 'MALE' ? 'ชาย' : (user.gender === 'FEMALE' ? 'หญิง' : '-');
 
-        // ✨ 3. กำหนดตำแหน่ง Card 1 ให้ตรงตาม Position จริงเท่านั้น
-        let finalPositionName = 'ประชาชนทั่วไป';
-        let finalPositionLevel = null;
-        let isSuperAdmin = false; 
-
-        if (user.username_phone === '0000000000') {
-            finalPositionName = 'Super Admin';
-            finalPositionLevel = 'SYSTEM';
-            isSuperAdmin = true;
-        } 
-        else if (user.position_name) {
-            finalPositionName = user.position_name;
-            finalPositionLevel = user.position_level || 'VILLAGE';
-        }
-
         const responseData = {
             id: user.account_id,
+            account_id: user.account_id,
             username: user.username_phone,
             firstName: user.first_name,
             lastName: user.last_name,
+            full_name: `${user.first_name || ''} ${user.last_name || ''}`.trim(),
             nickname: user.nickname,
             occupation: user.occupation_name,
             permissions: permissions,
             role: user.role,
-            
+
+            // ข้อมูลหมู่บ้านและสถิติ
             village_id: user.village_id,
             village_no: user.village_no,
-            villageName: user.village_name, 
+            villageName: user.village_name,
             headmanName: user.headman_first_name ? `${user.headman_first_name} ${user.headman_last_name}` : null,
             tambonName: user.tambon_name_th,
             amphureName: user.amphure_name_th,
             provinceName: user.province_name_th,
-            
+
             gender: genderTh,
             birthDayName: dayNameTh,
             age_years: isDummyDate ? '-' : (user.age_years || 0),
@@ -778,29 +809,39 @@ app.post('/api/login', async (req, res) => {
             age_days: isDummyDate ? '-' : (user.age_days || 0),
             house_no: user.house_no || '-',
             household_member_count: user.household_member_count || 0,
-            
+
             target_household_count: user.target_household_count || 0,
             target_population_count: user.target_population_count || 0,
             actual_household_count: user.actual_household_count || 0,
             actual_population_count: user.actual_population_count || 0,
-            
-            // ✨ รูป Profile จริงของ Card 1 และ Card 2 (ถ้ายังไม่มีผู้นำจะใช้ /profile-img.jpg รอคนใหม่)
-            userImage: user.user_image || '/profile-img.jpg', 
+
+            userImage: user.user_image || '/profile-img.jpg',
             headmanImage: user.headman_account_id ? (user.headman_image || '/profile-img.jpg') : '/profile-img.jpg',
-            
+
+            // ✨ ข้อมูล 4 มิติ (App + หน่วยงาน + แผนก + ตำแหน่ง + พื้นที่)
+            app_code: appCode,
+            isSuperAdmin: isSuperAdmin,
+            is_super_admin: isSuperAdmin,
+            org_id: primaryPos?.org_id || null,
+            org_name: isSuperAdmin ? 'ระบบส่วนกลาง (System)' : (primaryPos?.org_name || null),
+            dept_id: primaryPos?.dept_id || null,
+            department_name: primaryPos?.department_name || null,
+            position_id: primaryPos?.position_id || null,
             position_name: finalPositionName,
             position_level: finalPositionLevel,
-            isSuperAdmin: isSuperAdmin,
-            term_start_date: user.term_start_date, 
-            term_end_date: user.term_end_date 
+            scope_type: primaryPos?.scope_type || null,
+            scope_id: primaryPos?.scope_id || null,
+            term_start_date: primaryPos?.term_start_date || null,
+            term_end_date: primaryPos?.term_end_date || null,
+            positions: activePositions // เก็บทุกตำแหน่งที่ Active ไว้ครบ
         };
 
         res.json({
             success: true,
             message: 'เข้าสู่ระบบสำเร็จ',
             token,
-            user: responseData, 
-            userData: responseData 
+            user: responseData,
+            userData: responseData
         });
 
     } catch (error) {
@@ -810,7 +851,6 @@ app.post('/api/login', async (req, res) => {
         if (client) client.release();
     }
 });
-
 // ==========================================
 // API: ดึงเมนู Sidebar ฝั่งหน้าบ้าน (กรองตามสิทธิ์ selected_roles + ตำแหน่งจริงที่ Active)
 // ==========================================
