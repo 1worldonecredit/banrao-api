@@ -4263,6 +4263,58 @@ app.put('/api/admin/org-structure/positions/:id', async (req, res) => {
     }
 });
 
+
+// =========================================================================
+// 🗺️ API แก้ไขชื่อ จังหวัด / อำเภอ / ตำบล (สำหรับแก้คำผิดจากหลังบ้าน)
+// =========================================================================
+
+// 1. แก้ไขชื่อจังหวัด
+app.put('/api/admin/sys-provinces/:code', async (req, res) => {
+    const { name_th } = req.body;
+    if (!name_th || !name_th.trim()) return res.status(400).json({ success: false, message: 'กรุณาระบุชื่อจังหวัด' });
+    try {
+        const result = await pgPool.query(
+            `UPDATE sys_provinces SET province_name_th = $1 WHERE province_code = $2 RETURNING province_code, province_name_th`,
+            [name_th.trim(), req.params.code]
+        );
+        if (result.rows.length === 0) return res.status(404).json({ success: false, message: 'ไม่พบจังหวัดนี้' });
+        res.json({ success: true, data: result.rows[0] });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// 2. แก้ไขชื่ออำเภอ
+app.put('/api/admin/sys-amphures/:code', async (req, res) => {
+    const { name_th } = req.body;
+    if (!name_th || !name_th.trim()) return res.status(400).json({ success: false, message: 'กรุณาระบุชื่ออำเภอ' });
+    try {
+        const result = await pgPool.query(
+            `UPDATE sys_amphures SET amphure_name_th = $1 WHERE amphure_code = $2 RETURNING amphure_code, amphure_name_th`,
+            [name_th.trim(), req.params.code]
+        );
+        if (result.rows.length === 0) return res.status(404).json({ success: false, message: 'ไม่พบอำเภอนี้' });
+        res.json({ success: true, data: result.rows[0] });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// 3. แก้ไขชื่อตำบล
+app.put('/api/admin/sys-tambons/:id', async (req, res) => {
+    const { name_th } = req.body;
+    if (!name_th || !name_th.trim()) return res.status(400).json({ success: false, message: 'กรุณาระบุชื่อตำบล' });
+    try {
+        const result = await pgPool.query(
+            `UPDATE sys_tambons SET tambon_name_th = $1 WHERE tambon_id = $2 RETURNING tambon_id, tambon_name_th`,
+            [name_th.trim(), req.params.id]
+        );
+        if (result.rows.length === 0) return res.status(404).json({ success: false, message: 'ไม่พบตำบลนี้' });
+        res.json({ success: true, data: result.rows[0] });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
 //   สิ้นสุด
 //--------------------------------------------------------
 app.listen(port, () => {
