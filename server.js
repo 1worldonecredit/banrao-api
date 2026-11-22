@@ -4140,10 +4140,10 @@ app.delete('/api/admin/inspect-user/purge', async (req, res) => {
 // =========================================================================
 // 🧩 API จัดการกรุ๊ปเมนู & เมนูฝั่ง Frontend (สำหรับ Super Admin ใน emp.banrao.life)
 // =========================================================================
-// 1. ดึงข้อมูลทั้งหมดจากฐานข้อมูลจริง (Apps + Groups + Menus + Positions)
+/// 1. ดึงข้อมูลทั้งหมดจากฐานข้อมูลจริง (Apps + Groups + Menus + Orgs + Depts + Positions)
 app.get('/api/admin/frontend-menus/overview', async (req, res) => {
     try {
-        const [appsRes, groupsRes, menusRes, positionsRes] = await Promise.all([
+        const [appsRes, groupsRes, menusRes, orgsRes, deptsRes, positionsRes] = await Promise.all([
             pgPool.query(`SELECT * FROM sys_apps WHERE is_active = true ORDER BY created_at ASC`),
             pgPool.query(`SELECT * FROM sys_menu_groups ORDER BY app_code ASC, display_order ASC NULLS LAST, group_id ASC`),
             pgPool.query(`
@@ -4152,7 +4152,9 @@ app.get('/api/admin/frontend-menus/overview', async (req, res) => {
                 LEFT JOIN sys_menu_groups g ON m.group_id = g.group_id
                 ORDER BY m.app_code ASC, g.display_order ASC NULLS LAST, m.display_order ASC NULLS LAST, m.menu_id ASC
             `),
-            pgPool.query(`SELECT position_id, position_name, position_level FROM sys_positions WHERE is_active = true ORDER BY position_id ASC`)
+            pgPool.query(`SELECT org_id, org_name, app_code FROM sys_organizations WHERE is_active = true ORDER BY org_id ASC`),
+            pgPool.query(`SELECT department_id, department_name, org_id FROM sys_departments WHERE is_active = true ORDER BY department_id ASC`),
+            pgPool.query(`SELECT position_id, position_name, position_level, org_id, dept_id FROM sys_positions WHERE is_active = true ORDER BY position_id ASC`)
         ]);
 
         res.json({
@@ -4160,6 +4162,8 @@ app.get('/api/admin/frontend-menus/overview', async (req, res) => {
             apps: appsRes.rows,
             groups: groupsRes.rows,
             menus: menusRes.rows,
+            organizations: orgsRes.rows,
+            departments: deptsRes.rows,
             positions: positionsRes.rows
         });
     } catch (err) {
