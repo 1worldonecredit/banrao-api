@@ -853,7 +853,7 @@ app.post('/api/login', async (req, res) => {
     }
 });
 // ==========================================
-// API: ดึงเมนู Sidebar + สิทธิ์ Matrix 4 มิติ (ดู / เพิ่ม / แก้ไข / ลบ / อนุมัติ)
+// API: ดึงเมนู Sidebar + สิทธิ์ Matrix ครบวงจร (Tier + คะแนนชุมชน + 4 มิติ Org/Dept/Pos)
 // ==========================================
 app.get('/api/sidebar-menus/:accountId', async (req, res) => {
     const { accountId } = req.params;
@@ -866,17 +866,39 @@ app.get('/api/sidebar-menus/:accountId', async (req, res) => {
     const client = await pgPool.connect();
 
     try {
-        // 1. ตรวจสอบข้อมูลบัญชี (Super Admin เห็นและทำได้ทุกอย่าง)
+        // 1. ดึงข้อมูลบัญชี + ระดับผู้ใช้ (tier_code) + คะแนนชุมชน (community_score)
         const userRes = await client.query(
-            `SELECT account_id, username_phone, role FROM user_accounts WHERE account_id = $1`,
+            `SELECT account_id, username_phone, role,
+                    COALESCE(tier_code, 'CITIZEN_FREE') AS tier_code,
+                    COALESCE(community_score, 0) AS community_score
+             FROM user_accounts
+             WHERE account_id = $1`,
             [accountId]
         );
-        if (userRes.rows.length === 0) return res.json({ success: true, data: [], permissionsMap: {} });
+        if (userRes.rows.length === 0) {
+            return res.json({ success: true, data: [], permissionsMap: {} });
+        }
 
         const user = userRes.rows[0];
         const isSuperAdmin = user.username_phone === '0000000000' || user.role === 'SUPER_ADMIN';
+        const userScore = Number(user.community_score) || 0;
 
-        // 2. ดึงตำแหน่ง + หน่วยงาน + แผนก ที่ Active อยู่จริงของบัญชีนี้
+        // 2. คำนวณ Tier ทั้งหมดที่ผู้ใช้คนนี้มีสิทธิ์ได้รับ (ดึงจากตาราง sys_user_tiers จริง)
+        const autoTiersRes = await client.query(
+            `SELECT tier_code
+             FROM sys_user_tiers
+             WHERE is_active = TRUE
+               AND is_paid = FALSE
+               AND min_community_score <= $1`,
+            [userScore]
+        );
+
+        const eligibleTierCodes = new Set(autoTiersRes.rows.map(r => String(r.tier_code).trim().toUpperCase()));
+        if (user.tier_code) {
+            eligibleTierCodes.add(String(user.tier_code).trim().toUpperCase());
+        }
+
+        // 3. ดึงตำแหน่ง + หน่วยงาน + แผนก ที่ Active อยู่จริงของบัญชีนี้
         const posRes = await client.query(`
             SELECT 
                 sp.position_id,
@@ -894,7 +916,7 @@ app.get('/api/sidebar-menus/:accountId', async (req, res) => {
         const userPosIds = new Set(userPositions.map(r => String(r.position_id)));
         const userPosNames = new Set(userPositions.map(r => String(r.position_name).trim()));
 
-        // 3. ดึงเมนูทั้งหมดที่เปิดใช้งานใน App นี้
+        // 4. ดึงเมนูทั้งหมดที่เปิดใช้งานอยู่ (ทั้งเมนูและกรุ๊ปเมนูต้อง is_active = true)
         const menuRes = await client.query(`
             SELECT 
                 m.menu_id,
@@ -906,20 +928,21 @@ app.get('/api/sidebar-menus/:accountId', async (req, res) => {
             FROM sys_menus m
             JOIN sys_menu_groups mg ON m.group_id = mg.group_id
             WHERE m.is_active = TRUE
+              AND COALESCE(mg.is_active, TRUE) = TRUE
               AND (m.app_code = $1 OR ($1 = 'BANRAO_WEB' AND m.app_code IS NULL))
             ORDER BY mg.display_order ASC NULLS LAST, m.display_order ASC NULLS LAST, m.menu_id ASC
         `, [appCode]);
 
-        // 4. ดึงสิทธิ์ Matrix ทั้งหมดของ App นี้ที่เปิดใช้งาน
+        // 5. ดึงสิทธิ์ Matrix ทั้งหมดของ App นี้ที่เปิดใช้งาน
         const matrixRes = await client.query(`
-            SELECT menu_id, org_id, dept_id, position_id,
+            SELECT menu_id, org_id, dept_id, position_id, tier_code,
                    can_view, can_create, can_edit, can_delete, can_approve
             FROM sys_menu_permissions
             WHERE app_code = $1 AND is_active = TRUE
         `, [appCode]);
 
         const matrixRows = matrixRes.rows;
-        const permissionsMap = {}; // เก็บสิทธิ์แยกตาม path เช่น { "/my-places": { can_view: true, ... } }
+        const permissionsMap = {};
         const allowedMenus = [];
 
         for (const m of menuRes.rows) {
@@ -930,40 +953,47 @@ app.get('/api/sidebar-menus/:accountId', async (req, res) => {
                 continue;
             }
 
-            // คัดเฉพาะแถว Matrix ที่ตรงกับเมนูนี้และตรงกับ (หน่วยงาน / แผนก / ตำแหน่ง) ของผู้ใช้
-            const matchedRules = matrixRows.filter((rule) => {
-                if (rule.menu_id !== m.menu_id) return false;
+            // ตรวจว่าเมนูนี้มีการตั้งค่าในตาราง Matrix ไว้แล้วหรือไม่
+            const rulesForThisMenu = matrixRows.filter((r) => r.menu_id === m.menu_id);
 
-                // กฎส่วนกลาง (org=null, dept=null, pos=null) = ใช้ได้กับทุกคนรวมถึงประชาชนทั่วไป
-                if (rule.org_id === null && rule.dept_id === null && rule.position_id === null) {
-                    return true;
-                }
+            if (rulesForThisMenu.length > 0) {
+                // คัดเฉพาะกฎที่ตรงกับ Tier หรือ ตำแหน่ง 4 มิติ ของผู้ใช้
+                const matchedRules = rulesForThisMenu.filter((rule) => {
+                    // กรณีที่ 1: กฎระดับ Tier (ประชาชนฟรี / คะแนนชุมชน / แพ็กเกจธุรกิจ)
+                    if (rule.tier_code) {
+                        return eligibleTierCodes.has(String(rule.tier_code).trim().toUpperCase());
+                    }
 
-                // เช็กเทียบกับตำแหน่งที่ผู้ใช้ถืออยู่
-                return userPositions.some((up) => {
-                    const orgMatch = rule.org_id === null || String(rule.org_id) === String(up.org_id);
-                    const deptMatch = rule.dept_id === null || String(rule.dept_id) === String(up.dept_id);
-                    const posMatch = rule.position_id === null || String(rule.position_id) === String(up.position_id);
-                    return orgMatch && deptMatch && posMatch;
+                    // กรณีที่ 2: กฎส่วนกลาง (ไม่ได้ระบุ Org/Dept/Pos/Tier) = ทุกคนเห็นได้
+                    if (rule.org_id === null && rule.dept_id === null && rule.position_id === null) {
+                        return true;
+                    }
+
+                    // กรณีที่ 3: กฎโครงสร้างองค์กร 4 มิติ (Org -> Dept -> Pos)
+                    return userPositions.some((up) => {
+                        const orgMatch = rule.org_id === null || String(rule.org_id) === String(up.org_id);
+                        const deptMatch = rule.dept_id === null || String(rule.dept_id) === String(up.dept_id);
+                        const posMatch = rule.position_id === null || String(rule.position_id) === String(up.position_id);
+                        return orgMatch && deptMatch && posMatch;
+                    });
                 });
-            });
 
-            if (matchedRules.length > 0) {
-                // รวมสิทธิ์แบบ OR (ถ้ามีหลายตำแหน่ง ให้ได้สิทธิ์สูงสุด)
-                const mergedPerm = matchedRules.reduce((acc, r) => ({
-                    can_view: acc.can_view || r.can_view,
-                    can_create: acc.can_create || r.can_create,
-                    can_edit: acc.can_edit || r.can_edit,
-                    can_delete: acc.can_delete || r.can_delete,
-                    can_approve: acc.can_approve || r.can_approve
-                }), { can_view: false, can_create: false, can_edit: false, can_delete: false, can_approve: false });
+                if (matchedRules.length > 0) {
+                    const mergedPerm = matchedRules.reduce((acc, r) => ({
+                        can_view: acc.can_view || r.can_view,
+                        can_create: acc.can_create || r.can_create,
+                        can_edit: acc.can_edit || r.can_edit,
+                        can_delete: acc.can_delete || r.can_delete,
+                        can_approve: acc.can_approve || r.can_approve
+                    }), { can_view: false, can_create: false, can_edit: false, can_delete: false, can_approve: false });
 
-                if (mergedPerm.can_view) {
-                    permissionsMap[m.path] = mergedPerm;
-                    allowedMenus.push({ ...m, permissions: mergedPerm });
+                    if (mergedPerm.can_view) {
+                        permissionsMap[m.path] = mergedPerm;
+                        allowedMenus.push({ ...m, permissions: mergedPerm });
+                    }
                 }
             } else {
-                // Fallback: ถ้ายังไม่ได้ตั้งค่าใน Matrix ให้ใช้สิทธิ์จาก selected_roles เดิม
+                // Fallback: ถ้าเมนูนี้ยังไม่ได้กำหนดในหน้า Matrix ให้ใช้สิทธิ์จาก selected_roles เดิม
                 const roles = Array.isArray(m.selected_roles) ? m.selected_roles : [];
                 const canSeeLegacy = roles.length === 0 || roles.some((r) => userPosIds.has(String(r)) || userPosNames.has(String(r).trim()));
                 if (canSeeLegacy) {
@@ -974,7 +1004,7 @@ app.get('/api/sidebar-menus/:accountId', async (req, res) => {
             }
         }
 
-        // 5. จัดกลุ่มตาม group_name
+        // 6. จัดกลุ่มตาม group_name
         const groupedMenus = allowedMenus.reduce((acc, row) => {
             const group = acc.find(g => g.group_name === row.group_name);
             const menuData = {
@@ -989,7 +1019,16 @@ app.get('/api/sidebar-menus/:accountId', async (req, res) => {
             return acc;
         }, []);
 
-        res.json({ success: true, data: groupedMenus, permissionsMap });
+        res.json({
+            success: true,
+            data: groupedMenus,
+            permissionsMap,
+            userTier: {
+                tier_code: user.tier_code,
+                community_score: userScore,
+                eligible_tiers: Array.from(eligibleTierCodes)
+            }
+        });
     } catch (error) {
         console.error('Fetch Sidebar Menus Error:', error);
         res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการดึงข้อมูลเมนู' });
