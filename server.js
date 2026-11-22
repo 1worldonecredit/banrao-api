@@ -853,11 +853,12 @@ app.post('/api/login', async (req, res) => {
     }
 });
 // ==========================================
-// API: ดึงเมนู Sidebar ฝั่งหน้าบ้าน (กรองตามสิทธิ์ selected_roles + ตำแหน่งจริงที่ Active)
+// API: ดึงเมนู Sidebar + สิทธิ์ Matrix 4 มิติ (ดู / เพิ่ม / แก้ไข / ลบ / อนุมัติ)
 // ==========================================
 app.get('/api/sidebar-menus/:accountId', async (req, res) => {
     const { accountId } = req.params;
-    
+    const appCode = (req.query.app_code || 'BANRAO_WEB').trim().toUpperCase();
+
     if (!accountId || accountId === 'undefined') {
         return res.status(400).json({ success: false, message: 'Invalid Account ID' });
     }
@@ -865,20 +866,23 @@ app.get('/api/sidebar-menus/:accountId', async (req, res) => {
     const client = await pgPool.connect();
 
     try {
-        // 1. ตรวจสอบข้อมูลบัญชี (เช็กว่าเป็น Super Admin หรือไม่)
+        // 1. ตรวจสอบข้อมูลบัญชี (Super Admin เห็นและทำได้ทุกอย่าง)
         const userRes = await client.query(
             `SELECT account_id, username_phone, role FROM user_accounts WHERE account_id = $1`,
             [accountId]
         );
-        if (userRes.rows.length === 0) {
-            return res.json({ success: true, data: [] });
-        }
+        if (userRes.rows.length === 0) return res.json({ success: true, data: [], permissionsMap: {} });
+
         const user = userRes.rows[0];
         const isSuperAdmin = user.username_phone === '0000000000' || user.role === 'SUPER_ADMIN';
 
-        // 2. ดึงตำแหน่งที่กำลังดำรงตำแหน่งอยู่จริง (Active และยังไม่หมดวาระ)
+        // 2. ดึงตำแหน่ง + หน่วยงาน + แผนก ที่ Active อยู่จริงของบัญชีนี้
         const posRes = await client.query(`
-            SELECT sp.position_id, sp.position_name
+            SELECT 
+                sp.position_id,
+                sp.position_name,
+                COALESCE(up.org_id, sp.org_id) AS org_id,
+                COALESCE(up.dept_id, sp.dept_id) AS dept_id
             FROM user_positions up
             JOIN sys_positions sp ON up.position_id = sp.position_id
             WHERE up.account_id = $1
@@ -886,55 +890,108 @@ app.get('/api/sidebar-menus/:accountId', async (req, res) => {
               AND (up.end_date IS NULL OR up.end_date >= CURRENT_DATE)
         `, [accountId]);
 
-        const userPosIds = new Set(posRes.rows.map(r => String(r.position_id)));
-        const userPosNames = new Set(posRes.rows.map(r => String(r.position_name).trim()));
+        const userPositions = posRes.rows;
+        const userPosIds = new Set(userPositions.map(r => String(r.position_id)));
+        const userPosNames = new Set(userPositions.map(r => String(r.position_name).trim()));
 
-        // 3. ดึงเมนูทั้งหมดที่เปิดใช้งานอยู่ (เฉพาะฝั่งหน้าบ้าน BANRAO_WEB)
+        // 3. ดึงเมนูทั้งหมดที่เปิดใช้งานใน App นี้
         const menuRes = await client.query(`
             SELECT 
-                mg.group_name, 
-                m.menu_name AS name, 
-                m.icon_name AS icon, 
+                m.menu_id,
+                mg.group_name,
+                m.menu_name AS name,
+                m.icon_name AS icon,
                 COALESCE(m.route_path, m.path) AS path,
                 m.selected_roles
             FROM sys_menus m
             JOIN sys_menu_groups mg ON m.group_id = mg.group_id
             WHERE m.is_active = TRUE
-              AND (m.app_code IS NULL OR m.app_code = 'BANRAO_WEB')
+              AND (m.app_code = $1 OR ($1 = 'BANRAO_WEB' AND m.app_code IS NULL))
             ORDER BY mg.display_order ASC NULLS LAST, m.display_order ASC NULLS LAST, m.menu_id ASC
-        `);
+        `, [appCode]);
 
-        // 4. กรองสิทธิ์การมองเห็นตาม selected_roles
-        const allowedMenus = menuRes.rows.filter((m) => {
-            // Super Admin เห็นทุกเมนูที่เปิดใช้งาน
-            if (isSuperAdmin) return true;
+        // 4. ดึงสิทธิ์ Matrix ทั้งหมดของ App นี้ที่เปิดใช้งาน
+        const matrixRes = await client.query(`
+            SELECT menu_id, org_id, dept_id, position_id,
+                   can_view, can_create, can_edit, can_delete, can_approve
+            FROM sys_menu_permissions
+            WHERE app_code = $1 AND is_active = TRUE
+        `, [appCode]);
 
-            const roles = Array.isArray(m.selected_roles) ? m.selected_roles : [];
+        const matrixRows = matrixRes.rows;
+        const permissionsMap = {}; // เก็บสิทธิ์แยกตาม path เช่น { "/my-places": { can_view: true, ... } }
+        const allowedMenus = [];
 
-            // ถ้าไม่ได้กำหนดตำแหน่งใดเลย ([]) = ทุกคน / ประชาชนพื้นฐานเห็นได้ทันที
-            if (roles.length === 0) return true;
+        for (const m of menuRes.rows) {
+            if (isSuperAdmin) {
+                const fullPerm = { can_view: true, can_create: true, can_edit: true, can_delete: true, can_approve: true };
+                permissionsMap[m.path] = fullPerm;
+                allowedMenus.push({ ...m, permissions: fullPerm });
+                continue;
+            }
 
-            // ถ้ามีการกำหนดตำแหน่งไว้ ให้เช็กว่าผู้ใช้มีตำแหน่งตรงกันหรือไม่ (รองรับทั้ง position_id และชื่อตำแหน่ง)
-            return roles.some((r) => userPosIds.has(String(r)) || userPosNames.has(String(r).trim()));
-        });
+            // คัดเฉพาะแถว Matrix ที่ตรงกับเมนูนี้และตรงกับ (หน่วยงาน / แผนก / ตำแหน่ง) ของผู้ใช้
+            const matchedRules = matrixRows.filter((rule) => {
+                if (rule.menu_id !== m.menu_id) return false;
+
+                // กฎส่วนกลาง (org=null, dept=null, pos=null) = ใช้ได้กับทุกคนรวมถึงประชาชนทั่วไป
+                if (rule.org_id === null && rule.dept_id === null && rule.position_id === null) {
+                    return true;
+                }
+
+                // เช็กเทียบกับตำแหน่งที่ผู้ใช้ถืออยู่
+                return userPositions.some((up) => {
+                    const orgMatch = rule.org_id === null || String(rule.org_id) === String(up.org_id);
+                    const deptMatch = rule.dept_id === null || String(rule.dept_id) === String(up.dept_id);
+                    const posMatch = rule.position_id === null || String(rule.position_id) === String(up.position_id);
+                    return orgMatch && deptMatch && posMatch;
+                });
+            });
+
+            if (matchedRules.length > 0) {
+                // รวมสิทธิ์แบบ OR (ถ้ามีหลายตำแหน่ง ให้ได้สิทธิ์สูงสุด)
+                const mergedPerm = matchedRules.reduce((acc, r) => ({
+                    can_view: acc.can_view || r.can_view,
+                    can_create: acc.can_create || r.can_create,
+                    can_edit: acc.can_edit || r.can_edit,
+                    can_delete: acc.can_delete || r.can_delete,
+                    can_approve: acc.can_approve || r.can_approve
+                }), { can_view: false, can_create: false, can_edit: false, can_delete: false, can_approve: false });
+
+                if (mergedPerm.can_view) {
+                    permissionsMap[m.path] = mergedPerm;
+                    allowedMenus.push({ ...m, permissions: mergedPerm });
+                }
+            } else {
+                // Fallback: ถ้ายังไม่ได้ตั้งค่าใน Matrix ให้ใช้สิทธิ์จาก selected_roles เดิม
+                const roles = Array.isArray(m.selected_roles) ? m.selected_roles : [];
+                const canSeeLegacy = roles.length === 0 || roles.some((r) => userPosIds.has(String(r)) || userPosNames.has(String(r).trim()));
+                if (canSeeLegacy) {
+                    const legacyPerm = { can_view: true, can_create: true, can_edit: true, can_delete: false, can_approve: false };
+                    permissionsMap[m.path] = legacyPerm;
+                    allowedMenus.push({ ...m, permissions: legacyPerm });
+                }
+            }
+        }
 
         // 5. จัดกลุ่มตาม group_name
         const groupedMenus = allowedMenus.reduce((acc, row) => {
             const group = acc.find(g => g.group_name === row.group_name);
-            const menuData = { name: row.name, icon: row.icon, path: row.path };
-            
-            if (group) {
-                group.menus.push(menuData);
-            } else {
-                acc.push({ group_name: row.group_name, menus: [menuData] });
-            }
+            const menuData = {
+                menu_id: row.menu_id,
+                name: row.name,
+                icon: row.icon,
+                path: row.path,
+                permissions: row.permissions
+            };
+            if (group) group.menus.push(menuData);
+            else acc.push({ group_name: row.group_name, menus: [menuData] });
             return acc;
         }, []);
 
-        res.json({ success: true, data: groupedMenus });
-
+        res.json({ success: true, data: groupedMenus, permissionsMap });
     } catch (error) {
-        console.error("Fetch Sidebar Menus Error:", error);
+        console.error('Fetch Sidebar Menus Error:', error);
         res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการดึงข้อมูลเมนู' });
     } finally {
         client.release();
