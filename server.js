@@ -3462,6 +3462,156 @@ app.put('/api/villages/:villageId', async (req, res) => {
 // ==========================================
 
 
+
+// =========================================================================
+// 📝 API ลงทะเบียนประชาชน (ยืนยันหมู่บ้านจากผู้ใหญ่บ้าน + ค้นหาบ้านเลขที่ + สิทธิ์ CITIZEN_FREE)
+// =========================================================================
+
+// 1. ดึงข้อมูลหมู่บ้านและข้อมูลผู้ใหญ่บ้าน (ชื่อ นามสกุล ชื่อเล่น รูปโปรไฟล์)
+app.get('/api/public/village-headman/:villageId', async (req, res) => {
+    try {
+        const result = await pgPool.query(`
+            SELECT 
+                v.village_id, v.village_no, v.village_name,
+                t.tambon_name_th, am.amphure_name_th, pr.province_name_th,
+                hp.first_name AS headman_first_name,
+                hp.last_name AS headman_last_name,
+                hp.nickname AS headman_nickname,
+                (
+                    SELECT hcpm.image_url
+                    FROM citizen_profiles_media hcpm
+                    WHERE hcpm.profile_id = ha.profile_id AND hcpm.is_active = true
+                    LIMIT 1
+                ) AS headman_image
+            FROM villages v
+            LEFT JOIN sys_tambons t ON v.tambon_id = t.tambon_id
+            LEFT JOIN sys_amphures am ON t.amphure_id = am.amphure_id
+            LEFT JOIN sys_provinces pr ON am.province_id = pr.province_id
+            LEFT JOIN user_accounts ha ON v.headman_account_id = ha.account_id
+            LEFT JOIN user_profiles hp ON ha.profile_id = hp.profile_id
+            WHERE v.village_id = $1
+        `, [req.params.villageId]);
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({ success: false, message: 'ไม่พบข้อมูลหมู่บ้านนี้' });
+        }
+
+        res.json({ success: true, data: result.rows[0] });
+    } catch (err) {
+        console.error('Get Village Headman Error:', err);
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// 2. ค้นหารายชื่อประชาชนจากบ้านเลขที่ (ไม่ส่งเลขบัตรประชาชน citizen_id ออกไป)
+app.get('/api/public/search-citizens-by-house', async (req, res) => {
+    const { house_no } = req.query;
+    if (!house_no || !house_no.trim()) {
+        return res.status(400).json({ success: false, message: 'กรุณากรอกบ้านเลขที่' });
+    }
+
+    try {
+        const result = await pgPool.query(`
+            SELECT 
+                p.profile_id,
+                p.first_name,
+                p.last_name,
+                p.nickname,
+                p.house_no,
+                CASE WHEN a.account_id IS NOT NULL THEN true ELSE false END AS already_registered
+            FROM user_profiles p
+            LEFT JOIN user_accounts a ON a.profile_id = p.profile_id
+            WHERE TRIM(p.house_no) = TRIM($1)
+            ORDER BY p.first_name ASC
+        `, [house_no.trim()]);
+
+        res.json({ success: true, data: result.rows });
+    } catch (err) {
+        console.error('Search Citizens By House Error:', err);
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// 3. บันทึกการลงทะเบียนประชาชน (เชื่อมกับ profile_id เดิม + ตั้งสิทธิ์เริ่มต้น CITIZEN_FREE)
+app.post('/api/register-citizen', async (req, res) => {
+    const { profile_id, village_id, username_phone, password, referred_by } = req.body;
+
+    if (!profile_id || !village_id || !username_phone || !password) {
+        return res.status(400).json({ success: false, message: 'กรุณากรอกข้อมูลให้ครบถ้วน' });
+    }
+
+    const cleanPhone = String(username_phone).trim().replace(/[^0-9]/g, '');
+    if (cleanPhone.length < 9) {
+        return res.status(400).json({ success: false, message: 'รูปแบบเบอร์โทรศัพท์ไม่ถูกต้อง' });
+    }
+
+    const client = await pgPool.connect();
+    try {
+        await client.query('BEGIN');
+
+        // 1. ตรวจสอบเบอร์โทรซ้ำ
+        const phoneCheck = await client.query(
+            `SELECT account_id FROM user_accounts WHERE username_phone = $1`,
+            [cleanPhone]
+        );
+        if (phoneCheck.rows.length > 0) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ success: false, message: 'เบอร์โทรศัพท์นี้ถูกลงทะเบียนในระบบแล้ว' });
+        }
+
+        // 2. ตรวจสอบว่าบุคคลนี้ (profile_id) เคยลงทะเบียนไปแล้วหรือยัง
+        const profileCheck = await client.query(
+            `SELECT account_id FROM user_accounts WHERE profile_id = $1`,
+            [profile_id]
+        );
+        if (profileCheck.rows.length > 0) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ success: false, message: 'รายชื่อนี้มีการลงทะเบียนบัญชีผู้ใช้งานไปแล้ว' });
+        }
+
+        // 3. เข้ารหัสรหัสผ่านและสร้างรหัสแนะนำส่วนตัว
+        const passwordHash = await bcrypt.hash(password, 10);
+        const myReferralCode = `BR${cleanPhone.slice(-6)}${Math.floor(10 + Math.random() * 90)}`;
+
+        // 4. บันทึกลง user_accounts (ตั้ง tier_code = CITIZEN_FREE เพื่อให้ได้สิทธิ์เมนูพื้นฐานตาม Matrix ทันที)
+        const insertRes = await client.query(`
+            INSERT INTO user_accounts (
+                profile_id,
+                username_phone,
+                password_hash,
+                village_id,
+                role,
+                tier_code,
+                community_score,
+                is_active,
+                referred_by,
+                referral_code
+            ) VALUES ($1, $2, $3, $4, 'CITIZEN', 'CITIZEN_FREE', 0, true, $5, $6)
+            RETURNING account_id, username_phone, village_id, tier_code, referral_code
+        `, [
+            profile_id,
+            cleanPhone,
+            passwordHash,
+            village_id,
+            referred_by ? String(referred_by).trim() : null,
+            myReferralCode
+        ]);
+
+        await client.query('COMMIT');
+        res.json({
+            success: true,
+            message: 'ลงทะเบียนสำเร็จ! คุณสามารถเข้าสู่ระบบด้วยเบอร์โทรศัพท์และรหัสผ่านได้ทันที',
+            data: insertRes.rows[0]
+        });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error('Register Citizen Error:', err);
+        res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการลงทะเบียน: ' + err.message });
+    } finally {
+        client.release();
+    }
+});
+
 // ==========================================
 
 //API ADMIN  เริ่ม
