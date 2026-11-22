@@ -4015,57 +4015,60 @@ app.delete('/api/admin/inspect-user/purge', async (req, res) => {
 // =========================================================================
 // 🧩 API จัดการกรุ๊ปเมนู & เมนูฝั่ง Frontend (สำหรับ Super Admin ใน emp.banrao.life)
 // =========================================================================
-
-// 1. ดึงข้อมูลทั้งหมด (กรุ๊ปเมนู + เมนูย่อย + รายชื่อตำแหน่งทั้งหมด)
+// 1. ดึงข้อมูลทั้งหมดจากฐานข้อมูลจริง (Apps + Groups + Menus + Positions)
 app.get('/api/admin/frontend-menus/overview', async (req, res) => {
     try {
-        const [groupsRes, menusRes, positionsRes] = await Promise.all([
-            pgPool.query(`SELECT * FROM sys_menu_groups ORDER BY display_order ASC NULLS LAST, group_id ASC`),
+        const [appsRes, groupsRes, menusRes, positionsRes] = await Promise.all([
+            pgPool.query(`SELECT * FROM sys_apps WHERE is_active = true ORDER BY created_at ASC`),
+            pgPool.query(`SELECT * FROM sys_menu_groups ORDER BY app_code ASC, display_order ASC NULLS LAST, group_id ASC`),
             pgPool.query(`
                 SELECT m.*, g.group_name
                 FROM sys_menus m
                 LEFT JOIN sys_menu_groups g ON m.group_id = g.group_id
-                ORDER BY g.display_order ASC NULLS LAST, m.display_order ASC NULLS LAST, m.menu_id ASC
+                ORDER BY m.app_code ASC, g.display_order ASC NULLS LAST, m.display_order ASC NULLS LAST, m.menu_id ASC
             `),
-            pgPool.query(`SELECT position_id, position_name, position_level FROM sys_positions ORDER BY position_id ASC`)
+            pgPool.query(`SELECT position_id, position_name, position_level FROM sys_positions WHERE is_active = true ORDER BY position_id ASC`)
         ]);
 
         res.json({
             success: true,
+            apps: appsRes.rows,
             groups: groupsRes.rows,
             menus: menusRes.rows,
             positions: positionsRes.rows
         });
     } catch (err) {
-        console.error('Frontend Menus Overview Error:', err);
+        console.error('Master Menus Overview Error:', err);
         res.status(500).json({ success: false, message: err.message });
     }
 });
 
-// 2. เพิ่มกรุ๊ปเมนูใหม่
+// 2. เพิ่มกรุ๊ปเมนูใหม่ (ระบุ app_code ได้)
 app.post('/api/admin/frontend-menu-groups', async (req, res) => {
-    const { group_name, display_order } = req.body;
-    if (!group_name || !group_name.trim()) {
-        return res.status(400).json({ success: false, message: 'กรุณาระบุชื่อกรุ๊ปเมนู' });
+    const { app_code, group_name, display_order } = req.body;
+    if (!app_code || !group_name || !group_name.trim()) {
+        return res.status(400).json({ success: false, message: 'กรุณาระบุแอปพลิเคชันและชื่อกรุ๊ปเมนู' });
     }
     try {
         const result = await pgPool.query(
-            `INSERT INTO sys_menu_groups (group_name, display_order) VALUES ($1, $2) RETURNING *`,
-            [group_name.trim(), Number(display_order) || 1]
+            `INSERT INTO sys_menu_groups (app_code, group_name, display_order, is_active)
+             VALUES ($1, $2, $3, true) RETURNING *`,
+            [app_code.trim().toUpperCase(), group_name.trim(), Number(display_order) || 1]
         );
         res.json({ success: true, message: 'เพิ่มกรุ๊ปเมนูเรียบร้อยแล้ว', data: result.rows[0] });
     } catch (err) {
         res.status(500).json({ success: false, message: err.message });
     }
 });
-
 // 3. แก้ไขกรุ๊ปเมนู
 app.put('/api/admin/frontend-menu-groups/:id', async (req, res) => {
-    const { group_name, display_order } = req.body;
+    const { app_code, group_name, display_order, is_active } = req.body;
     try {
         const result = await pgPool.query(
-            `UPDATE sys_menu_groups SET group_name = $1, display_order = $2 WHERE group_id = $3 RETURNING *`,
-            [group_name.trim(), Number(display_order) || 1, req.params.id]
+            `UPDATE sys_menu_groups
+             SET app_code = $1, group_name = $2, display_order = $3, is_active = $4
+             WHERE group_id = $5 RETURNING *`,
+            [app_code.trim().toUpperCase(), group_name.trim(), Number(display_order) || 1, is_active !== false, req.params.id]
         );
         res.json({ success: true, message: 'อัปเดตกรุ๊ปเมนูเรียบร้อยแล้ว', data: result.rows[0] });
     } catch (err) {
@@ -4073,34 +4076,34 @@ app.put('/api/admin/frontend-menu-groups/:id', async (req, res) => {
     }
 });
 
-// 4. ลบกรุ๊ปเมนู (เช็กก่อนว่ามีเมนูย่อยค้างอยู่หรือไม่)
-app.delete('/api/admin/frontend-menu-groups/:id', async (req, res) => {
+// 4. เปิด-ปิดสถานะกรุ๊ปเมนู (Soft Delete — ไม่ลบข้อมูลจริง)
+app.patch('/api/admin/frontend-menu-groups/:id/toggle', async (req, res) => {
+    const { is_active } = req.body;
     try {
-        const check = await pgPool.query(`SELECT COUNT(*) FROM sys_menus WHERE group_id = $1`, [req.params.id]);
-        if (Number(check.rows[0].count) > 0) {
-            return res.status(400).json({ success: false, message: 'ไม่สามารถลบได้ เนื่องจากยังมีเมนูย่อยอยู่ในกรุ๊ปนี้ กรุณาย้ายหรือลบเมนูย่อยก่อน' });
-        }
-        await pgPool.query(`DELETE FROM sys_menu_groups WHERE group_id = $1`, [req.params.id]);
-        res.json({ success: true, message: 'ลบกรุ๊ปเมนูเรียบร้อยแล้ว' });
+        const result = await pgPool.query(
+            `UPDATE sys_menu_groups SET is_active = $1 WHERE group_id = $2 RETURNING *`,
+            [Boolean(is_active), req.params.id]
+        );
+        res.json({ success: true, data: result.rows[0] });
     } catch (err) {
         res.status(500).json({ success: false, message: err.message });
     }
 });
 
-// 5. เพิ่มเมนูย่อยฝั่ง Frontend
+// 5. เพิ่มเมนูย่อยใหม่ (ระบุ app_code ได้)
 app.post('/api/admin/frontend-menus', async (req, res) => {
-    const { group_id, menu_name, route_path, icon_name, display_order, is_active, selected_roles } = req.body;
-    if (!group_id || !menu_name || !route_path) {
-        return res.status(400).json({ success: false, message: 'กรุณากรอกกรุ๊ปเมนู ชื่อเมนู และเส้นทาง (Route Path) ให้ครบถ้วน' });
+    const { app_code, group_id, menu_name, route_path, icon_name, display_order, is_active, selected_roles } = req.body;
+    if (!app_code || !group_id || !menu_name || !route_path) {
+        return res.status(400).json({ success: false, message: 'กรุณากรอกข้อมูลให้ครบถ้วน (แอป, กรุ๊ปเมนู, ชื่อเมนู, เส้นทาง)' });
     }
     try {
         const cleanPath = route_path.trim();
         const rolesJson = JSON.stringify(Array.isArray(selected_roles) ? selected_roles : []);
         const result = await pgPool.query(
-            `INSERT INTO sys_menus (group_id, menu_name, route_path, path, icon_name, display_order, is_active, selected_roles)
-             VALUES ($1, $2, $3, $3, $4, $5, $6, $7::jsonb)
+            `INSERT INTO sys_menus (app_code, group_id, menu_name, route_path, path, icon_name, display_order, is_active, selected_roles)
+             VALUES ($1, $2, $3, $4, $4, $5, $6, $7, $8::jsonb)
              RETURNING *`,
-            [Number(group_id), menu_name.trim(), cleanPath, icon_name || 'Activity', Number(display_order) || 1, is_active !== false, rolesJson]
+            [app_code.trim().toUpperCase(), Number(group_id), menu_name.trim(), cleanPath, icon_name || 'Activity', Number(display_order) || 1, is_active !== false, rolesJson]
         );
         res.json({ success: true, message: 'เพิ่มเมนูย่อยเรียบร้อยแล้ว', data: result.rows[0] });
     } catch (err) {
@@ -4108,25 +4111,26 @@ app.post('/api/admin/frontend-menus', async (req, res) => {
     }
 });
 
-// 6. แก้ไขเมนูย่อยฝั่ง Frontend
+// 6. แก้ไขเมนูย่อย
 app.put('/api/admin/frontend-menus/:id', async (req, res) => {
-    const { group_id, menu_name, route_path, icon_name, display_order, is_active, selected_roles } = req.body;
+    const { app_code, group_id, menu_name, route_path, icon_name, display_order, is_active, selected_roles } = req.body;
     try {
         const cleanPath = route_path.trim();
         const rolesJson = JSON.stringify(Array.isArray(selected_roles) ? selected_roles : []);
         const result = await pgPool.query(
             `UPDATE sys_menus
-             SET group_id = $1,
-                 menu_name = $2,
-                 route_path = $3,
-                 path = $3,
-                 icon_name = $4,
-                 display_order = $5,
-                 is_active = $6,
-                 selected_roles = $7::jsonb
-             WHERE menu_id = $8
+             SET app_code = $1,
+                 group_id = $2,
+                 menu_name = $3,
+                 route_path = $4,
+                 path = $4,
+                 icon_name = $5,
+                 display_order = $6,
+                 is_active = $7,
+                 selected_roles = $8::jsonb
+             WHERE menu_id = $9
              RETURNING *`,
-            [Number(group_id), menu_name.trim(), cleanPath, icon_name || 'Activity', Number(display_order) || 1, is_active !== false, rolesJson, req.params.id]
+            [app_code.trim().toUpperCase(), Number(group_id), menu_name.trim(), cleanPath, icon_name || 'Activity', Number(display_order) || 1, is_active !== false, rolesJson, req.params.id]
         );
         res.json({ success: true, message: 'อัปเดตเมนูเรียบร้อยแล้ว', data: result.rows[0] });
     } catch (err) {
@@ -4134,7 +4138,7 @@ app.put('/api/admin/frontend-menus/:id', async (req, res) => {
     }
 });
 
-// 7. เปิด-ปิดการใช้งานเมนูอย่างรวดเร็ว (Toggle Active)
+// 7. เปิด-ปิดสถานะเมนูย่อย (Soft Delete — ไม่ลบข้อมูลจริง)
 app.patch('/api/admin/frontend-menus/:id/toggle', async (req, res) => {
     const { is_active } = req.body;
     try {
@@ -4148,15 +4152,6 @@ app.patch('/api/admin/frontend-menus/:id/toggle', async (req, res) => {
     }
 });
 
-// 8. ลบเมนูย่อย
-app.delete('/api/admin/frontend-menus/:id', async (req, res) => {
-    try {
-        await pgPool.query(`DELETE FROM sys_menus WHERE menu_id = $1`, [req.params.id]);
-        res.json({ success: true, message: 'ลบเมนูเรียบร้อยแล้ว' });
-    } catch (err) {
-        res.status(500).json({ success: false, message: err.message });
-    }
-});
 //---------------------------------------------------------
 //สิ้นสุดใช้ชั่วคราว 
 //---------------------------------------------------------
