@@ -3736,34 +3736,120 @@ app.delete('/api/admin/positions/:positionId', verifyAdminToken, async (req, res
     }
 });
 
-
 // ==========================================
-// 1. ดึงเมนูที่ผู้ใช้ปัจจุบันมีสิทธิ์เห็น (สำหรับ Sidebar)
+// 1. ดึงเมนูหลังบ้านตามสิทธิ์ Matrix 4 มิติ (EMP_ADMIN) + จัดกลุ่มตามกรุ๊ปเมนู
 // ==========================================
 app.get('/api/admin/my-menus', verifyAdminToken, async (req, res) => {
+    const client = await pgPool.connect();
     try {
         const user = req.adminUser;
-        // Super Admin เห็นทุกเมนูที่เปิดใช้งาน
-        if (user.is_super_admin) {
-            const result = await pgPool.query(
-                `SELECT * FROM admin_menus WHERE is_active = true ORDER BY display_order ASC, menu_id ASC`
-            );
-            return res.json({ success: true, data: result.rows });
-        }
+        const appCode = 'EMP_ADMIN';
+        const isSuperAdmin = Boolean(user.is_super_admin);
 
-        // พนักงานทั่วไป เห็นเฉพาะเมนูที่ถูกกำหนดสิทธิ์ไว้ใน admin_user_menus
-        const result = await pgPool.query(`
-            SELECT m.*
-            FROM admin_menus m
-            JOIN admin_user_menus um ON m.menu_id = um.menu_id
-            WHERE um.account_id = $1 AND m.is_active = true
-            ORDER BY m.display_order ASC, m.menu_id ASC
+        // 1. ดึงตำแหน่ง + หน่วยงาน + แผนก ที่ Active อยู่จริงของพนักงานคนนี้
+        const posRes = await client.query(`
+            SELECT 
+                sp.position_id,
+                COALESCE(up.org_id, sp.org_id) AS org_id,
+                COALESCE(up.dept_id, sp.dept_id) AS dept_id
+            FROM user_positions up
+            JOIN sys_positions sp ON up.position_id = sp.position_id
+            WHERE up.account_id = $1
+              AND up.is_active = TRUE
+              AND (up.end_date IS NULL OR up.end_date >= CURRENT_DATE)
         `, [user.account_id]);
 
-        res.json({ success: true, data: result.rows });
+        const userPositions = posRes.rows;
+
+        // 2. ดึงเมนูหลังบ้านทั้งหมดที่เปิดใช้งานอยู่ (ทั้งเมนูและกรุ๊ปต้อง is_active = true)
+        const menuRes = await client.query(`
+            SELECT 
+                m.menu_id,
+                m.menu_name,
+                COALESCE(m.route_path, m.path) AS route_path,
+                m.icon_name,
+                m.display_order,
+                mg.group_id,
+                COALESCE(mg.group_name, 'ระบบจัดการหลังบ้าน') AS group_name,
+                mg.display_order AS group_order
+            FROM sys_menus m
+            JOIN sys_menu_groups mg ON m.group_id = mg.group_id
+            WHERE m.app_code = $1
+              AND m.is_active = TRUE
+              AND COALESCE(mg.is_active, TRUE) = TRUE
+            ORDER BY mg.display_order ASC NULLS LAST, m.display_order ASC NULLS LAST, m.menu_id ASC
+        `, [appCode]);
+
+        // 3. ดึงสิทธิ์ Matrix ทั้งหมดของ EMP_ADMIN
+        const matrixRes = await client.query(`
+            SELECT menu_id, org_id, dept_id, position_id,
+                   can_view, can_create, can_edit, can_delete, can_approve
+            FROM sys_menu_permissions
+            WHERE app_code = $1 AND is_active = TRUE
+        `, [appCode]);
+
+        const matrixRows = matrixRes.rows;
+        const permissionsMap = {};
+        const allowedMenus = [];
+
+        for (const m of menuRes.rows) {
+            if (isSuperAdmin) {
+                const fullPerm = { can_view: true, can_create: true, can_edit: true, can_delete: true, can_approve: true };
+                permissionsMap[m.route_path] = fullPerm;
+                allowedMenus.push({ ...m, permissions: fullPerm });
+                continue;
+            }
+
+            // คัดเฉพาะกฎ Matrix ที่ตรงกับเมนูนี้ และตรงกับ (หน่วยงาน / แผนก / ตำแหน่ง) ของพนักงาน
+            const matchedRules = matrixRows.filter((rule) => {
+                if (rule.menu_id !== m.menu_id) return false;
+                if (rule.org_id === null && rule.dept_id === null && rule.position_id === null) return true;
+
+                return userPositions.some((up) => {
+                    const orgMatch = rule.org_id === null || String(rule.org_id) === String(up.org_id);
+                    const deptMatch = rule.dept_id === null || String(rule.dept_id) === String(up.dept_id);
+                    const posMatch = rule.position_id === null || String(rule.position_id) === String(up.position_id);
+                    return orgMatch && deptMatch && posMatch;
+                });
+            });
+
+            if (matchedRules.length > 0) {
+                const mergedPerm = matchedRules.reduce((acc, r) => ({
+                    can_view: acc.can_view || r.can_view,
+                    can_create: acc.can_create || r.can_create,
+                    can_edit: acc.can_edit || r.can_edit,
+                    can_delete: acc.can_delete || r.can_delete,
+                    can_approve: acc.can_approve || r.can_approve
+                }), { can_view: false, can_create: false, can_edit: false, can_delete: false, can_approve: false });
+
+                if (mergedPerm.can_view) {
+                    permissionsMap[m.route_path] = mergedPerm;
+                    allowedMenus.push({ ...m, permissions: mergedPerm });
+                }
+            }
+        }
+
+        // 4. จัดกลุ่มเมนูตาม group_name
+        const groupedMenus = allowedMenus.reduce((acc, row) => {
+            const group = acc.find((g) => g.group_name === row.group_name);
+            const item = {
+                menu_id: row.menu_id,
+                menu_name: row.menu_name,
+                route_path: row.route_path,
+                icon_name: row.icon_name,
+                permissions: row.permissions
+            };
+            if (group) group.menus.push(item);
+            else acc.push({ group_id: row.group_id, group_name: row.group_name, menus: [item] });
+            return acc;
+        }, []);
+
+        res.json({ success: true, data: groupedMenus, permissionsMap });
     } catch (err) {
         console.error('Get My Menus Error:', err);
         res.status(500).json({ success: false, message: err.message });
+    } finally {
+        client.release();
     }
 });
 
