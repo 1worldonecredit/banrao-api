@@ -4420,14 +4420,73 @@ app.get('/api/admin/permission-matrix', async (req, res) => {
         res.status(500).json({ success: false, message: err.message });
     }
 });
+// =========================================================================
+// 🛡️ เฟส 3 (ขั้นที่ 2): API กำหนดสิทธิ์แบบ Matrix (รองรับทั้ง Tier ประชาชน/ธุรกิจ และ Org->Dept->Pos)
+// =========================================================================
 
-// 2. บันทึกสิทธิ์ Matrix แบบยกชุด (Transaction ปลอดภัย 100%)
+// 0. ดึงรายการระดับผู้ใช้งาน / แพ็กเกจ (Tiers)
+app.get('/api/admin/user-tiers', async (req, res) => {
+    try {
+        const result = await pgPool.query(
+            `SELECT * FROM sys_user_tiers WHERE is_active = true ORDER BY display_order ASC, tier_code ASC`
+        );
+        res.json({ success: true, data: result.rows });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// 1. ดึงรายการเมนูของ App พร้อมสิทธิ์ Matrix (รองรับ tier_code + org/dept/pos)
+app.get('/api/admin/permission-matrix', async (req, res) => {
+    const appCode = (req.query.app_code || 'BANRAO_WEB').trim().toUpperCase();
+    const orgId = req.query.org_id ? Number(req.query.org_id) : null;
+    const deptId = req.query.dept_id ? Number(req.query.dept_id) : null;
+    const posId = req.query.position_id ? Number(req.query.position_id) : null;
+    const tierCode = req.query.tier_code ? req.query.tier_code.trim().toUpperCase() : null;
+
+    try {
+        const result = await pgPool.query(`
+            SELECT 
+                m.menu_id,
+                m.menu_name,
+                COALESCE(m.route_path, m.path) AS route_path,
+                m.is_active AS menu_active,
+                mg.group_id,
+                COALESCE(mg.group_name, 'เมนูทั่วไป') AS group_name,
+                COALESCE(p.can_view, false) AS can_view,
+                COALESCE(p.can_create, false) AS can_create,
+                COALESCE(p.can_edit, false) AS can_edit,
+                COALESCE(p.can_delete, false) AS can_delete,
+                COALESCE(p.can_approve, false) AS can_approve
+            FROM sys_menus m
+            LEFT JOIN sys_menu_groups mg ON m.group_id = mg.group_id
+            LEFT JOIN sys_menu_permissions p 
+                ON p.menu_id = m.menu_id
+                AND p.app_code = $1
+                AND p.org_id IS NOT DISTINCT FROM $2
+                AND p.dept_id IS NOT DISTINCT FROM $3
+                AND p.position_id IS NOT DISTINCT FROM $4
+                AND p.tier_code IS NOT DISTINCT FROM $5
+                AND p.is_active = true
+            WHERE (m.app_code = $1 OR ($1 = 'BANRAO_WEB' AND m.app_code IS NULL))
+            ORDER BY mg.display_order ASC NULLS LAST, m.display_order ASC NULLS LAST, m.menu_id ASC
+        `, [appCode, orgId, deptId, posId, tierCode]);
+
+        res.json({ success: true, data: result.rows });
+    } catch (err) {
+        console.error('Get Permission Matrix Error:', err);
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// 2. บันทึกสิทธิ์ Matrix แบบยกชุด
 app.post('/api/admin/permission-matrix/save', async (req, res) => {
-    const { app_code, org_id, dept_id, position_id, permissions } = req.body;
+    const { app_code, org_id, dept_id, position_id, tier_code, permissions } = req.body;
     const appCode = (app_code || 'BANRAO_WEB').trim().toUpperCase();
     const orgId = org_id ? Number(org_id) : null;
     const deptId = dept_id ? Number(dept_id) : null;
     const posId = position_id ? Number(position_id) : null;
+    const tierCode = tier_code ? tier_code.trim().toUpperCase() : null;
 
     if (!Array.isArray(permissions)) {
         return res.status(400).json({ success: false, message: 'รูปแบบข้อมูลสิทธิ์ไม่ถูกต้อง' });
@@ -4437,16 +4496,15 @@ app.post('/api/admin/permission-matrix/save', async (req, res) => {
     try {
         await client.query('BEGIN');
 
-        // ลบสิทธิ์เดิมของเงื่อนไข (App + Org + Dept + Pos) ชุดนี้ออกก่อน
         await client.query(`
             DELETE FROM sys_menu_permissions
             WHERE app_code = $1
               AND org_id IS NOT DISTINCT FROM $2
               AND dept_id IS NOT DISTINCT FROM $3
               AND position_id IS NOT DISTINCT FROM $4
-        `, [appCode, orgId, deptId, posId]);
+              AND tier_code IS NOT DISTINCT FROM $5
+        `, [appCode, orgId, deptId, posId, tierCode]);
 
-        // บันทึกเฉพาะเมนูที่มีการติ๊กอย่างน้อย 1 สิทธิ์
         let savedCount = 0;
         for (const item of permissions) {
             const hasAny = item.can_view || item.can_create || item.can_edit || item.can_delete || item.can_approve;
@@ -4454,15 +4512,16 @@ app.post('/api/admin/permission-matrix/save', async (req, res) => {
 
             await client.query(`
                 INSERT INTO sys_menu_permissions (
-                    app_code, menu_id, org_id, dept_id, position_id,
+                    app_code, menu_id, org_id, dept_id, position_id, tier_code,
                     can_view, can_create, can_edit, can_delete, can_approve, is_active
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, true)
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, true)
             `, [
                 appCode,
                 Number(item.menu_id),
                 orgId,
                 deptId,
                 posId,
+                tierCode,
                 Boolean(item.can_view),
                 Boolean(item.can_create),
                 Boolean(item.can_edit),
