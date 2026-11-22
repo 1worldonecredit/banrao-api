@@ -3564,9 +3564,11 @@ app.post('/api/register-citizen', async (req, res) => {
         // 2. ดึงข้อมูลสมาชิกจาก household_members + households
         const memberRes = await client.query(`
             SELECT hm.*, h.house_no, h.village_id,
+                   COALESCE(v.tambon_id::text, '000000') AS area_code,
                    (SELECT COUNT(*) FROM household_members WHERE household_id = h.household_id) AS member_count
             FROM household_members hm
             JOIN households h ON hm.household_id = h.household_id
+            LEFT JOIN villages v ON h.village_id = v.village_id
             WHERE hm.member_id = $1
         `, [member_id]);
 
@@ -3616,16 +3618,17 @@ app.post('/api/register-citizen', async (req, res) => {
 
         const insertAcc = await client.query(`
             INSERT INTO user_accounts (
-                profile_id, username_phone, password_hash, village_id,
+                profile_id, username_phone, password_hash, village_id, area_code,
                 household_member_count, role, tier_code, community_score,
                 is_active, referred_by, referral_code
-            ) VALUES ($1, $2, $3, $4, $5, 'CITIZEN', 'CITIZEN_FREE', 0, true, $6, $7)
+            ) VALUES ($1, $2, $3, $4, $5, $6, 'CITIZEN', 'CITIZEN_FREE', 0, true, $7, $8)
             RETURNING account_id, username_phone, village_id, tier_code, referral_code
         `, [
             profileId,
             cleanPhone,
             passwordHash,
             member.village_id || village_id,
+            member.area_code || '000000',
             Number(member.member_count) || 1,
             referred_by ? String(referred_by).trim() : null,
             myReferralCode
