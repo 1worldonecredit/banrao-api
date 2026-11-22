@@ -772,7 +772,8 @@ app.post('/api/login', async (req, res) => {
                 scope_id: primaryPos?.scope_id || null
             },
             process.env.JWT_SECRET || 'banrao_secret_key',
-            { expiresIn: '1d' }
+            { expiresIn: '5d' } //หมดอายุทุก 5 วัน
+            { expiresIn: '1d' } //หมดอายุทุกวัน
         );
 
         const daysTh = ['อาทิตย์', 'จันทร์', 'อังคาร', 'พุธ', 'พฤหัสบดี', 'ศุกร์', 'เสาร์'];
