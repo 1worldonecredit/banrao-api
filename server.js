@@ -3503,27 +3503,29 @@ app.get('/api/public/village-headman/:villageId', async (req, res) => {
     }
 });
 
-// 2. ค้นหารายชื่อประชาชนจากบ้านเลขที่ (ไม่ส่งเลขบัตรประชาชน citizen_id ออกไป)
+// 2. ค้นหารายชื่อประชาชนจาก หมู่บ้าน + บ้านเลขที่ (ดึงจาก households + household_members และไม่ส่งเลขบัตร/พาสปอร์ต)
 app.get('/api/public/search-citizens-by-house', async (req, res) => {
-    const { house_no } = req.query;
-    if (!house_no || !house_no.trim()) {
-        return res.status(400).json({ success: false, message: 'กรุณากรอกบ้านเลขที่' });
+    const { village_id, house_no } = req.query;
+    if (!village_id || !house_no || !house_no.trim()) {
+        return res.status(400).json({ success: false, message: 'กรุณาเลือกหมู่บ้านและกรอกบ้านเลขที่' });
     }
 
     try {
         const result = await pgPool.query(`
             SELECT 
-                p.profile_id,
-                p.first_name,
-                p.last_name,
-                p.nickname,
-                p.house_no,
-                CASE WHEN a.account_id IS NOT NULL THEN true ELSE false END AS already_registered
-            FROM user_profiles p
-            LEFT JOIN user_accounts a ON a.profile_id = p.profile_id
-            WHERE TRIM(p.house_no) = TRIM($1)
-            ORDER BY p.first_name ASC
-        `, [house_no.trim()]);
+                hm.member_id,
+                hm.first_name,
+                hm.last_name,
+                hm.nickname,
+                h.house_no,
+                CASE WHEN hm.account_id IS NOT NULL THEN true ELSE false END AS already_registered
+            FROM household_members hm
+            JOIN households h ON hm.household_id = h.household_id
+            WHERE h.village_id = $1
+              AND TRIM(h.house_no) = TRIM($2)
+              AND COALESCE(hm.status, 'ACTIVE') = 'ACTIVE'
+            ORDER BY hm.is_head_of_household DESC, hm.first_name ASC
+        `, [village_id, house_no.trim()]);
 
         res.json({ success: true, data: result.rows });
     } catch (err) {
@@ -3532,11 +3534,11 @@ app.get('/api/public/search-citizens-by-house', async (req, res) => {
     }
 });
 
-// 3. บันทึกการลงทะเบียนประชาชน (เชื่อมกับ profile_id เดิม + ตั้งสิทธิ์เริ่มต้น CITIZEN_FREE)
+// 3. บันทึกการลงทะเบียนประชาชน (สร้าง user_profiles + user_accounts + ผูกกลับ household_members.account_id)
 app.post('/api/register-citizen', async (req, res) => {
-    const { profile_id, village_id, username_phone, password, referred_by } = req.body;
+    const { member_id, village_id, username_phone, password, referred_by } = req.body;
 
-    if (!profile_id || !village_id || !username_phone || !password) {
+    if (!member_id || !village_id || !username_phone || !password) {
         return res.status(400).json({ success: false, message: 'กรุณากรอกข้อมูลให้ครบถ้วน' });
     }
 
@@ -3559,49 +3561,89 @@ app.post('/api/register-citizen', async (req, res) => {
             return res.status(400).json({ success: false, message: 'เบอร์โทรศัพท์นี้ถูกลงทะเบียนในระบบแล้ว' });
         }
 
-        // 2. ตรวจสอบว่าบุคคลนี้ (profile_id) เคยลงทะเบียนไปแล้วหรือยัง
-        const profileCheck = await client.query(
-            `SELECT account_id FROM user_accounts WHERE profile_id = $1`,
-            [profile_id]
-        );
-        if (profileCheck.rows.length > 0) {
+        // 2. ดึงข้อมูลสมาชิกจาก household_members + households
+        const memberRes = await client.query(`
+            SELECT hm.*, h.house_no, h.village_id,
+                   (SELECT COUNT(*) FROM household_members WHERE household_id = h.household_id) AS member_count
+            FROM household_members hm
+            JOIN households h ON hm.household_id = h.household_id
+            WHERE hm.member_id = $1
+        `, [member_id]);
+
+        if (memberRes.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ success: false, message: 'ไม่พบข้อมูลรายชื่อในทะเบียนบ้าน' });
+        }
+
+        const member = memberRes.rows[0];
+        if (member.account_id) {
             await client.query('ROLLBACK');
             return res.status(400).json({ success: false, message: 'รายชื่อนี้มีการลงทะเบียนบัญชีผู้ใช้งานไปแล้ว' });
         }
 
-        // 3. เข้ารหัสรหัสผ่านและสร้างรหัสแนะนำส่วนตัว
+        // 3. ค้นหาหรือสร้าง user_profiles (ป้องกันซ้ำจาก citizen_id)
+        let profileId = null;
+        if (member.citizen_id && member.citizen_id.trim()) {
+            const existProfile = await client.query(
+                `SELECT profile_id FROM user_profiles WHERE citizen_id = $1 LIMIT 1`,
+                [member.citizen_id.trim()]
+            );
+            if (existProfile.rows.length > 0) {
+                profileId = existProfile.rows[0].profile_id;
+            }
+        }
+
+        if (!profileId) {
+            const newProfile = await client.query(`
+                INSERT INTO user_profiles (first_name, last_name, nickname, dob, citizen_id, gender, house_no)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                RETURNING profile_id
+            `, [
+                member.first_name,
+                member.last_name,
+                member.nickname || null,
+                member.date_of_birth || null,
+                member.citizen_id || member.passport_no || null,
+                member.gender || null,
+                member.house_no || null
+            ]);
+            profileId = newProfile.rows[0].profile_id;
+        }
+
+        // 4. สร้างบัญชีใน user_accounts (ผูกสิทธิ์เริ่มต้น CITIZEN_FREE)
         const passwordHash = await bcrypt.hash(password, 10);
         const myReferralCode = `BR${cleanPhone.slice(-6)}${Math.floor(10 + Math.random() * 90)}`;
 
-        // 4. บันทึกลง user_accounts (ตั้ง tier_code = CITIZEN_FREE เพื่อให้ได้สิทธิ์เมนูพื้นฐานตาม Matrix ทันที)
-        const insertRes = await client.query(`
+        const insertAcc = await client.query(`
             INSERT INTO user_accounts (
-                profile_id,
-                username_phone,
-                password_hash,
-                village_id,
-                role,
-                tier_code,
-                community_score,
-                is_active,
-                referred_by,
-                referral_code
-            ) VALUES ($1, $2, $3, $4, 'CITIZEN', 'CITIZEN_FREE', 0, true, $5, $6)
+                profile_id, username_phone, password_hash, village_id,
+                household_member_count, role, tier_code, community_score,
+                is_active, referred_by, referral_code
+            ) VALUES ($1, $2, $3, $4, $5, 'CITIZEN', 'CITIZEN_FREE', 0, true, $6, $7)
             RETURNING account_id, username_phone, village_id, tier_code, referral_code
         `, [
-            profile_id,
+            profileId,
             cleanPhone,
             passwordHash,
-            village_id,
+            member.village_id || village_id,
+            Number(member.member_count) || 1,
             referred_by ? String(referred_by).trim() : null,
             myReferralCode
         ]);
+
+        const newAccountId = insertAcc.rows[0].account_id;
+
+        // 5. ผูก account_id กลับไปที่ household_members เพื่อให้รู้ว่าลงทะเบียนแล้ว
+        await client.query(
+            `UPDATE household_members SET account_id = $1 WHERE member_id = $2`,
+            [newAccountId, member_id]
+        );
 
         await client.query('COMMIT');
         res.json({
             success: true,
             message: 'ลงทะเบียนสำเร็จ! คุณสามารถเข้าสู่ระบบด้วยเบอร์โทรศัพท์และรหัสผ่านได้ทันที',
-            data: insertRes.rows[0]
+            data: insertAcc.rows[0]
         });
     } catch (err) {
         await client.query('ROLLBACK');
