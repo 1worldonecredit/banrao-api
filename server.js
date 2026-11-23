@@ -905,6 +905,57 @@ app.post('/api/stories/:storyId/comments', async (req, res) => {
 });
 
 
+// =========================================================================
+// 🔔 API ระบบแจ้งเตือน (ดึงรายการ / อ่านแล้ว 1 รายการ / อ่านแล้วทั้งหมด)
+// =========================================================================
+app.get('/api/notifications/:accountId', async (req, res) => {
+    const { accountId } = req.params;
+    try {
+        const result = await pgPool.query(`
+            SELECT n.*,
+                   (
+                       SELECT cpm.image_url FROM citizen_profiles_media cpm
+                       JOIN user_accounts a ON cpm.profile_id = a.profile_id
+                       WHERE a.account_id = n.sender_id AND cpm.is_active = true
+                       LIMIT 1
+                   ) AS sender_image
+            FROM user_notifications n
+            WHERE n.recipient_id = $1
+            ORDER BY n.created_at DESC
+            LIMIT 30
+        `, [accountId]);
+
+        const unreadCount = result.rows.filter((r) => !r.is_read).length;
+        res.json({ success: true, unread_count: unreadCount, data: result.rows });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+app.patch('/api/notifications/:notificationId/read', async (req, res) => {
+    try {
+        await pgPool.query(
+            `UPDATE user_notifications SET is_read = true WHERE notification_id = $1`,
+            [req.params.notificationId]
+        );
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+app.patch('/api/notifications/read-all/:accountId', async (req, res) => {
+    try {
+        await pgPool.query(
+            `UPDATE user_notifications SET is_read = true WHERE recipient_id = $1 AND is_read = false`,
+            [req.params.accountId]
+        );
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
 // ลบคอมเมนต์แบบ Soft Delete (ไม่ลบจริง)
 app.patch('/api/stories/comments/:commentId/delete', async (req, res) => {
     try {
