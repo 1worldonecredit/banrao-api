@@ -817,31 +817,89 @@ app.get('/api/stories/:storyId/comments', async (req, res) => {
     }
 });
 
-
 app.post('/api/stories/:storyId/comments', async (req, res) => {
     const { account_id, comment_text, parent_comment_id } = req.body;
+    const { storyId } = req.params;
     if (!comment_text || !comment_text.trim()) {
         return res.status(400).json({ success: false, message: 'กรุณาพิมพ์ข้อความคอมเมนต์' });
     }
     try {
-        // เช็กว่าโดนเจ้าของโพสต์บล็อกอยู่หรือไม่
-        const ownerRes = await pgPool.query(`SELECT account_id FROM user_stories WHERE story_id = $1`, [req.params.storyId]);
-        if (ownerRes.rows.length > 0) {
-            const blockCheck = await pgPool.query(
-                `SELECT 1 FROM user_blocks WHERE blocker_id = $1 AND blocked_id = $2`,
-                [ownerRes.rows[0].account_id, account_id]
+        // 1. เช็กเจ้าของโพสต์และตรวจสอบการบล็อก
+        const ownerRes = await pgPool.query(
+            `SELECT account_id, COALESCE(title, 'โพสต์ของคุณ') AS story_title FROM user_stories WHERE story_id = $1`,
+            [storyId]
+        );
+        if (ownerRes.rows.length === 0) {
+            return res.status(404).json({ success: false, message: 'ไม่พบโพสต์นี้' });
+        }
+        const storyOwnerId = ownerRes.rows[0].account_id;
+        const storyTitle = ownerRes.rows[0].story_title;
+
+        const blockCheck = await pgPool.query(
+            `SELECT 1 FROM user_blocks WHERE blocker_id = $1 AND blocked_id = $2`,
+            [storyOwnerId, account_id]
+        );
+        if (blockCheck.rows.length > 0) {
+            return res.status(403).json({ success: false, message: 'คุณไม่สามารถแสดงความคิดเห็นในโพสต์นี้ได้' });
+        }
+
+        // 2. บันทึกคอมเมนต์ลงฐานข้อมูล
+        await pgPool.query(
+            `INSERT INTO story_comments (story_id, account_id, parent_comment_id, comment_text, is_active) VALUES ($1, $2, $3, $4, true)`,
+            [storyId, account_id, parent_comment_id || null, comment_text.trim()]
+        );
+
+        // 3. ดึงชื่อผู้คอมเมนต์เพื่อนำไปสร้างข้อความแจ้งเตือน (และอ่านออกเสียง)
+        const senderRes = await pgPool.query(`
+            SELECT COALESCE(NULLIF(p.nickname, ''), p.first_name, 'เพื่อนในชุมชน') AS sender_name
+            FROM user_accounts a
+            LEFT JOIN user_profiles p ON a.profile_id = p.profile_id
+            WHERE a.account_id = $1
+        `, [account_id]);
+        const senderName = senderRes.rows[0]?.sender_name || 'เพื่อนในชุมชน';
+        const cleanText = comment_text.trim().slice(0, 80);
+
+        const notifiedUsers = new Set();
+
+        // 4. กรณีเป็นการ "ตอบกลับคอมเมนต์" → แจ้งเตือนเจ้าของคอมเมนต์ต้นทาง
+        if (parent_comment_id) {
+            const parentRes = await pgPool.query(
+                `SELECT account_id FROM story_comments WHERE comment_id = $1`,
+                [parent_comment_id]
             );
-            if (blockCheck.rows.length > 0) {
-                return res.status(403).json({ success: false, message: 'คุณไม่สามารถแสดงความคิดเห็นในโพสต์นี้ได้' });
+            const parentAuthorId = parentRes.rows[0]?.account_id;
+            if (parentAuthorId && String(parentAuthorId) !== String(account_id)) {
+                await pgPool.query(`
+                    INSERT INTO user_notifications (recipient_id, sender_id, type, reference_id, title, message)
+                    VALUES ($1, $2, 'STORY_REPLY', $3, $4, $5)
+                `, [
+                    parentAuthorId,
+                    account_id,
+                    storyId,
+                    `${senderName} ตอบกลับคอมเมนต์ของคุณ`,
+                    `${senderName} ตอบกลับคุณว่า ${cleanText}`
+                ]);
+                notifiedUsers.add(String(parentAuthorId));
             }
         }
 
-        await pgPool.query(
-            `INSERT INTO story_comments (story_id, account_id, parent_comment_id, comment_text, is_active) VALUES ($1, $2, $3, $4, true)`,
-            [req.params.storyId, account_id, parent_comment_id || null, comment_text.trim()]
-        );
+        // 5. แจ้งเตือนเจ้าของโพสต์ (ถ้าไม่ใช่คนคอมเมนต์เอง และยังไม่ถูกแจ้งเตือนในข้อ 4)
+        if (String(storyOwnerId) !== String(account_id) && !notifiedUsers.has(String(storyOwnerId))) {
+            await pgPool.query(`
+                INSERT INTO user_notifications (recipient_id, sender_id, type, reference_id, title, message)
+                VALUES ($1, $2, 'STORY_COMMENT', $3, $4, $5)
+            `, [
+                storyOwnerId,
+                account_id,
+                storyId,
+                `${senderName} คอมเมนต์ใน "${storyTitle}"`,
+                `${senderName} แสดงความคิดเห็นว่า ${cleanText}`
+            ]);
+        }
+
         res.json({ success: true });
     } catch (err) {
+        console.error('Post Comment Error:', err);
         res.status(500).json({ success: false, message: err.message });
     }
 });
