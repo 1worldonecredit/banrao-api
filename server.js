@@ -666,6 +666,193 @@ app.delete('/api/user/profile-image/:accountId', async (req, res) => {
     }
 });
 
+
+// =========================================================================
+// 🌟 API ฟีด Story เพื่อนบน Dashboard (ดู / ชอบ / ดาว 1-7 / แชร์ / คอมเมนต์ / ติดตาม)
+// =========================================================================
+
+// 1. ดึงรายชื่อเพื่อนที่มี Story พร้อมรายการโพสต์และสถิติทั้งหมด
+app.get('/api/stories/feed/:viewerId', async (req, res) => {
+    const { viewerId } = req.params;
+    try {
+        const result = await pgPool.query(`
+            SELECT 
+                s.*,
+                p.first_name,
+                p.last_name,
+                p.nickname,
+                (
+                    SELECT cpm.image_url FROM citizen_profiles_media cpm
+                    WHERE cpm.profile_id = a.profile_id AND cpm.is_active = true
+                    LIMIT 1
+                ) AS author_image,
+                (SELECT COUNT(*)::int FROM story_likes sl WHERE sl.story_id = s.story_id) AS likes_count,
+                EXISTS(SELECT 1 FROM story_likes sl WHERE sl.story_id = s.story_id AND sl.account_id = $1) AS is_liked,
+                COALESCE((SELECT ROUND(AVG(stars)::numeric, 1) FROM story_stars ss WHERE ss.story_id = s.story_id), 0) AS avg_stars,
+                COALESCE((SELECT SUM(stars)::int FROM story_stars ss WHERE ss.story_id = s.story_id), 0) AS total_stars,
+                COALESCE((SELECT stars FROM story_stars ss WHERE ss.story_id = s.story_id AND ss.account_id = $1), 0) AS my_stars,
+                (SELECT COUNT(*)::int FROM story_comments sc WHERE sc.story_id = s.story_id) AS comments_count,
+                EXISTS(SELECT 1 FROM user_follows uf WHERE uf.follower_id = $1 AND uf.following_id = s.account_id) AS is_following
+            FROM user_stories s
+            JOIN user_accounts a ON s.account_id = a.account_id
+            LEFT JOIN user_profiles p ON a.profile_id = p.profile_id
+            WHERE s.is_active = true
+              AND (s.visibility != 'PRIVATE' OR s.account_id = $1)
+            ORDER BY s.created_at DESC
+        `, [viewerId]);
+
+        // จัดกลุ่มโพสต์ตามเจ้าของบัญชี (1 คน = 1 วงกลมโปรไฟล์)
+        const authorsMap = new Map();
+        for (const row of result.rows) {
+            if (!authorsMap.has(row.account_id)) {
+                authorsMap.set(row.account_id, {
+                    account_id: row.account_id,
+                    full_name: `${row.first_name || ''} ${row.last_name || ''}`.trim() || 'ผู้ใช้งาน',
+                    nickname: row.nickname || '',
+                    author_image: row.author_image || '/profile-img.jpg',
+                    is_following: row.is_following,
+                    stories: []
+                });
+            }
+            authorsMap.get(row.account_id).stories.push(row);
+        }
+
+        res.json({ success: true, data: Array.from(authorsMap.values()) });
+    } catch (err) {
+        console.error('Get Stories Feed Error:', err);
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// 2. เพิ่มยอดคนดู (+1 View)
+app.post('/api/stories/:storyId/view', async (req, res) => {
+    try {
+        await pgPool.query(`UPDATE user_stories SET views_count = COALESCE(views_count, 0) + 1 WHERE story_id = $1`, [req.params.storyId]);
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// 3. กดถูกใจ / ยกเลิกถูกใจ (Toggle Like)
+app.post('/api/stories/:storyId/like', async (req, res) => {
+    const { account_id } = req.body;
+    const { storyId } = req.params;
+    try {
+        const exists = await pgPool.query(`SELECT 1 FROM story_likes WHERE story_id = $1 AND account_id = $2`, [storyId, account_id]);
+        let liked = false;
+        if (exists.rows.length > 0) {
+            await pgPool.query(`DELETE FROM story_likes WHERE story_id = $1 AND account_id = $2`, [storyId, account_id]);
+        } else {
+            await pgPool.query(`INSERT INTO story_likes (story_id, account_id) VALUES ($1, $2)`, [storyId, account_id]);
+            liked = true;
+        }
+        const countRes = await pgPool.query(`SELECT COUNT(*)::int AS cnt FROM story_likes WHERE story_id = $1`, [storyId]);
+        res.json({ success: true, liked, likes_count: countRes.rows[0].cnt });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// 4. ให้ดาว 1-7 ดาว
+app.post('/api/stories/:storyId/star', async (req, res) => {
+    const { account_id, stars } = req.body;
+    const { storyId } = req.params;
+    const starVal = Math.min(7, Math.max(1, Number(stars) || 1));
+    try {
+        await pgPool.query(`
+            INSERT INTO story_stars (story_id, account_id, stars, updated_at)
+            VALUES ($1, $2, $3, CURRENT_TIMESTAMP)
+            ON CONFLICT (story_id, account_id)
+            DO UPDATE SET stars = EXCLUDED.stars, updated_at = CURRENT_TIMESTAMP
+        `, [storyId, account_id, starVal]);
+
+        const statRes = await pgPool.query(`
+            SELECT COALESCE(ROUND(AVG(stars)::numeric, 1), 0) AS avg_stars,
+                   COALESCE(SUM(stars)::int, 0) AS total_stars
+            FROM story_stars WHERE story_id = $1
+        `, [storyId]);
+
+        res.json({ success: true, my_stars: starVal, ...statRes.rows[0] });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// 5. เพิ่มยอดแชร์ (+1 Share)
+app.post('/api/stories/:storyId/share', async (req, res) => {
+    try {
+        const result = await pgPool.query(
+            `UPDATE user_stories SET shares_count = COALESCE(shares_count, 0) + 1 WHERE story_id = $1 RETURNING shares_count`,
+            [req.params.storyId]
+        );
+        res.json({ success: true, shares_count: result.rows[0]?.shares_count || 0 });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// 6. ดึง & เพิ่มคอมเมนต์
+app.get('/api/stories/:storyId/comments', async (req, res) => {
+    try {
+        const result = await pgPool.query(`
+            SELECT c.comment_id, c.comment_text, c.created_at,
+                   p.first_name, p.last_name, p.nickname,
+                   (SELECT cpm.image_url FROM citizen_profiles_media cpm WHERE cpm.profile_id = a.profile_id AND cpm.is_active = true LIMIT 1) AS user_image
+            FROM story_comments c
+            JOIN user_accounts a ON c.account_id = a.account_id
+            LEFT JOIN user_profiles p ON a.profile_id = p.profile_id
+            WHERE c.story_id = $1
+            ORDER BY c.created_at ASC
+        `, [req.params.storyId]);
+        res.json({ success: true, data: result.rows });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+app.post('/api/stories/:storyId/comments', async (req, res) => {
+    const { account_id, comment_text } = req.body;
+    if (!comment_text || !comment_text.trim()) {
+        return res.status(400).json({ success: false, message: 'กรุณาพิมพ์ข้อความคอมเมนต์' });
+    }
+    try {
+        await pgPool.query(
+            `INSERT INTO story_comments (story_id, account_id, comment_text) VALUES ($1, $2, $3)`,
+            [req.params.storyId, account_id, comment_text.trim()]
+        );
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// 7. กดติดตาม / เลิกติดตาม (Toggle Follow)
+app.post('/api/users/follow', async (req, res) => {
+    const { follower_id, following_id } = req.body;
+    if (!follower_id || !following_id || follower_id === following_id) {
+        return res.status(400).json({ success: false, message: 'ไม่สามารถติดตามตัวเองได้' });
+    }
+    try {
+        const exists = await pgPool.query(
+            `SELECT 1 FROM user_follows WHERE follower_id = $1 AND following_id = $2`,
+            [follower_id, following_id]
+        );
+        let is_following = false;
+        if (exists.rows.length > 0) {
+            await pgPool.query(`DELETE FROM user_follows WHERE follower_id = $1 AND following_id = $2`, [follower_id, following_id]);
+        } else {
+            await pgPool.query(`INSERT INTO user_follows (follower_id, following_id) VALUES ($1, $2)`, [follower_id, following_id]);
+            is_following = true;
+        }
+        res.json({ success: true, is_following });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+
+
 // API สำหรับขอค่ารัศมีการแสดงผลตามพิกัดปัจจุบัน
 app.post('/api/get-display-radius', async (req, res) => {
     const { lat, lng } = req.body;
