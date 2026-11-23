@@ -554,7 +554,7 @@ app.get('/api/user/stories/:accountId', async (req, res) => {
 // 🎬 3. API โพสต์ My Story (รองรับรูปภาพผ่าน Cloudflare Images + วิดีโอ)
 // =========================================================================
 app.post('/api/user/stories', upload.single('storyMedia'), async (req, res) => {
-    const { account_id, village_id, overlay_text, text_color, text_size, visibility } = req.body;
+   const { account_id, village_id, overlay_text, text_color, text_size, text_x, text_y, bg_blur, visibility } = req.body;
 
     if (!account_id || !req.file) {
         return res.status(400).json({ success: false, message: 'กรุณาเลือกไฟล์รูปภาพหรือวิดีโอ' });
@@ -600,8 +600,8 @@ app.post('/api/user/stories', upload.single('storyMedia'), async (req, res) => {
         const insertRes = await pgPool.query(`
             INSERT INTO user_stories (
                 account_id, village_id, media_type, media_url,
-                overlay_text, text_color, text_size, visibility, is_active
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true)
+                overlay_text, text_color, text_size, text_x, text_y, bg_blur, visibility, is_active
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, true)
             RETURNING *
         `, [
             account_id,
@@ -611,6 +611,9 @@ app.post('/api/user/stories', upload.single('storyMedia'), async (req, res) => {
             overlay_text ? overlay_text.trim() : null,
             text_color || '#ffffff',
             Number(text_size) || 22,
+            text_x !== undefined ? Number(text_x) : 50,
+            text_y !== undefined ? Number(text_y) : 50,
+            bg_blur !== undefined ? Number(bg_blur) : 0,
             visibility || 'PUBLIC'
         ]);
 
