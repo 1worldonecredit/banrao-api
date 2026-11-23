@@ -351,6 +351,154 @@ app.post('/api/upload-profile', upload.single('profileImage'), async (req, res) 
     }
 });
 
+// =========================================================================
+// 👤 API จัดการโปรไฟล์ผู้ใช้งาน Frontend (ดึง / แก้ไข / ลบรูปแบบ Soft Delete)
+// =========================================================================
+
+// 1. ดึงข้อมูลโปรไฟล์ล่าสุดของบัญชีนี้ (รวมถึงรายชื่ออาชีพสำหรับ Dropdown)
+app.get('/api/user/profile/:accountId', async (req, res) => {
+    const { accountId } = req.params;
+    try {
+        const [userRes, occRes] = await Promise.all([
+            pgPool.query(`
+                SELECT 
+                    a.account_id, a.username_phone, a.occupation_id, a.household_member_count,
+                    a.role, COALESCE(a.tier_code, 'CITIZEN_FREE') AS tier_code,
+                    COALESCE(a.community_score, 0) AS community_score,
+                    a.referral_code, a.referred_by, a.is_active,
+                    p.profile_id, p.first_name, p.last_name, p.nickname, p.dob, p.gender, p.house_no,
+                    o.occupation_name,
+                    (
+                        SELECT cpm.image_url
+                        FROM citizen_profiles_media cpm
+                        WHERE cpm.profile_id = a.profile_id AND cpm.is_active = true
+                        LIMIT 1
+                    ) AS user_image,
+                    v.village_no, v.village_name,
+                    t.tambon_name_th, am.amphure_name_th, pr.province_name_th,
+                    hp.first_name AS headman_first_name, hp.last_name AS headman_last_name
+                FROM user_accounts a
+                LEFT JOIN user_profiles p ON a.profile_id = p.profile_id
+                LEFT JOIN sys_occupations o ON a.occupation_id = o.occupation_id
+                LEFT JOIN villages v ON a.village_id = v.village_id
+                LEFT JOIN user_accounts ha ON v.headman_account_id = ha.account_id
+                LEFT JOIN user_profiles hp ON ha.profile_id = hp.profile_id
+                LEFT JOIN sys_tambons t ON v.tambon_id = t.tambon_id
+                LEFT JOIN sys_amphures am ON t.amphure_id = am.amphure_id
+                LEFT JOIN sys_provinces pr ON am.province_id = pr.province_id
+                WHERE a.account_id = $1
+            `, [accountId]),
+            pgPool.query(`SELECT occupation_id, occupation_name FROM sys_occupations ORDER BY occupation_name ASC`).catch(() => ({ rows: [] }))
+        ]);
+
+        if (userRes.rows.length === 0) {
+            return res.status(404).json({ success: false, message: 'ไม่พบข้อมูลผู้ใช้งาน' });
+        }
+
+        res.json({
+            success: true,
+            data: userRes.rows[0],
+            occupations: occRes.rows
+        });
+    } catch (err) {
+        console.error('Get User Profile Error:', err);
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// 2. เพิ่ม / แก้ไข / ล้างค่า ข้อมูลส่วนตัวใน user_profiles และ user_accounts
+app.put('/api/user/profile/:accountId', async (req, res) => {
+    const { accountId } = req.params;
+    const {
+        first_name, last_name, nickname, dob, gender, house_no,
+        occupation_id, household_member_count
+    } = req.body;
+
+    const client = await pgPool.connect();
+    try {
+        await client.query('BEGIN');
+
+        // ค้นหา profile_id ของบัญชีนี้
+        const accRes = await client.query(
+            `SELECT profile_id FROM user_accounts WHERE account_id = $1`,
+            [accountId]
+        );
+        if (accRes.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ success: false, message: 'ไม่พบบัญชีผู้ใช้งาน' });
+        }
+
+        const profileId = accRes.rows[0].profile_id;
+
+        // อัปเดตข้อมูลส่วนตัวลง user_profiles (ส่งค่าว่าง = ล้างค่าเป็น NULL)
+        if (profileId) {
+            await client.query(`
+                UPDATE user_profiles
+                SET first_name = $1,
+                    last_name = $2,
+                    nickname = $3,
+                    dob = $4,
+                    gender = $5,
+                    house_no = $6
+                WHERE profile_id = $7
+            `, [
+                first_name ? first_name.trim() : '',
+                last_name ? last_name.trim() : '',
+                nickname && nickname.trim() ? nickname.trim() : null,
+                dob && dob.trim() ? dob.trim() : null,
+                gender && gender.trim() ? gender.trim() : null,
+                house_no && house_no.trim() ? house_no.trim() : null,
+                profileId
+            ]);
+        }
+
+        // อัปเดตอาชีพและจำนวนสมาชิกในครัวเรือนลง user_accounts
+        await client.query(`
+            UPDATE user_accounts
+            SET occupation_id = $1,
+                household_member_count = $2
+            WHERE account_id = $3
+        `, [
+            occupation_id ? Number(occupation_id) : null,
+            household_member_count !== '' && household_member_count !== null ? Number(household_member_count) : 0,
+            accountId
+        ]);
+
+        await client.query('COMMIT');
+        res.json({ success: true, message: 'บันทึกข้อมูลโปรไฟล์เรียบร้อยแล้ว' });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error('Update User Profile Error:', err);
+        res.status(500).json({ success: false, message: err.message });
+    } finally {
+        client.release();
+    }
+});
+
+// 3. ลบรูปโปรไฟล์ปัจจุบัน (Soft Delete: ปรับ is_active = false ไม่ลบไฟล์จริง)
+app.delete('/api/user/profile-image/:accountId', async (req, res) => {
+    const { accountId } = req.params;
+    try {
+        const accRes = await pgPool.query(
+            `SELECT profile_id FROM user_accounts WHERE account_id = $1`,
+            [accountId]
+        );
+        if (accRes.rows.length === 0) {
+            return res.status(404).json({ success: false, message: 'ไม่พบบัญชีผู้ใช้งาน' });
+        }
+
+        await pgPool.query(
+            `UPDATE citizen_profiles_media SET is_active = false WHERE profile_id = $1`,
+            [accRes.rows[0].profile_id]
+        );
+
+        res.json({ success: true, message: 'ลบรูปโปรไฟล์เรียบร้อยแล้ว' });
+    } catch (err) {
+        console.error('Delete Profile Image Error:', err);
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
 // API สำหรับขอค่ารัศมีการแสดงผลตามพิกัดปัจจุบัน
 app.post('/api/get-display-radius', async (req, res) => {
     const { lat, lng } = req.body;
