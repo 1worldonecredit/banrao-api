@@ -475,6 +475,170 @@ app.put('/api/user/profile/:accountId', async (req, res) => {
     }
 });
 
+
+// =========================================================================
+// 👥 1. API ดึงรายชื่อผู้ที่เราแนะนำ (Referrals)
+// =========================================================================
+app.get('/api/user/referrals/:accountId', async (req, res) => {
+    const { accountId } = req.params;
+    try {
+        // หา referral_code และเบอร์โทรของเจ้าของโปรไฟล์ก่อน
+        const ownerRes = await pgPool.query(
+            `SELECT referral_code, username_phone FROM user_accounts WHERE account_id = $1`,
+            [accountId]
+        );
+        if (ownerRes.rows.length === 0) {
+            return res.json({ success: true, data: [] });
+        }
+
+        const { referral_code, username_phone } = ownerRes.rows[0];
+        const matchValues = [referral_code, username_phone].filter(Boolean);
+        if (matchValues.length === 0) {
+            return res.json({ success: true, data: [] });
+        }
+
+        const refRes = await pgPool.query(`
+            SELECT 
+                a.account_id,
+                a.username_phone,
+                COALESCE(a.tier_code, 'CITIZEN_FREE') AS tier_code,
+                COALESCE(a.community_score, 0) AS community_score,
+                a.created_at,
+                p.first_name,
+                p.last_name,
+                p.nickname,
+                v.village_no,
+                v.village_name,
+                (
+                    SELECT cpm.image_url
+                    FROM citizen_profiles_media cpm
+                    WHERE cpm.profile_id = a.profile_id AND cpm.is_active = true
+                    LIMIT 1
+                ) AS user_image
+            FROM user_accounts a
+            LEFT JOIN user_profiles p ON a.profile_id = p.profile_id
+            LEFT JOIN villages v ON a.village_id = v.village_id
+            WHERE a.referred_by = ANY($1::text[])
+              AND a.account_id != $2
+            ORDER BY a.created_at DESC NULLS LAST
+        `, [matchValues, accountId]);
+
+        res.json({ success: true, data: refRes.rows });
+    } catch (err) {
+        console.error('Get Referrals Error:', err);
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// =========================================================================
+// 📸 2. API ดึงรายการ My Story ของผู้ใช้งาน
+// =========================================================================
+app.get('/api/user/stories/:accountId', async (req, res) => {
+    const { accountId } = req.params;
+    try {
+        const result = await pgPool.query(`
+            SELECT *
+            FROM user_stories
+            WHERE account_id = $1 AND is_active = true
+            ORDER BY created_at DESC
+        `, [accountId]);
+
+        res.json({ success: true, data: result.rows });
+    } catch (err) {
+        console.error('Get User Stories Error:', err);
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// =========================================================================
+// 🎬 3. API โพสต์ My Story (รองรับรูปภาพผ่าน Cloudflare Images + วิดีโอ)
+// =========================================================================
+app.post('/api/user/stories', upload.single('storyMedia'), async (req, res) => {
+    const { account_id, village_id, overlay_text, text_color, text_size, visibility } = req.body;
+
+    if (!account_id || !req.file) {
+        return res.status(400).json({ success: false, message: 'กรุณาเลือกไฟล์รูปภาพหรือวิดีโอ' });
+    }
+
+    try {
+        const isVideo = req.file.mimetype.startsWith('video/');
+        let mediaUrl = '';
+
+        const fileBlob = new Blob([req.file.buffer], { type: req.file.mimetype });
+        const formData = new FormData();
+        formData.append('file', fileBlob, req.file.originalname);
+
+        if (!isVideo) {
+            // อัปโหลดรูปภาพขึ้น Cloudflare Images (เส้นเดียวกับรูปโปรไฟล์)
+            const cfRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${process.env.CF_ACCOUNT_ID}/images/v1`, {
+                method: 'POST',
+                headers: { 'Authorization': `Bearer ${process.env.CF_API_TOKEN}` },
+                body: formData
+            });
+            const cfData = await cfRes.json();
+            if (!cfData.success) {
+                return res.status(500).json({ success: false, message: 'อัปโหลดรูปขึ้น Cloudflare ไม่สำเร็จ' });
+            }
+            mediaUrl = cfData.result.variants[0];
+        } else {
+            // อัปโหลดวิดีโอขึ้น Cloudflare Stream (หากเปิดใช้งานไว้)
+            const cfRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${process.env.CF_ACCOUNT_ID}/stream`, {
+                method: 'POST',
+                headers: { 'Authorization': `Bearer ${process.env.CF_API_TOKEN}` },
+                body: formData
+            });
+            const cfData = await cfRes.json();
+            if (!cfData.success || !cfData.result?.preview) {
+                return res.status(400).json({
+                    success: false,
+                    message: 'ระบบยังไม่รองรับอัปโหลดไฟล์วิดีโอโดยตรง (กรุณาเปิด Cloudflare Stream หรือใช้รูปภาพก่อนครับ)'
+                });
+            }
+            mediaUrl = cfData.result.preview;
+        }
+
+        const insertRes = await pgPool.query(`
+            INSERT INTO user_stories (
+                account_id, village_id, media_type, media_url,
+                overlay_text, text_color, text_size, visibility, is_active
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true)
+            RETURNING *
+        `, [
+            account_id,
+            village_id || null,
+            isVideo ? 'VIDEO' : 'IMAGE',
+            mediaUrl,
+            overlay_text ? overlay_text.trim() : null,
+            text_color || '#ffffff',
+            Number(text_size) || 22,
+            visibility || 'PUBLIC'
+        ]);
+
+        res.json({ success: true, message: 'โพสต์ Story สำเร็จ!', data: insertRes.rows[0] });
+    } catch (err) {
+        console.error('Create Story Error:', err);
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// =========================================================================
+// 🗑️ 4. API ลบ My Story (Soft Delete: is_active = false)
+// =========================================================================
+app.delete('/api/user/stories/:storyId', async (req, res) => {
+    try {
+        await pgPool.query(
+            `UPDATE user_stories SET is_active = false WHERE story_id = $1`,
+            [req.params.storyId]
+        );
+        res.json({ success: true, message: 'ลบ Story เรียบร้อยแล้ว' });
+    } catch (err) {
+        console.error('Delete Story Error:', err);
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+
+
 // 3. ลบรูปโปรไฟล์ปัจจุบัน (Soft Delete: ปรับ is_active = false ไม่ลบไฟล์จริง)
 app.delete('/api/user/profile-image/:accountId', async (req, res) => {
     const { accountId } = req.params;
