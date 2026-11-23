@@ -670,17 +670,16 @@ app.delete('/api/user/profile-image/:accountId', async (req, res) => {
 // =========================================================================
 // 🌟 API ฟีด Story เพื่อนบน Dashboard (ดู / ชอบ / ดาว 1-7 / แชร์ / คอมเมนต์ / ติดตาม)
 // =========================================================================
-
-// 1. ดึงรายชื่อเพื่อนที่มี Story พร้อมรายการโพสต์และสถิติทั้งหมด
+// =========================================================================
+// 🌟 2. API ฟีด Story เพื่อนบน Dashboard (กรองโพสต์ที่ซ่อนและคนที่ถูกบล็อกออก)
+// =========================================================================
 app.get('/api/stories/feed/:viewerId', async (req, res) => {
     const { viewerId } = req.params;
     try {
         const result = await pgPool.query(`
             SELECT 
                 s.*,
-                p.first_name,
-                p.last_name,
-                p.nickname,
+                p.first_name, p.last_name, p.nickname,
                 (
                     SELECT cpm.image_url FROM citizen_profiles_media cpm
                     WHERE cpm.profile_id = a.profile_id AND cpm.is_active = true
@@ -691,17 +690,21 @@ app.get('/api/stories/feed/:viewerId', async (req, res) => {
                 COALESCE((SELECT ROUND(AVG(stars)::numeric, 1) FROM story_stars ss WHERE ss.story_id = s.story_id), 0) AS avg_stars,
                 COALESCE((SELECT SUM(stars)::int FROM story_stars ss WHERE ss.story_id = s.story_id), 0) AS total_stars,
                 COALESCE((SELECT stars FROM story_stars ss WHERE ss.story_id = s.story_id AND ss.account_id = $1), 0) AS my_stars,
-                (SELECT COUNT(*)::int FROM story_comments sc WHERE sc.story_id = s.story_id) AS comments_count,
+                (SELECT COUNT(*)::int FROM story_comments sc WHERE sc.story_id = s.story_id AND COALESCE(sc.is_active, true) = true) AS comments_count,
                 EXISTS(SELECT 1 FROM user_follows uf WHERE uf.follower_id = $1 AND uf.following_id = s.account_id) AS is_following
             FROM user_stories s
             JOIN user_accounts a ON s.account_id = a.account_id
             LEFT JOIN user_profiles p ON a.profile_id = p.profile_id
             WHERE s.is_active = true
+              AND COALESCE(s.is_hidden, false) = false
               AND (s.visibility != 'PRIVATE' OR s.account_id = $1)
+              AND NOT EXISTS (
+                  SELECT 1 FROM user_blocks ub
+                  WHERE ub.blocker_id = s.account_id AND ub.blocked_id = $1
+              )
             ORDER BY s.created_at DESC
         `, [viewerId]);
 
-        // จัดกลุ่มโพสต์ตามเจ้าของบัญชี (1 คน = 1 วงกลมโปรไฟล์)
         const authorsMap = new Map();
         for (const row of result.rows) {
             if (!authorsMap.has(row.account_id)) {
@@ -792,17 +795,20 @@ app.post('/api/stories/:storyId/share', async (req, res) => {
     }
 });
 
-// 6. ดึง & เพิ่มคอมเมนต์
+
+// =========================================================================
+// 💬 3. API คอมเมนต์ (ดึงเฉพาะ is_active=true / ตอบกลับ / ลบ Soft Delete / บล็อก)
+// =========================================================================
 app.get('/api/stories/:storyId/comments', async (req, res) => {
     try {
         const result = await pgPool.query(`
-            SELECT c.comment_id, c.comment_text, c.created_at,
+            SELECT c.comment_id, c.account_id, c.parent_comment_id, c.comment_text, c.created_at,
                    p.first_name, p.last_name, p.nickname,
                    (SELECT cpm.image_url FROM citizen_profiles_media cpm WHERE cpm.profile_id = a.profile_id AND cpm.is_active = true LIMIT 1) AS user_image
             FROM story_comments c
             JOIN user_accounts a ON c.account_id = a.account_id
             LEFT JOIN user_profiles p ON a.profile_id = p.profile_id
-            WHERE c.story_id = $1
+            WHERE c.story_id = $1 AND COALESCE(c.is_active, true) = true
             ORDER BY c.created_at ASC
         `, [req.params.storyId]);
         res.json({ success: true, data: result.rows });
@@ -811,17 +817,189 @@ app.get('/api/stories/:storyId/comments', async (req, res) => {
     }
 });
 
+
 app.post('/api/stories/:storyId/comments', async (req, res) => {
-    const { account_id, comment_text } = req.body;
+    const { account_id, comment_text, parent_comment_id } = req.body;
     if (!comment_text || !comment_text.trim()) {
         return res.status(400).json({ success: false, message: 'กรุณาพิมพ์ข้อความคอมเมนต์' });
     }
     try {
+        // เช็กว่าโดนเจ้าของโพสต์บล็อกอยู่หรือไม่
+        const ownerRes = await pgPool.query(`SELECT account_id FROM user_stories WHERE story_id = $1`, [req.params.storyId]);
+        if (ownerRes.rows.length > 0) {
+            const blockCheck = await pgPool.query(
+                `SELECT 1 FROM user_blocks WHERE blocker_id = $1 AND blocked_id = $2`,
+                [ownerRes.rows[0].account_id, account_id]
+            );
+            if (blockCheck.rows.length > 0) {
+                return res.status(403).json({ success: false, message: 'คุณไม่สามารถแสดงความคิดเห็นในโพสต์นี้ได้' });
+            }
+        }
+
         await pgPool.query(
-            `INSERT INTO story_comments (story_id, account_id, comment_text) VALUES ($1, $2, $3)`,
-            [req.params.storyId, account_id, comment_text.trim()]
+            `INSERT INTO story_comments (story_id, account_id, parent_comment_id, comment_text, is_active) VALUES ($1, $2, $3, $4, true)`,
+            [req.params.storyId, account_id, parent_comment_id || null, comment_text.trim()]
         );
         res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+
+// ลบคอมเมนต์แบบ Soft Delete (ไม่ลบจริง)
+app.patch('/api/stories/comments/:commentId/delete', async (req, res) => {
+    try {
+        await pgPool.query(`UPDATE story_comments SET is_active = false WHERE comment_id = $1`, [req.params.commentId]);
+        res.json({ success: true, message: 'ซ่อน/ลบคอมเมนต์เรียบร้อยแล้ว' });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// บล็อกผู้ใช้งาน
+app.post('/api/users/block', async (req, res) => {
+    const { blocker_id, blocked_id } = req.body;
+    if (!blocker_id || !blocked_id || String(blocker_id) === String(blocked_id)) {
+        return res.status(400).json({ success: false, message: 'ไม่สามารถบล็อกตัวเองได้' });
+    }
+    try {
+        await pgPool.query(
+            `INSERT INTO user_blocks (blocker_id, blocked_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+            [blocker_id, blocked_id]
+        );
+        res.json({ success: true, message: 'บล็อกผู้ใช้งานนี้เรียบร้อยแล้ว' });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// =========================================================================
+// 📸 1. API โพสต์ / แก้ไข / ซ่อน-แสดง My Story (รองรับ หัวข้อ, คำอธิบาย, ปกวิดีโอ)
+// =========================================================================
+app.post('/api/user/stories', upload.fields([
+    { name: 'storyMedia', maxCount: 1 },
+    { name: 'coverImage', maxCount: 1 }
+]), async (req, res) => {
+    const {
+        account_id, village_id, title, description,
+        overlay_text, text_color, text_size, text_x, text_y, bg_blur, visibility
+    } = req.body;
+
+    const mediaFile = req.files?.storyMedia?.[0];
+    const coverFile = req.files?.coverImage?.[0];
+
+    if (!account_id || !mediaFile) {
+        return res.status(400).json({ success: false, message: 'กรุณาเลือกไฟล์รูปภาพหรือวิดีโอ' });
+    }
+
+    try {
+        const isVideo = mediaFile.mimetype.startsWith('video/');
+        let mediaUrl = '';
+        let coverUrl = null;
+
+        // 1. อัปโหลดไฟล์หลัก (รูปหรือวิดีโอ)
+        const fileBlob = new Blob([mediaFile.buffer], { type: mediaFile.mimetype });
+        const formData = new FormData();
+        formData.append('file', fileBlob, mediaFile.originalname);
+
+        if (!isVideo) {
+            const cfRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${process.env.CF_ACCOUNT_ID}/images/v1`, {
+                method: 'POST',
+                headers: { 'Authorization': `Bearer ${process.env.CF_API_TOKEN}` },
+                body: formData
+            });
+            const cfData = await cfRes.json();
+            if (!cfData.success) return res.status(500).json({ success: false, message: 'อัปโหลดรูปไม่สำเร็จ' });
+            mediaUrl = cfData.result.variants[0];
+        } else {
+            const cfRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${process.env.CF_ACCOUNT_ID}/stream`, {
+                method: 'POST',
+                headers: { 'Authorization': `Bearer ${process.env.CF_API_TOKEN}` },
+                body: formData
+            });
+            const cfData = await cfRes.json();
+            if (!cfData.success || !cfData.result?.preview) {
+                return res.status(400).json({ success: false, message: 'ระบบยังไม่รองรับวิดีโอโดยตรง (กรุณาเปิด Cloudflare Stream หรือใช้รูปภาพ)' });
+            }
+            mediaUrl = cfData.result.preview;
+        }
+
+        // 2. อัปโหลดภาพปกวิดีโอ (ถ้ามี)
+        if (coverFile) {
+            const coverBlob = new Blob([coverFile.buffer], { type: coverFile.mimetype });
+            const coverFd = new FormData();
+            coverFd.append('file', coverBlob, coverFile.originalname);
+            const cfCoverRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${process.env.CF_ACCOUNT_ID}/images/v1`, {
+                method: 'POST',
+                headers: { 'Authorization': `Bearer ${process.env.CF_API_TOKEN}` },
+                body: coverFd
+            });
+            const cfCoverData = await cfCoverRes.json();
+            if (cfCoverData.success) coverUrl = cfCoverData.result.variants[0];
+        }
+
+        const insertRes = await pgPool.query(`
+            INSERT INTO user_stories (
+                account_id, village_id, media_type, media_url, cover_url,
+                title, description, overlay_text, text_color, text_size,
+                text_x, text_y, bg_blur, visibility, is_hidden, is_active
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, false, true)
+            RETURNING *
+        `, [
+            account_id,
+            village_id || null,
+            isVideo ? 'VIDEO' : 'IMAGE',
+            mediaUrl,
+            coverUrl,
+            title ? title.trim() : null,
+            description ? description.trim() : null,
+            overlay_text ? overlay_text.trim() : null,
+            text_color || '#ffffff',
+            Number(text_size) || 22,
+            text_x !== undefined ? Number(text_x) : 50,
+            text_y !== undefined ? Number(text_y) : 50,
+            bg_blur !== undefined ? Number(bg_blur) : 0,
+            visibility || 'PUBLIC'
+        ]);
+
+        res.json({ success: true, message: 'โพสต์ Story สำเร็จ!', data: insertRes.rows[0] });
+    } catch (err) {
+        console.error('Create Story Error:', err);
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// แก้ไขโพสต์ (หัวข้อ, คำอธิบาย, ข้อความบนภาพ, สี, ขนาด, เบลอ, ความเป็นส่วนตัว)
+app.put('/api/user/stories/:storyId', async (req, res) => {
+    const { title, description, overlay_text, text_color, text_size, text_x, text_y, bg_blur, visibility } = req.body;
+    try {
+        const result = await pgPool.query(`
+            UPDATE user_stories
+            SET title = $1,
+                description = $2,
+                overlay_text = $3,
+                text_color = $4,
+                text_size = $5,
+                text_x = $6,
+                text_y = $7,
+                bg_blur = $8,
+                visibility = $9
+            WHERE story_id = $10
+            RETURNING *
+        `, [
+            title ? title.trim() : null,
+            description ? description.trim() : null,
+            overlay_text ? overlay_text.trim() : null,
+            text_color || '#ffffff',
+            Number(text_size) || 22,
+            text_x !== undefined ? Number(text_x) : 50,
+            text_y !== undefined ? Number(text_y) : 50,
+            bg_blur !== undefined ? Number(bg_blur) : 0,
+            visibility || 'PUBLIC',
+            req.params.storyId
+        ]);
+        res.json({ success: true, message: 'แก้ไขโพสต์เรียบร้อยแล้ว', data: result.rows[0] });
     } catch (err) {
         res.status(500).json({ success: false, message: err.message });
     }
