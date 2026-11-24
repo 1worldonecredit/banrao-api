@@ -6484,6 +6484,232 @@ app.get('/api/admin/profile/:accountId', async (req, res) => {
     }
 });
 
+
+
+// =========================================================================
+// ระบบจัดการผู้ใช้น้ำประปาหมู่บ้าน (Water Supply Management API)
+// =========================================================================
+
+// 1. ดึงรายชื่อบ้านเลขที่ + สมาชิกในบ้าน + ที่อยู่ละเอียด + รูป + เบอร์โทร (สำหรับ Dropdown เพิ่มผู้ใช้น้ำ)
+app.get('/api/water/households/:villageId', async (req, res) => {
+    const { villageId } = req.params;
+    try {
+        const result = await pgPool.query(`
+            SELECT
+                h.household_id,
+                h.house_no,
+                v.village_no,
+                v.village_name,
+                t.tambon_name_th,
+                am.amphure_name_th,
+                pr.province_name_th,
+                hm.member_id,
+                hm.first_name,
+                hm.last_name,
+                hm.citizen_id,
+                hm.phone,
+                hm.relationship,
+                (
+                    SELECT cpm.image_url
+                    FROM user_profiles up
+                    JOIN citizen_profiles_media cpm ON cpm.profile_id = up.profile_id AND cpm.is_active = true
+                    WHERE REGEXP_REPLACE(COALESCE(up.national_id::text, ''), '[^0-9]', '', 'g') = REGEXP_REPLACE(COALESCE(hm.citizen_id::text, ''), '[^0-9]', '', 'g')
+                    LIMIT 1
+                ) AS member_image
+            FROM households h
+            LEFT JOIN villages v ON h.village_id::text = v.village_id::text
+            LEFT JOIN sys_tambons t ON v.tambon_id = t.tambon_id
+            LEFT JOIN sys_amphures am ON t.amphure_id = am.amphure_id
+            LEFT JOIN sys_provinces pr ON am.province_id = pr.province_id
+            LEFT JOIN household_members hm ON hm.household_id = h.household_id AND hm.status = 'ACTIVE'
+            WHERE h.village_id::text = $1::text
+            ORDER BY h.house_no ASC, hm.member_id ASC
+        `, [String(villageId)]);
+
+        // จัดกลุ่มสมาชิกเข้าตามบ้านเลขที่
+        const houseMap = new Map();
+        for (const row of result.rows) {
+            if (!houseMap.has(row.household_id)) {
+                const vName = row.village_name
+                    ? (row.village_name.startsWith('บ้าน') ? row.village_name : `บ้าน${row.village_name}`)
+                    : '';
+                const fullAddress = `บ้านเลขที่ ${row.house_no} หมู่ ${row.village_no || '-'} ${vName} ต.${row.tambon_name_th || '-'} อ.${row.amphure_name_th || '-'} จ.${row.province_name_th || '-'}`.trim();
+
+                houseMap.set(row.household_id, {
+                    household_id: row.household_id,
+                    house_no: row.house_no,
+                    full_address: fullAddress,
+                    members: []
+                });
+            }
+            if (row.member_id) {
+                houseMap.get(row.household_id).members.push({
+                    member_id: row.member_id,
+                    first_name: row.first_name,
+                    last_name: row.last_name,
+                    full_name: `${row.first_name || ''} ${row.last_name || ''}`.trim(),
+                    phone: row.phone || '',
+                    relationship: row.relationship || '',
+                    member_image: row.member_image || '/profile-img.jpg'
+                });
+            }
+        }
+
+        res.json({ success: true, data: Array.from(houseMap.values()) });
+    } catch (err) {
+        console.error('Get Water Households Error:', err);
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// 2. ดึงรายชื่อผู้ใช้น้ำทั้งหมดในหมู่บ้าน (ใช้ได้ทั้งหน้าจัดการ และหน้าออกบิลค่าน้ำ)
+app.get('/api/water/meters/:villageId', async (req, res) => {
+    const { villageId } = req.params;
+    try {
+        const result = await pgPool.query(`
+            SELECT
+                wm.*,
+                h.house_no,
+                v.village_no,
+                v.village_name,
+                t.tambon_name_th,
+                am.amphure_name_th,
+                pr.province_name_th,
+                hm.first_name,
+                hm.last_name,
+                hm.phone,
+                hm.citizen_id,
+                (
+                    SELECT cpm.image_url
+                    FROM user_profiles up
+                    JOIN citizen_profiles_media cpm ON cpm.profile_id = up.profile_id AND cpm.is_active = true
+                    WHERE REGEXP_REPLACE(COALESCE(up.national_id::text, ''), '[^0-9]', '', 'g') = REGEXP_REPLACE(COALESCE(hm.citizen_id::text, ''), '[^0-9]', '', 'g')
+                    LIMIT 1
+                ) AS member_image
+            FROM water_meters wm
+            JOIN households h ON wm.household_id = h.household_id
+            JOIN household_members hm ON wm.member_id = hm.member_id
+            LEFT JOIN villages v ON wm.village_id::text = v.village_id::text
+            LEFT JOIN sys_tambons t ON v.tambon_id = t.tambon_id
+            LEFT JOIN sys_amphures am ON t.amphure_id = am.amphure_id
+            LEFT JOIN sys_provinces pr ON am.province_id = pr.province_id
+            WHERE wm.village_id::text = $1::text AND wm.is_active = true
+            ORDER BY h.house_no ASC, wm.meter_id DESC
+        `, [String(villageId)]);
+
+        const formatted = result.rows.map((r) => {
+            const vName = r.village_name
+                ? (r.village_name.startsWith('บ้าน') ? r.village_name : `บ้าน${r.village_name}`)
+                : '';
+            return {
+                ...r,
+                full_name: `${r.first_name || ''} ${r.last_name || ''}`.trim(),
+                full_address: `บ้านเลขที่ ${r.house_no} หมู่ ${r.village_no || '-'} ${vName} ต.${r.tambon_name_th || '-'} อ.${r.amphure_name_th || '-'} จ.${r.province_name_th || '-'}`.trim(),
+                member_image: r.member_image || '/profile-img.jpg'
+            };
+        });
+
+        res.json({ success: true, data: formatted });
+    } catch (err) {
+        console.error('Get Water Meters Error:', err);
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// 3. เพิ่มผู้ใช้น้ำประปาใหม่ (พร้อมบันทึกประวัติสถานะเริ่มต้น)
+app.post('/api/water/meters', async (req, res) => {
+    const {
+        village_id, household_id, member_id, meter_code, meter_photo_url,
+        meter_status, payment_status, latitude, longitude, last_meter_reading, note, changed_by
+    } = req.body;
+
+    if (!village_id || !household_id || !member_id || !meter_code) {
+        return res.status(400).json({ success: false, message: 'กรุณาเลือกบ้านเลขที่ ผู้ใช้น้ำ และกรอกเลขมิเตอร์ให้ครบถ้วน' });
+    }
+
+    const client = await pgPool.connect();
+    try {
+        await client.query('BEGIN');
+
+        const insertRes = await client.query(`
+            INSERT INTO water_meters (
+                village_id, household_id, member_id, meter_code, meter_photo_url,
+                meter_status, payment_status, latitude, longitude, last_meter_reading, note
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            RETURNING *
+        `, [
+            Number(village_id), Number(household_id), Number(member_id), meter_code.trim(),
+            meter_photo_url || null, meter_status || 'ACTIVE', payment_status || 'PAID',
+            latitude || null, longitude || null, Number(last_meter_reading || 0), note || null
+        ]);
+
+        const newMeter = insertRes.rows[0];
+
+        await client.query(`
+            INSERT INTO water_meter_status_logs (meter_id, meter_status, payment_status, note, changed_by)
+            VALUES ($1, $2, $3, $4, $5)
+        `, [newMeter.meter_id, newMeter.meter_status, newMeter.payment_status, 'ลงทะเบียนผู้ใช้น้ำใหม่', changed_by || 'SYSTEM']);
+
+        await client.query('COMMIT');
+        res.json({ success: true, message: 'เพิ่มผู้ใช้น้ำประปาเรียบร้อยแล้ว', data: newMeter });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        if (err.code === '23505') {
+            return res.status(400).json({ success: false, message: 'เลขมิเตอร์นี้มีอยู่ในระบบแล้ว' });
+        }
+        res.status(500).json({ success: false, message: err.message });
+    } finally {
+        client.release();
+    }
+});
+
+// 4. แก้ไขข้อมูลมิเตอร์ / อัปเดตสถานะ / พิกัด GPS (พร้อมเก็บประวัติ Audit Log)
+app.put('/api/water/meters/:meterId', async (req, res) => {
+    const { meterId } = req.params;
+    const {
+        meter_code, meter_photo_url, meter_status, payment_status,
+        latitude, longitude, last_meter_reading, note, changed_by
+    } = req.body;
+
+    const client = await pgPool.connect();
+    try {
+        await client.query('BEGIN');
+
+        await client.query(`
+            UPDATE water_meters
+            SET meter_code = $1, meter_photo_url = $2, meter_status = $3, payment_status = $4,
+                latitude = $5, longitude = $6, last_meter_reading = $7, note = $8, updated_at = CURRENT_TIMESTAMP
+            WHERE meter_id = $9
+        `, [
+            meter_code.trim(), meter_photo_url || null, meter_status || 'ACTIVE', payment_status || 'PAID',
+            latitude || null, longitude || null, Number(last_meter_reading || 0), note || null, meterId
+        ]);
+
+        await client.query(`
+            INSERT INTO water_meter_status_logs (meter_id, meter_status, payment_status, note, changed_by)
+            VALUES ($1, $2, $3, $4, $5)
+        `, [meterId, meter_status || 'ACTIVE', payment_status || 'PAID', note || 'อัปเดตข้อมูลมิเตอร์', changed_by || 'SYSTEM']);
+
+        await client.query('COMMIT');
+        res.json({ success: true, message: 'อัปเดตข้อมูลผู้ใช้น้ำเรียบร้อยแล้ว' });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        res.status(500).json({ success: false, message: err.message });
+    } finally {
+        client.release();
+    }
+});
+
+// 5. ลบผู้ใช้น้ำ (Soft Delete ไม่ลบประวัติจริง)
+app.delete('/api/water/meters/:meterId', async (req, res) => {
+    try {
+        await pgPool.query(`UPDATE water_meters SET is_active = false, updated_at = CURRENT_TIMESTAMP WHERE meter_id = $1`, [req.params.meterId]);
+        res.json({ success: true, message: 'ปิดใช้งานรายการผู้ใช้น้ำเรียบร้อยแล้ว' });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
 app.listen(port, () => {
     console.log(`Server is running on port ${port}`);
 });
