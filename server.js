@@ -5740,7 +5740,7 @@ app.get('/api/hr/lookup-national-id/:nationalId', async (req, res) => {
         let profileRow = null;
         if (profileId) {
             const pRes = await pgPool.query(`
-                SELECT p.*, ua.account_id, ua.username_phone AS account_phone
+                SELECT p.*, ua.account_id, ua.username_phone AS account_phone, to_jsonb(ua) AS ua_json
                 FROM user_profiles p
                 LEFT JOIN user_accounts ua ON p.profile_id = ua.profile_id
                 WHERE p.profile_id = $1 LIMIT 1
@@ -5752,7 +5752,7 @@ app.get('/api/hr/lookup-national-id/:nationalId', async (req, res) => {
             const profileCols = ['national_id', 'id_card', 'id_card_number', 'citizen_id'];
             for (const col of profileCols) {
                 const pRes = await pgPool.query(`
-                    SELECT p.*, ua.account_id, ua.username_phone AS account_phone
+                    SELECT p.*, ua.account_id, ua.username_phone AS account_phone, to_jsonb(ua) AS ua_json
                     FROM user_profiles p
                     LEFT JOIN user_accounts ua ON p.profile_id = ua.profile_id
                     WHERE REGEXP_REPLACE(COALESCE(p.${col}::text, ''), '[^0-9]', '', 'g') = $1
@@ -5825,9 +5825,29 @@ app.get('/api/hr/lookup-national-id/:nationalId', async (req, res) => {
             assignmentHistory = histRes.rows;
         }
 
-        // รวมข้อมูลโปรไฟล์เต็ม (รองรับหลายชื่อคอลัมน์ที่มีอยู่ใน DB)
+            // ฟังก์ชันช่วยหา URL รูปโปรไฟล์จากทุกชื่อคอลัมน์ที่เป็นไปได้
+        const findAvatar = (obj) => {
+            if (!obj || typeof obj !== 'object') return null;
+            const preferred = [
+                'profile_image_url', 'avatar_url', 'profile_image', 'profile_pic',
+                'profile_picture', 'photo_url', 'image_url', 'picture_url', 'avatar', 'img_url'
+            ];
+            for (const key of preferred) {
+                if (typeof obj[key] === 'string' && obj[key].trim()) return obj[key].trim();
+            }
+            for (const [k, v] of Object.entries(obj)) {
+                if (/(avatar|image|photo|pic|img)/i.test(k) && typeof v === 'string' && v.trim()) {
+                    return v.trim();
+                }
+            }
+            return null;
+        };
+
+        const rawAvatar = findAvatar(profileRow) || findAvatar(profileRow?.ua_json);
+
+        // รวมข้อมูลโปรไฟล์เต็ม
         const profileDetails = {
-            avatar_url: profileRow?.avatar_url || profileRow?.profile_image || profileRow?.profile_pic || profileRow?.photo_url || null,
+            avatar_url: rawAvatar,
             birth_date: profileRow?.birth_date || profileRow?.date_of_birth || profileRow?.dob || null,
             gender: profileRow?.gender || profileRow?.sex || null,
             education: profileRow?.education || profileRow?.education_level || null,
