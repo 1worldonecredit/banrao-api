@@ -5638,9 +5638,9 @@ app.get('/api/hr/departments/:orgId', async (req, res) => {
 app.get('/api/hr/positions/:deptId', async (req, res) => {
     try {
         const result = await pgPool.query(`
-            SELECT position_id, pos_code, position_name, department_id
+            SELECT position_id, pos_code, position_name, dept_id AS department_id
             FROM sys_positions
-            WHERE department_id = $1 AND COALESCE(is_active, true) = true
+            WHERE dept_id = $1 AND COALESCE(is_active, true) = true
             ORDER BY position_id ASC
         `, [req.params.deptId]);
         res.json({ success: true, data: result.rows });
