@@ -5649,7 +5649,7 @@ app.get('/api/hr/positions/:deptId', async (req, res) => {
     }
 });
 
-// 2. ค้นหาข้อมูลจากเลขบัตรประชาชน 13 หลัก (เช็กทั้ง hr_employees และ user_profiles)
+// 2. ค้นหาข้อมูลจากเลขบัตรประชาชน 13 หลัก (รองรับทั้งแบบมีขีดและไม่มีขีด)
 app.get('/api/hr/lookup-national-id/:nationalId', async (req, res) => {
     const cleanId = String(req.params.nationalId || '').replace(/\D/g, '');
     if (cleanId.length !== 13) {
@@ -5668,34 +5668,40 @@ app.get('/api/hr/lookup-national-id/:nationalId', async (req, res) => {
             LEFT JOIN sys_organizations o ON a.org_id = o.org_id
             LEFT JOIN sys_departments d ON a.department_id = d.department_id
             LEFT JOIN sys_positions pos ON a.position_id = pos.position_id
-            WHERE e.national_id = $1
+            WHERE REGEXP_REPLACE(COALESCE(e.national_id, ''), '\D', '', 'g') = $1
             LIMIT 1
         `, [cleanId]);
 
         if (empRes.rows.length > 0) {
-            return res.json({
-                success: true,
-                source: 'HR_EMPLOYEE',
-                data: empRes.rows[0]
-            });
+            return res.json({ success: true, source: 'HR_EMPLOYEE', data: empRes.rows[0] });
         }
 
-        // 2.2 ถ้ายังไม่เคยเป็นบุคลากร เช็กใน user_profiles (กรณีเป็นประชาชนในระบบอยู่แล้ว)
+        // 2.2 เช็กใน user_profiles (ตัดขีดออกตอนเทียบ จะได้เจอทั้งแบบมีขีดและไม่มีขีด)
         const citizenRes = await pgPool.query(`
             SELECT p.profile_id, p.first_name, p.last_name, p.nickname,
                    ua.account_id, ua.username_phone AS phone
             FROM user_profiles p
             LEFT JOIN user_accounts ua ON p.profile_id = ua.profile_id
-            WHERE p.national_id = $1
+            WHERE REGEXP_REPLACE(COALESCE(p.national_id, ''), '\D', '', 'g') = $1
             LIMIT 1
         `, [cleanId]).catch(() => ({ rows: [] }));
 
         if (citizenRes.rows.length > 0) {
-            return res.json({
-                success: true,
-                source: 'CITIZEN_PROFILE',
-                data: citizenRes.rows[0]
-            });
+            return res.json({ success: true, source: 'CITIZEN_PROFILE', data: citizenRes.rows[0] });
+        }
+
+        // 2.3 เช็กสำรองใน user_profiles กรณีคอลัมน์ชื่อ id_card หรือ citizen_id
+        const altCitizenRes = await pgPool.query(`
+            SELECT p.profile_id, p.first_name, p.last_name, p.nickname,
+                   ua.account_id, ua.username_phone AS phone
+            FROM user_profiles p
+            LEFT JOIN user_accounts ua ON p.profile_id = ua.profile_id
+            WHERE REGEXP_REPLACE(COALESCE(p.id_card, ''), '\D', '', 'g') = $1
+            LIMIT 1
+        `, [cleanId]).catch(() => ({ rows: [] }));
+
+        if (altCitizenRes.rows.length > 0) {
+            return res.json({ success: true, source: 'CITIZEN_PROFILE', data: altCitizenRes.rows[0] });
         }
 
         res.json({ success: true, source: 'NOT_FOUND', data: null });
