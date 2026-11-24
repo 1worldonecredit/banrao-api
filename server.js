@@ -5699,8 +5699,7 @@ app.get('/api/hr/positions/:deptId', async (req, res) => {
         res.status(500).json({ success: false, message: err.message });
     }
 });
-
-// 2. ค้นหาข้อมูลจากเลขบัตรประชาชน 13 หลัก (รองรับทั้งแบบมีขีดและไม่มีขีด ครบทุกตาราง)
+// 2. ค้นหาข้อมูลจากเลขบัตรประชาชน 13 หลัก (พร้อมรูปโปรไฟล์ + ข้อมูลส่วนตัว + ประวัติตำแหน่งทั้งหมด)
 app.get('/api/hr/lookup-national-id/:nationalId', async (req, res) => {
     const cleanId = String(req.params.nationalId || '').replace(/\D/g, '');
     if (cleanId.length !== 13) {
@@ -5708,7 +5707,13 @@ app.get('/api/hr/lookup-national-id/:nationalId', async (req, res) => {
     }
 
     try {
-        // 2.1 เช็กในทะเบียนกลางบุคลากร (hr_employees) ก่อน
+        let source = 'NOT_FOUND';
+        let baseData = null;
+        let empId = null;
+        let profileId = null;
+        let accountId = null;
+
+        // 2.1 เช็กใน hr_employees ก่อน
         const empRes = await pgPool.query(`
             SELECT e.*,
                    a.assignment_id AS current_assignment_id,
@@ -5724,46 +5729,126 @@ app.get('/api/hr/lookup-national-id/:nationalId', async (req, res) => {
         `, [cleanId]);
 
         if (empRes.rows.length > 0) {
-            return res.json({ success: true, source: 'HR_EMPLOYEE', data: empRes.rows[0] });
+            source = 'HR_EMPLOYEE';
+            baseData = empRes.rows[0];
+            empId = baseData.emp_id;
+            profileId = baseData.profile_id;
+            accountId = baseData.account_id;
         }
 
-        // 2.2 เช็กใน user_profiles (รองรับชื่อคอลัมน์ national_id / id_card / id_card_number)
-        const profileCols = ['national_id', 'id_card', 'id_card_number', 'citizen_id'];
-        for (const col of profileCols) {
-            const citizenRes = await pgPool.query(`
-                SELECT p.profile_id, p.first_name, p.last_name, p.nickname,
-                       ua.account_id, ua.username_phone AS phone
+        // 2.2 ดึงข้อมูลเต็มจาก user_profiles (รูปโปรไฟล์, วันเกิด, เพศ, การศึกษา ฯลฯ)
+        let profileRow = null;
+        if (profileId) {
+            const pRes = await pgPool.query(`
+                SELECT p.*, ua.account_id, ua.username_phone AS account_phone
                 FROM user_profiles p
                 LEFT JOIN user_accounts ua ON p.profile_id = ua.profile_id
-                WHERE REGEXP_REPLACE(COALESCE(p.${col}::text, ''), '[^0-9]', '', 'g') = $1
-                LIMIT 1
-            `, [cleanId]).catch(() => ({ rows: [] }));
+                WHERE p.profile_id = $1 LIMIT 1
+            `, [profileId]).catch(() => ({ rows: [] }));
+            profileRow = pRes.rows[0] || null;
+        }
 
-            if (citizenRes.rows.length > 0) {
-                return res.json({ success: true, source: 'CITIZEN_PROFILE', data: citizenRes.rows[0] });
+        if (!profileRow) {
+            const profileCols = ['national_id', 'id_card', 'id_card_number', 'citizen_id'];
+            for (const col of profileCols) {
+                const pRes = await pgPool.query(`
+                    SELECT p.*, ua.account_id, ua.username_phone AS account_phone
+                    FROM user_profiles p
+                    LEFT JOIN user_accounts ua ON p.profile_id = ua.profile_id
+                    WHERE REGEXP_REPLACE(COALESCE(p.${col}::text, ''), '[^0-9]', '', 'g') = $1
+                    LIMIT 1
+                `, [cleanId]).catch(() => ({ rows: [] }));
+                if (pRes.rows.length > 0) {
+                    profileRow = pRes.rows[0];
+                    break;
+                }
             }
         }
 
-        // 2.3 เช็กใน household_members (ข้อมูลประชากรจากหน้าจัดการทะเบียนบ้าน)
-        for (const col of profileCols) {
-            const hmRes = await pgPool.query(`
-                SELECT first_name, last_name, nickname, phone
-                FROM household_members
-                WHERE REGEXP_REPLACE(COALESCE(${col}::text, ''), '[^0-9]', '', 'g') = $1
-                LIMIT 1
-            `, [cleanId]).catch(() => ({ rows: [] }));
+        // ถ้ายังไม่เจอใน hr_employees แต่เจอใน user_profiles
+        if (!baseData && profileRow) {
+            source = 'CITIZEN_PROFILE';
+            baseData = {
+                profile_id: profileRow.profile_id,
+                account_id: profileRow.account_id,
+                first_name: profileRow.first_name,
+                last_name: profileRow.last_name,
+                nickname: profileRow.nickname,
+                phone: profileRow.account_phone || profileRow.phone || ''
+            };
+        }
 
-            if (hmRes.rows.length > 0) {
-                return res.json({ success: true, source: 'CITIZEN_PROFILE', data: hmRes.rows[0] });
+        // 2.3 เช็กสำรองใน household_members กรณีไม่เจอทั้ง 2 ตารางบน
+        if (!baseData) {
+            const hmCols = ['national_id', 'id_card', 'id_card_number', 'citizen_id'];
+            for (const col of hmCols) {
+                const hmRes = await pgPool.query(`
+                    SELECT * FROM household_members
+                    WHERE REGEXP_REPLACE(COALESCE(${col}::text, ''), '[^0-9]', '', 'g') = $1
+                    LIMIT 1
+                `, [cleanId]).catch(() => ({ rows: [] }));
+                if (hmRes.rows.length > 0) {
+                    source = 'CITIZEN_PROFILE';
+                    const hm = hmRes.rows[0];
+                    baseData = {
+                        first_name: hm.first_name,
+                        last_name: hm.last_name,
+                        nickname: hm.nickname,
+                        phone: hm.phone || ''
+                    };
+                    profileRow = hm;
+                    break;
+                }
             }
         }
 
-        res.json({ success: true, source: 'NOT_FOUND', data: null });
+        if (!baseData) {
+            return res.json({ success: true, source: 'NOT_FOUND', data: null });
+        }
+
+        // 2.4 ดึงประวัติตำแหน่งงานทั้งหมด (ล่าสุด -> ที่ผ่านมา)
+        let assignmentHistory = [];
+        if (empId) {
+            const histRes = await pgPool.query(`
+                SELECT a.assignment_id, a.scope_level, a.area_code, a.area_name,
+                       a.status, a.is_current, a.start_date, a.end_date, a.created_at, a.note,
+                       o.org_code, o.org_name,
+                       d.dept_code, d.department_name,
+                       pos.pos_code, pos.position_name
+                FROM hr_assignments a
+                LEFT JOIN sys_organizations o ON a.org_id = o.org_id
+                LEFT JOIN sys_departments d ON a.department_id = d.department_id
+                LEFT JOIN sys_positions pos ON a.position_id = pos.position_id
+                WHERE a.emp_id = $1 AND COALESCE(a.is_active, true) = true
+                ORDER BY a.is_current DESC, COALESCE(a.start_date, a.created_at) DESC, a.assignment_id DESC
+            `, [empId]).catch(() => ({ rows: [] }));
+            assignmentHistory = histRes.rows;
+        }
+
+        // รวมข้อมูลโปรไฟล์เต็ม (รองรับหลายชื่อคอลัมน์ที่มีอยู่ใน DB)
+        const profileDetails = {
+            avatar_url: profileRow?.avatar_url || profileRow?.profile_image || profileRow?.profile_pic || profileRow?.photo_url || null,
+            birth_date: profileRow?.birth_date || profileRow?.date_of_birth || profileRow?.dob || null,
+            gender: profileRow?.gender || profileRow?.sex || null,
+            education: profileRow?.education || profileRow?.education_level || null,
+            phone: baseData.phone || profileRow?.account_phone || profileRow?.phone || null
+        };
+
+        res.json({
+            success: true,
+            source,
+            data: {
+                ...baseData,
+                profile_details: profileDetails,
+                assignment_history: assignmentHistory
+            }
+        });
     } catch (err) {
         console.error('Lookup National ID Error:', err);
         res.status(500).json({ success: false, message: err.message });
     }
 });
+
 
 // 3. ดึงรายชื่อบุคลากรและการดำรงตำแหน่ง (กรองได้ตาม ระดับ 7 ระดับ / หน่วยงาน / แผนก / ตำแหน่ง / คำค้นหา)
 app.get('/api/hr/assignments', async (req, res) => {
