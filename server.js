@@ -4389,7 +4389,6 @@ const verifyAdminToken = (req, res, next) => {
         next();
     });
 };
-
 app.post('/api/admin/login', async (req, res) => {
     const { username, password } = req.body;
     if (!username || !password) {
@@ -4423,39 +4422,57 @@ app.post('/api/admin/login', async (req, res) => {
             return res.status(401).json({ success: false, message: 'รหัสผ่านไม่ถูกต้อง' });
         }
 
-        // 2. ดึงตำแหน่งทั้งหมดของบุคคลนี้
+        // 2. ดึงเฉพาะตำแหน่งที่ยังเปิดใช้งานอยู่ (is_active = true)
         const posQuery = await pgPool.query(`
-            SELECT sp.position_id, sp.position_name, sp.position_level, sp.department_id
+            SELECT sp.position_id, sp.position_name, sp.position_level, sp.dept_id AS department_id
             FROM user_positions upos
             JOIN sys_positions sp ON upos.position_id = sp.position_id
-            WHERE upos.account_id = $1
+            WHERE upos.account_id = $1 AND COALESCE(upos.is_active, true) = true
         `, [user.account_id]);
 
-        // 3. ดึงสิทธิ์ (permission_code) ทั้งหมดจากตำแหน่งที่ถืออยู่
+        const activePositionIds = posQuery.rows.map(r => r.position_id);
+
+        // 3. ดึงสิทธิ์ทั้งหมด (รองรับทั้ง Super Admin, ตารางเดิม position_permissions และตารางสิทธิ์เมนู sys_menu_permissions)
         const isSuperAdmin = user.username_phone === '0000000000' || (user.role || '').toUpperCase() === 'SUPER_ADMIN';
         let permissions = [];
+        let adminMenuPermissions = [];
 
         if (isSuperAdmin) {
-            // Super Admin ได้สิทธิ์ทั้งหมดในระบบ
-            const allPerm = await pgPool.query('SELECT permission_code FROM sys_permissions');
+            const allPerm = await pgPool.query('SELECT permission_code FROM sys_permissions').catch(() => ({ rows: [] }));
             permissions = ['*', ...allPerm.rows.map(r => r.permission_code)];
-        } else {
+        } else if (activePositionIds.length > 0) {
+            // 3.1 สิทธิ์จากตารางเดิม
             const permQuery = await pgPool.query(`
                 SELECT DISTINCT p.permission_code
-                FROM user_positions upos
-                JOIN position_permissions pp ON upos.position_id = pp.position_id
+                FROM position_permissions pp
                 JOIN sys_permissions p ON pp.permission_id = p.permission_id
-                WHERE upos.account_id = $1
-            `, [user.account_id]);
+                WHERE pp.position_id = ANY($1::int[])
+            `, [activePositionIds]).catch(() => ({ rows: [] }));
             permissions = permQuery.rows.map(r => r.permission_code);
+
+            // 3.2 สิทธิ์รายเมนู (ดู / เพิ่ม / แก้ไข / ลบ / อนุมัติ) สำหรับ src/utils/permissions.js
+            const menuPermQuery = await pgPool.query(`
+                SELECT mp.menu_id, m.menu_path, m.menu_name,
+                       BOOL_OR(COALESCE(mp.can_view, false)) AS can_view,
+                       BOOL_OR(COALESCE(mp.can_create, false)) AS can_create,
+                       BOOL_OR(COALESCE(mp.can_edit, false)) AS can_edit,
+                       BOOL_OR(COALESCE(mp.can_delete, false)) AS can_delete,
+                       BOOL_OR(COALESCE(mp.can_approve, false)) AS can_approve
+                FROM sys_menu_permissions mp
+                LEFT JOIN sys_menus m ON mp.menu_id = m.menu_id
+                WHERE mp.position_id = ANY($1::int[])
+                GROUP BY mp.menu_id, m.menu_path, m.menu_name
+            `, [activePositionIds]).catch(() => ({ rows: [] }));
+            adminMenuPermissions = menuPermQuery.rows;
         }
 
-        // 4. ถ้าไม่มีสิทธิ์หลังบ้านเลยแม้แต่สิทธิ์เดียว ห้ามเข้า emp.banrao.life
-        if (permissions.length === 0) {
+        // 4. อนุญาตให้เข้าหลังบ้านได้ถ้าเป็น Super Admin หรือมีตำแหน่งที่อนุมัติแล้ว (ACTIVE)
+        const hasAdminAccess = isSuperAdmin || permissions.length > 0 || adminMenuPermissions.length > 0 || activePositionIds.length > 0;
+        if (!hasAdminAccess) {
             return res.status(403).json({ success: false, message: 'บัญชีนี้ยังไม่ได้รับกำหนดสิทธิ์เข้าใช้งานระบบหลังบ้าน' });
         }
 
-        // 5. สร้าง Token พร้อมฝัง permissions ไว้ตรวจสอบทุก API
+        // 5. สร้าง Token พร้อมฝัง permissions
         const token = jwt.sign(
             {
                 account_id: user.account_id,
@@ -4480,7 +4497,8 @@ app.post('/api/admin/login', async (req, res) => {
                 area_code: user.area_code,
                 is_super_admin: isSuperAdmin,
                 positions: posQuery.rows,
-                permissions // <-- Frontend เอา Array นี้ไปเช็กเปิด/ปิดเมนูได้เลย
+                permissions,
+                adminMenuPermissions // <-- ส่งให้ src/utils/permissions.js เช็กปุ่ม เพิ่ม/แก้ไข/ลบ ตั้งแต่ Login
             }
         });
     } catch (err) {
