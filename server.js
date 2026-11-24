@@ -5578,6 +5578,458 @@ app.post('/api/admin/permission-matrix/save', async (req, res) => {
 });
 //   สิ้นสุด
 //--------------------------------------------------------
+
+
+// =========================================================================
+// 🏢 ระบบจัดการบุคลากร 7 ระดับ (HR Staff & Assignment Management API)
+// =========================================================================
+
+// ฟังก์ชันช่วยตรวจสอบรหัส PIN อนุมัติ (เช็ก PIN ส่วนตัวก่อน ถ้าไม่มีใช้รหัสกลาง 123456)
+async function verifyApprovalPin(client, approverAccountId, inputPin) {
+    if (!inputPin) return false;
+    const pinStr = String(inputPin).trim();
+
+    if (approverAccountId) {
+        const personalRes = await client.query(
+            `SELECT pin_code FROM sys_approval_pins WHERE account_id = $1 AND is_active = true LIMIT 1`,
+            [approverAccountId]
+        );
+        if (personalRes.rows.length > 0) {
+            return personalRes.rows[0].pin_code === pinStr;
+        }
+    }
+
+    const globalRes = await client.query(
+        `SELECT pin_code FROM sys_approval_pins WHERE scope_level = 'DEFAULT_GLOBAL' AND is_active = true LIMIT 1`
+    );
+    const defaultPin = globalRes.rows[0]?.pin_code || '123456';
+    return pinStr === defaultPin;
+}
+
+// 1. ดึงข้อมูล Dropdown 4 ชั้น (หน่วยงาน -> แผนก -> ตำแหน่ง)
+app.get('/api/hr/orgs', async (req, res) => {
+    try {
+        const result = await pgPool.query(`
+            SELECT org_id, org_code, org_name
+            FROM sys_organizations
+            WHERE COALESCE(is_active, true) = true
+            ORDER BY org_id ASC
+        `);
+        res.json({ success: true, data: result.rows });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+app.get('/api/hr/departments/:orgId', async (req, res) => {
+    try {
+        const result = await pgPool.query(`
+            SELECT department_id, dept_code, department_name, org_id
+            FROM sys_departments
+            WHERE org_id = $1 AND COALESCE(is_active, true) = true
+            ORDER BY department_id ASC
+        `, [req.params.orgId]);
+        res.json({ success: true, data: result.rows });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+app.get('/api/hr/positions/:deptId', async (req, res) => {
+    try {
+        const result = await pgPool.query(`
+            SELECT position_id, pos_code, position_name, department_id
+            FROM sys_positions
+            WHERE department_id = $1 AND COALESCE(is_active, true) = true
+            ORDER BY position_id ASC
+        `, [req.params.deptId]);
+        res.json({ success: true, data: result.rows });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// 2. ค้นหาข้อมูลจากเลขบัตรประชาชน 13 หลัก (เช็กทั้ง hr_employees และ user_profiles)
+app.get('/api/hr/lookup-national-id/:nationalId', async (req, res) => {
+    const cleanId = String(req.params.nationalId || '').replace(/\D/g, '');
+    if (cleanId.length !== 13) {
+        return res.status(400).json({ success: false, message: 'กรุณากรอกเลขบัตรประชาชนให้ครบ 13 หลัก' });
+    }
+
+    try {
+        // 2.1 เช็กในทะเบียนกลางบุคลากร (hr_employees) ก่อน
+        const empRes = await pgPool.query(`
+            SELECT e.*,
+                   a.assignment_id AS current_assignment_id,
+                   a.org_id, a.department_id, a.position_id, a.scope_level, a.area_code, a.area_name, a.status,
+                   o.org_name, d.department_name, pos.position_name
+            FROM hr_employees e
+            LEFT JOIN hr_assignments a ON e.emp_id = a.emp_id AND a.is_current = true AND a.is_active = true
+            LEFT JOIN sys_organizations o ON a.org_id = o.org_id
+            LEFT JOIN sys_departments d ON a.department_id = d.department_id
+            LEFT JOIN sys_positions pos ON a.position_id = pos.position_id
+            WHERE e.national_id = $1
+            LIMIT 1
+        `, [cleanId]);
+
+        if (empRes.rows.length > 0) {
+            return res.json({
+                success: true,
+                source: 'HR_EMPLOYEE',
+                data: empRes.rows[0]
+            });
+        }
+
+        // 2.2 ถ้ายังไม่เคยเป็นบุคลากร เช็กใน user_profiles (กรณีเป็นประชาชนในระบบอยู่แล้ว)
+        const citizenRes = await pgPool.query(`
+            SELECT p.profile_id, p.first_name, p.last_name, p.nickname,
+                   ua.account_id, ua.username_phone AS phone
+            FROM user_profiles p
+            LEFT JOIN user_accounts ua ON p.profile_id = ua.profile_id
+            WHERE p.national_id = $1
+            LIMIT 1
+        `, [cleanId]).catch(() => ({ rows: [] }));
+
+        if (citizenRes.rows.length > 0) {
+            return res.json({
+                success: true,
+                source: 'CITIZEN_PROFILE',
+                data: citizenRes.rows[0]
+            });
+        }
+
+        res.json({ success: true, source: 'NOT_FOUND', data: null });
+    } catch (err) {
+        console.error('Lookup National ID Error:', err);
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// 3. ดึงรายชื่อบุคลากรและการดำรงตำแหน่ง (กรองได้ตาม ระดับ 7 ระดับ / หน่วยงาน / แผนก / ตำแหน่ง / คำค้นหา)
+app.get('/api/hr/assignments', async (req, res) => {
+    const { scope_level, org_id, department_id, position_id, status, search } = req.query;
+
+    try {
+        const conditions = ['a.is_active = true', 'e.is_active = true'];
+        const params = [];
+
+        if (scope_level && scope_level !== 'ALL') {
+            params.push(scope_level);
+            conditions.push(`a.scope_level = $${params.length}`);
+        }
+        if (org_id) {
+            params.push(Number(org_id));
+            conditions.push(`a.org_id = $${params.length}`);
+        }
+        if (department_id) {
+            params.push(Number(department_id));
+            conditions.push(`a.department_id = $${params.length}`);
+        }
+        if (position_id) {
+            params.push(Number(position_id));
+            conditions.push(`a.position_id = $${params.length}`);
+        }
+        if (status && status !== 'ALL') {
+            params.push(status);
+            conditions.push(`a.status = $${params.length}`);
+        }
+        if (search && search.trim()) {
+            params.push(`%${search.trim()}%`);
+            conditions.push(`(
+                e.emp_code ILIKE $${params.length} OR
+                e.national_id ILIKE $${params.length} OR
+                e.first_name ILIKE $${params.length} OR
+                e.last_name ILIKE $${params.length} OR
+                e.phone ILIKE $${params.length} OR
+                a.area_name ILIKE $${params.length}
+            )`);
+        }
+
+        const result = await pgPool.query(`
+            SELECT
+                a.*,
+                e.emp_code, e.national_id, e.first_name, e.last_name, e.nickname, e.phone, e.email,
+                o.org_code, o.org_name,
+                d.dept_code, d.department_name,
+                pos.pos_code, pos.position_name
+            FROM hr_assignments a
+            JOIN hr_employees e ON a.emp_id = e.emp_id
+            JOIN sys_organizations o ON a.org_id = o.org_id
+            JOIN sys_departments d ON a.department_id = d.department_id
+            JOIN sys_positions pos ON a.position_id = pos.position_id
+            WHERE ${conditions.join(' AND ')}
+            ORDER BY
+                CASE a.status WHEN 'PENDING' THEN 1 WHEN 'ACTIVE' THEN 2 ELSE 3 END,
+                a.created_at DESC
+        `, params);
+
+        res.json({ success: true, data: result.rows });
+    } catch (err) {
+        console.error('Get HR Assignments Error:', err);
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// 4. เพิ่มบุคลากรใหม่ / บรรจุเข้าตำแหน่ง (สร้าง emp_code อัตโนมัติ และไม่ให้เลขบัตรซ้ำ)
+app.post('/api/hr/assignments', async (req, res) => {
+    const {
+        national_id, first_name, last_name, nickname, phone, email,
+        profile_id, account_id,
+        org_id, department_id, position_id,
+        scope_level, area_code, area_name, note
+    } = req.body;
+
+    const cleanId = String(national_id || '').replace(/\D/g, '');
+    if (cleanId.length !== 13 || !first_name || !last_name || !org_id || !department_id || !position_id || !scope_level) {
+        return res.status(400).json({ success: false, message: 'กรุณากรอกข้อมูลสำคัญให้ครบถ้วน (เลขบัตร 13 หลัก, ชื่อ-นามสกุล, หน่วยงาน, แผนก, ตำแหน่ง, ระดับ)' });
+    }
+
+    const client = await pgPool.connect();
+    try {
+        await client.query('BEGIN');
+
+        // 4.1 ตรวจสอบว่ามีเลขบัตรนี้ใน hr_employees แล้วหรือยัง
+        let empId;
+        let empCode;
+        const existEmp = await client.query(
+            `SELECT emp_id, emp_code FROM hr_employees WHERE national_id = $1`,
+            [cleanId]
+        );
+
+        if (existEmp.rows.length > 0) {
+            empId = existEmp.rows[0].emp_id;
+            empCode = existEmp.rows[0].emp_code;
+            // อัปเดตข้อมูลติดต่อล่าสุด
+            await client.query(`
+                UPDATE hr_employees
+                SET first_name = $1, last_name = $2, nickname = $3, phone = $4, email = $5, is_active = true, updated_at = CURRENT_TIMESTAMP
+                WHERE emp_id = $6
+            `, [first_name.trim(), last_name.trim(), nickname || null, phone || null, email || null, empId]);
+        } else {
+            // สร้างรหัสพนักงานอัตโนมัติรูปแบบ EMP-2569-00001
+            const seqRes = await client.query(`SELECT nextval('hr_emp_code_seq') AS seq`);
+            const yearBE = new Date().getFullYear() + 543;
+            empCode = `EMP-${yearBE}-${String(seqRes.rows[0].seq).padStart(5, '0')}`;
+
+            const newEmp = await client.query(`
+                INSERT INTO hr_employees (emp_code, national_id, profile_id, account_id, first_name, last_name, nickname, phone, email, is_active)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, true)
+                RETURNING emp_id
+            `, [empCode, cleanId, profile_id || null, account_id || null, first_name.trim(), last_name.trim(), nickname || null, phone || null, email || null]);
+
+            empId = newEmp.rows[0].emp_id;
+        }
+
+        // 4.2 บันทึกคำขอบรรจุ/แต่งตั้ง (สถานะเริ่มต้น = PENDING รออนุมัติด้วย PIN)
+        const assignRes = await client.query(`
+            INSERT INTO hr_assignments (
+                emp_id, org_id, department_id, position_id,
+                scope_level, area_code, area_name, status, is_current, note, is_active
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'PENDING', false, $8, true)
+            RETURNING *
+        `, [
+            empId, Number(org_id), Number(department_id), Number(position_id),
+            scope_level, area_code || 'TH', area_name || 'ส่วนกลาง', note || null
+        ]);
+
+        await client.query('COMMIT');
+        res.json({
+            success: true,
+            message: `บันทึกข้อมูลสำเร็จ (รหัสบุคลากร: ${empCode}) สถานะ: รออนุมัติ`,
+            data: { ...assignRes.rows[0], emp_code: empCode }
+        });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error('Create HR Assignment Error:', err);
+        res.status(500).json({ success: false, message: err.message });
+    } finally {
+        client.release();
+    }
+});
+
+// 5. แก้ไขข้อมูลบุคลากร / ข้อมูลตำแหน่ง
+app.put('/api/hr/assignments/:assignmentId', async (req, res) => {
+    const { assignmentId } = req.params;
+    const { first_name, last_name, nickname, phone, email, scope_level, area_code, area_name, note } = req.body;
+
+    const client = await pgPool.connect();
+    try {
+        await client.query('BEGIN');
+
+        const assignRes = await client.query(`SELECT emp_id FROM hr_assignments WHERE assignment_id = $1`, [assignmentId]);
+        if (assignRes.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ success: false, message: 'ไม่พบรายการนี้' });
+        }
+
+        const empId = assignRes.rows[0].emp_id;
+        await client.query(`
+            UPDATE hr_employees
+            SET first_name = $1, last_name = $2, nickname = $3, phone = $4, email = $5, updated_at = CURRENT_TIMESTAMP
+            WHERE emp_id = $6
+        `, [first_name.trim(), last_name.trim(), nickname || null, phone || null, email || null, empId]);
+
+        await client.query(`
+            UPDATE hr_assignments
+            SET scope_level = $1, area_code = $2, area_name = $3, note = $4, updated_at = CURRENT_TIMESTAMP
+            WHERE assignment_id = $5
+        `, [scope_level, area_code || 'TH', area_name || 'ส่วนกลาง', note || null, assignmentId]);
+
+        await client.query('COMMIT');
+        res.json({ success: true, message: 'แก้ไขข้อมูลเรียบร้อยแล้ว' });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        res.status(500).json({ success: false, message: err.message });
+    } finally {
+        client.release();
+    }
+});
+
+// 6. อนุมัติการแต่งตั้ง / ย้าย / ปรับตำแหน่ง (ต้องยืนยันรหัส PIN 123456)
+app.post('/api/hr/assignments/:assignmentId/approve', async (req, res) => {
+    const { assignmentId } = req.params;
+    const { pin_code, approver_id } = req.body;
+
+    const client = await pgPool.connect();
+    try {
+        const isPinValid = await verifyApprovalPin(client, approver_id, pin_code);
+        if (!isPinValid) {
+            return res.status(403).json({ success: false, message: 'รหัส PIN อนุมัติไม่ถูกต้อง' });
+        }
+
+        await client.query('BEGIN');
+
+        const targetRes = await client.query(`SELECT emp_id FROM hr_assignments WHERE assignment_id = $1`, [assignmentId]);
+        if (targetRes.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ success: false, message: 'ไม่พบรายการที่ต้องการอนุมัติ' });
+        }
+        const empId = targetRes.rows[0].emp_id;
+
+        // ปรับตำแหน่งปัจจุบันเดิม (ถ้ามี) เป็น TRANSFERRED (ย้าย/ปรับตำแหน่งแล้ว)
+        await client.query(`
+            UPDATE hr_assignments
+            SET is_current = false, status = 'TRANSFERRED', end_date = CURRENT_DATE, updated_at = CURRENT_TIMESTAMP
+            WHERE emp_id = $1 AND is_current = true AND assignment_id != $2
+        `, [empId, assignmentId]);
+
+        // อนุมัติรายการนี้ให้เป็นตำแหน่งปัจจุบัน (ACTIVE)
+        await client.query(`
+            UPDATE hr_assignments
+            SET status = 'ACTIVE', is_current = true, approved_by = $1, approved_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+            WHERE assignment_id = $2
+        `, [approver_id || null, assignmentId]);
+
+        await client.query('COMMIT');
+        res.json({ success: true, message: 'อนุมัติตำแหน่งปัจจุบันเรียบร้อยแล้ว!' });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        res.status(500).json({ success: false, message: err.message });
+    } finally {
+        client.release();
+    }
+});
+
+// 7. ย้าย / ปรับตำแหน่ง (สร้างรายการใหม่ + สามารถอนุมัติทันทีด้วย PIN หรือส่งรออนุมัติก็ได้)
+app.post('/api/hr/assignments/:empId/transfer', async (req, res) => {
+    const { empId } = req.params;
+    const { org_id, department_id, position_id, scope_level, area_code, area_name, note, pin_code, approver_id } = req.body;
+
+    const client = await pgPool.connect();
+    try {
+        await client.query('BEGIN');
+
+        let status = 'PENDING';
+        let isCurrent = false;
+
+        // ถ้าระบุรหัส PIN มาด้วย ให้ตรวจสอบและอนุมัติย้ายทันที
+        if (pin_code) {
+            const isPinValid = await verifyApprovalPin(client, approver_id, pin_code);
+            if (!isPinValid) {
+                await client.query('ROLLBACK');
+                return res.status(403).json({ success: false, message: 'รหัส PIN อนุมัติไม่ถูกต้อง' });
+            }
+            status = 'ACTIVE';
+            isCurrent = true;
+
+            await client.query(`
+                UPDATE hr_assignments
+                SET is_current = false, status = 'TRANSFERRED', end_date = CURRENT_DATE, updated_at = CURRENT_TIMESTAMP
+                WHERE emp_id = $1 AND is_current = true
+            `, [empId]);
+        }
+
+        await client.query(`
+            INSERT INTO hr_assignments (
+                emp_id, org_id, department_id, position_id,
+                scope_level, area_code, area_name, status, is_current, note,
+                approved_by, approved_at, is_active
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, true)
+        `, [
+            empId, Number(org_id), Number(department_id), Number(position_id),
+            scope_level, area_code || 'TH', area_name || 'ส่วนกลาง', status, isCurrent, note || null,
+            isCurrent ? (approver_id || null) : null, isCurrent ? new Date() : null
+        ]);
+
+        await client.query('COMMIT');
+        res.json({
+            success: true,
+            message: isCurrent ? 'ย้าย/ปรับตำแหน่งและอนุมัติเรียบร้อยแล้ว!' : 'ส่งคำขอย้าย/ปรับตำแหน่งแล้ว (สถานะ: รออนุมัติ)'
+        });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        res.status(500).json({ success: false, message: err.message });
+    } finally {
+        client.release();
+    }
+});
+
+// 8. ลบแบบ Soft Delete (ไม่ลบจริง ปรับ is_active = false, status = 'INACTIVE')
+app.delete('/api/hr/assignments/:assignmentId', async (req, res) => {
+    try {
+        await pgPool.query(`
+            UPDATE hr_assignments
+            SET is_active = false, is_current = false, status = 'INACTIVE', end_date = CURRENT_DATE, updated_at = CURRENT_TIMESTAMP
+            WHERE assignment_id = $1
+        `, [req.params.assignmentId]);
+        res.json({ success: true, message: 'ปิดใช้งานรายการเรียบร้อยแล้ว (Soft Delete)' });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// 9. เปลี่ยนรหัส PIN อนุมัติส่วนตัว (รองรับทุกระดับเปลี่ยนได้เองในอนาคต)
+app.put('/api/hr/approval-pin', async (req, res) => {
+    const { account_id, old_pin, new_pin } = req.body;
+    if (!account_id || !new_pin || String(new_pin).trim().length < 4) {
+        return res.status(400).json({ success: false, message: 'กรุณาระบุรหัส PIN ใหม่อย่างน้อย 4 หลัก' });
+    }
+
+    const client = await pgPool.connect();
+    try {
+        const isOldValid = await verifyApprovalPin(client, account_id, old_pin);
+        if (!isOldValid) {
+            return res.status(403).json({ success: false, message: 'รหัส PIN เดิมไม่ถูกต้อง' });
+        }
+
+        await client.query(`
+            INSERT INTO sys_approval_pins (account_id, scope_level, pin_code, is_active, updated_at)
+            VALUES ($1, 'PERSONAL', $2, true, CURRENT_TIMESTAMP)
+            ON CONFLICT (account_id)
+            DO UPDATE SET pin_code = EXCLUDED.pin_code, updated_at = CURRENT_TIMESTAMP
+        `, [account_id, String(new_pin).trim()]);
+
+        res.json({ success: true, message: 'เปลี่ยนรหัส PIN อนุมัติส่วนตัวเรียบร้อยแล้ว!' });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    } finally {
+        client.release();
+    }
+});
+
+
+
+
 app.listen(port, () => {
     console.log(`Server is running on port ${port}`);
 });
