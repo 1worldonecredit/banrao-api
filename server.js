@@ -5779,6 +5779,41 @@ app.get('/api/hr/assignments', async (req, res) => {
     }
 });
 
+
+// ฟังก์ชันช่วย Sync ชื่อ-นามสกุล-ชื่อเล่น กลับไปอัปเดตที่ต้นทาง (user_profiles และ household_members)
+async function syncCitizenName({ profile_id, national_id, first_name, last_name, nickname, phone }) {
+    const cleanId = String(national_id || '').replace(/\D/g, '');
+    const idCols = ['national_id', 'id_card', 'id_card_number', 'citizen_id'];
+
+    // 1. อัปเดตตาราง user_profiles
+    if (profile_id) {
+        await pgPool.query(`
+            UPDATE user_profiles
+            SET first_name = $1, last_name = $2, nickname = $3, updated_at = CURRENT_TIMESTAMP
+            WHERE profile_id = $4
+        `, [first_name, last_name, nickname || null, profile_id]).catch(() => {});
+    } else if (cleanId.length === 13) {
+        for (const col of idCols) {
+            await pgPool.query(`
+                UPDATE user_profiles
+                SET first_name = $1, last_name = $2, nickname = $3, updated_at = CURRENT_TIMESTAMP
+                WHERE REGEXP_REPLACE(COALESCE(${col}::text, ''), '[^0-9]', '', 'g') = $4
+            `, [first_name, last_name, nickname || null, cleanId]).catch(() => {});
+        }
+    }
+
+    // 2. อัปเดตตาราง household_members (หน้า manage-population)
+    if (cleanId.length === 13) {
+        for (const col of idCols) {
+            await pgPool.query(`
+                UPDATE household_members
+                SET first_name = $1, last_name = $2, nickname = $3, phone = COALESCE($4, phone)
+                WHERE REGEXP_REPLACE(COALESCE(${col}::text, ''), '[^0-9]', '', 'g') = $5
+            `, [first_name, last_name, nickname || null, phone || null, cleanId]).catch(() => {});
+        }
+    }
+}
+
 // 4. เพิ่มบุคลากรใหม่ / บรรจุเข้าตำแหน่ง (สร้าง emp_code อัตโนมัติ และไม่ให้เลขบัตรซ้ำ)
 app.post('/api/hr/assignments', async (req, res) => {
     const {
@@ -5842,6 +5877,13 @@ app.post('/api/hr/assignments', async (req, res) => {
         ]);
 
         await client.query('COMMIT');
+
+        // Sync ชื่อกลับต้นทางหลัง COMMIT สำเร็จ
+        await syncCitizenName({
+            profile_id, national_id: cleanId,
+            first_name: first_name.trim(), last_name: last_name.trim(), nickname, phone
+        });
+
         res.json({
             success: true,
             message: `บันทึกข้อมูลสำเร็จ (รหัสบุคลากร: ${empCode}) สถานะ: รออนุมัติ`,
@@ -5865,13 +5907,20 @@ app.put('/api/hr/assignments/:assignmentId', async (req, res) => {
     try {
         await client.query('BEGIN');
 
-        const assignRes = await client.query(`SELECT emp_id FROM hr_assignments WHERE assignment_id = $1`, [assignmentId]);
+        const assignRes = await client.query(`
+            SELECT a.emp_id, e.profile_id, e.national_id
+            FROM hr_assignments a
+            JOIN hr_employees e ON a.emp_id = e.emp_id
+            WHERE a.assignment_id = $1
+        `, [assignmentId]);
+
         if (assignRes.rows.length === 0) {
             await client.query('ROLLBACK');
             return res.status(404).json({ success: false, message: 'ไม่พบรายการนี้' });
         }
 
-        const empId = assignRes.rows[0].emp_id;
+        const { emp_id: empId, profile_id: profileId, national_id: nationalId } = assignRes.rows[0];
+
         await client.query(`
             UPDATE hr_employees
             SET first_name = $1, last_name = $2, nickname = $3, phone = $4, email = $5, updated_at = CURRENT_TIMESTAMP
@@ -5885,6 +5934,17 @@ app.put('/api/hr/assignments/:assignmentId', async (req, res) => {
         `, [scope_level, area_code || 'TH', area_name || 'ส่วนกลาง', note || null, assignmentId]);
 
         await client.query('COMMIT');
+
+        // Sync ชื่อกลับต้นทางหลัง COMMIT สำเร็จ
+        await syncCitizenName({
+            profile_id: profileId,
+            national_id: nationalId,
+            first_name: first_name.trim(),
+            last_name: last_name.trim(),
+            nickname,
+            phone
+        });
+
         res.json({ success: true, message: 'แก้ไขข้อมูลเรียบร้อยแล้ว' });
     } catch (err) {
         await client.query('ROLLBACK');
@@ -5893,6 +5953,9 @@ app.put('/api/hr/assignments/:assignmentId', async (req, res) => {
         client.release();
     }
 });
+
+
+
 
 // 6. อนุมัติการแต่งตั้ง / ย้าย / ปรับตำแหน่ง (ต้องยืนยันรหัส PIN 123456)
 app.post('/api/hr/assignments/:assignmentId/approve', async (req, res) => {
