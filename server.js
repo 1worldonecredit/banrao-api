@@ -2230,62 +2230,112 @@ app.get('/api/positions', async (req, res) => {
         client.release();
     }
 });
-
 // ==========================================
-// API: ค้นหาข้อมูลลูกบ้านด้วยเลขบัตรประชาชน (ดึงจากระบบประชากร/Household Members)
+// API: ค้นหาข้อมูลลูกบ้านด้วยเลขบัตรประชาชน (ดึงรูปโปรไฟล์จริง + วันเกิด/อายุ)
 // ==========================================
 app.get('/api/search-citizen/:villageId/:citizenId', async (req, res) => {
     const { villageId, citizenId } = req.params;
-    
-    // 🌟 ทำความสะอาดข้อมูล: ลบช่องว่างหรือขีด (-) ออก
     const cleanCitizenId = String(citizenId || '').replace(/[^0-9]/g, '');
 
     if (!cleanCitizenId || !villageId) {
         return res.status(400).json({ success: false, message: 'ข้อมูลการค้นหาไม่ครบถ้วน' });
     }
 
-    const client = await pgPool.connect(); 
+    const client = await pgPool.connect();
     try {
-        // 🌟 เปลี่ยนมาค้นหาใน household_members ที่ผูกกับ households แทน เพื่อให้เจอลูกบ้านทั้งหมด
+        // 1. ค้นหาใน household_members ที่ผูกกับหมู่บ้านนี้
         const result = await client.query(`
             SELECT 
-                hm.member_id AS account_id, -- ใช้ member_id แทน account_id ชั่วคราวเพื่อให้ผังดึง ID ไปใช้งานได้
+                hm.member_id AS account_id,
                 hm.first_name, 
                 hm.last_name,
                 hm.citizen_id,
-                v.village_name,          
-                t.tambon_name_th,        
-                -- กรณีที่ใน household_members ไม่มีรูป อาจจะต้องดึงจาก user_profiles หรือใช้รูป default
-                '/profile-img.jpg' AS user_image, 
+                to_jsonb(hm) AS hm_json,
+                v.village_name,
+                t.tambon_name_th,
+                am.amphure_name_th,
+                pr.province_name_th,
                 hm.relationship AS responsibilities
             FROM household_members hm
             INNER JOIN households h ON hm.household_id = h.household_id
             LEFT JOIN villages v ON h.village_id::TEXT = v.village_id::TEXT
             LEFT JOIN sys_tambons t ON v.tambon_id = t.tambon_id
+            LEFT JOIN sys_amphures am ON t.amphure_id = am.amphure_id
+            LEFT JOIN sys_provinces pr ON am.province_id = pr.province_id
             WHERE REPLACE(TRIM(hm.citizen_id::TEXT), '-', '') = $1 
               AND h.village_id::TEXT = $2::TEXT
-              AND hm.status = 'ACTIVE' -- เอาเฉพาะคนที่ยังอาศัยอยู่
+              AND hm.status = 'ACTIVE'
             LIMIT 1
         `, [cleanCitizenId, String(villageId)]);
 
-        if (result.rows.length > 0) {
-            res.json({ success: true, data: result.rows[0] });
-        } else {
-            // เช็คว่ามีคนนี้อยู่จริงไหม แต่ไม่ได้อยู่หมู่บ้านนี้
-            const checkOtherVillage = await client.query(`SELECT member_id FROM household_members WHERE REPLACE(TRIM(citizen_id::TEXT), '-', '') = $1 AND status = 'ACTIVE'`, [cleanCitizenId]);
-            if(checkOtherVillage.rows.length > 0){
-                res.status(404).json({ success: false, message: 'ไม่พบข้อมูลลูกบ้านนี้ในหมู่บ้านของคุณ' });
-            } else {
-                res.status(404).json({ success: false, message: 'ไม่พบข้อมูลเลขบัตรประชาชนนี้ในระบบจัดการประชากร' });
+        if (result.rows.length === 0) {
+            const checkOtherVillage = await client.query(
+                `SELECT member_id FROM household_members WHERE REPLACE(TRIM(citizen_id::TEXT), '-', '') = $1 AND status = 'ACTIVE'`,
+                [cleanCitizenId]
+            );
+            if (checkOtherVillage.rows.length > 0) {
+                return res.status(404).json({ success: false, message: 'ไม่พบข้อมูลลูกบ้านนี้ในหมู่บ้านของคุณ' });
+            }
+            return res.status(404).json({ success: false, message: 'ไม่พบข้อมูลเลขบัตรประชาชนนี้ในระบบจัดการประชากร' });
+        }
+
+        const row = result.rows[0];
+        const hmJson = row.hm_json || {};
+
+        // 2. ค้นหารูปโปรไฟล์จริง + วันเกิด + เพศ จาก user_profiles และ citizen_profiles_media
+        let userImage = null;
+        let profileDob = null;
+        let profileGender = null;
+
+        const idCols = ['national_id', 'id_card', 'id_card_number', 'citizen_id'];
+        for (const col of idCols) {
+            const pRes = await client.query(`
+                SELECT p.dob, p.gender,
+                       (
+                           SELECT cpm.image_url
+                           FROM citizen_profiles_media cpm
+                           WHERE cpm.profile_id = p.profile_id AND cpm.is_active = true
+                           LIMIT 1
+                       ) AS user_image
+                FROM user_profiles p
+                WHERE REGEXP_REPLACE(COALESCE(p.${col}::text, ''), '[^0-9]', '', 'g') = $1
+                LIMIT 1
+            `, [cleanCitizenId]).catch(() => ({ rows: [] }));
+
+            if (pRes.rows.length > 0) {
+                userImage = pRes.rows[0].user_image || null;
+                profileDob = pRes.rows[0].dob || null;
+                profileGender = pRes.rows[0].gender || null;
+                break;
             }
         }
+
+        res.json({
+            success: true,
+            data: {
+                account_id: row.account_id,
+                first_name: row.first_name,
+                last_name: row.last_name,
+                citizen_id: row.citizen_id,
+                village_name: row.village_name,
+                tambon_name_th: row.tambon_name_th,
+                amphure_name_th: row.amphure_name_th,
+                province_name_th: row.province_name_th,
+                responsibilities: row.responsibilities,
+                dob: profileDob || hmJson.dob || hmJson.birth_date || hmJson.date_of_birth || null,
+                gender: profileGender || hmJson.gender || hmJson.sex || null,
+                user_image: userImage || '/profile-img.jpg'
+            }
+        });
     } catch (error) {
         console.error("Search Citizen Error:", error);
         res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการค้นหาข้อมูล' });
     } finally {
-        if (client) client.release(); 
+        if (client) client.release();
     }
 });
+
+
 
 app.delete('/api/community-leaders/:id', async (req, res) => {
   const { id } = req.params;
@@ -2413,9 +2463,8 @@ app.get('/api/community-leaders/by-committee/:committeeId', async (req, res) => 
     }
 });
 
-
 // ==========================================
-// API: ดึงข้อมูลผังผู้นำ (V2) - แก้ไข Error คอลัมน์รูปภาพแล้ว 100%
+// API: ดึงข้อมูลผังผู้นำ (V2) - ดึงรูปโปรไฟล์จริงจาก citizen_profiles_media
 // ==========================================
 app.get('/api/v2/committee-leaders/:committeeId', async (req, res) => {
     const { committeeId } = req.params;
@@ -2434,10 +2483,13 @@ app.get('/api/v2/committee-leaders/:committeeId', async (req, res) => {
                 upos.account_id,
                 COALESCE(p.first_name, hm.first_name) AS first_name,
                 COALESCE(p.last_name, hm.last_name) AS last_name,
-                
-                -- 🌟 จุดที่แก้: ใช้รูปภาพ Default ไปก่อน เพื่อป้องกัน Error คอลัมน์ไม่มี
-                '/profile-img.jpg' AS user_image
-                
+                hm.citizen_id,
+                (
+                    SELECT cpm.image_url
+                    FROM citizen_profiles_media cpm
+                    WHERE cpm.profile_id = a.profile_id AND cpm.is_active = true
+                    LIMIT 1
+                ) AS direct_image
             FROM user_positions upos
             LEFT JOIN sys_positions sp ON upos.position_id = sp.position_id 
             LEFT JOIN user_accounts a ON upos.account_id::text = a.account_id::text
@@ -2446,7 +2498,37 @@ app.get('/api/v2/committee-leaders/:committeeId', async (req, res) => {
             WHERE upos.committee_id::integer = $1::integer
         `, [committeeId]);
 
-        res.json({ success: true, data: result.rows });
+        // กรณี account_id ผูกกับ household_members ให้ค้นหารูปจาก citizen_id เพิ่มเติม
+        const idCols = ['national_id', 'id_card', 'id_card_number', 'citizen_id'];
+        const rowsWithImages = await Promise.all(result.rows.map(async (row) => {
+            let finalImage = row.direct_image || null;
+
+            if (!finalImage && row.citizen_id) {
+                const cleanId = String(row.citizen_id).replace(/\D/g, '');
+                if (cleanId.length === 13) {
+                    for (const col of idCols) {
+                        const imgRes = await client.query(`
+                            SELECT cpm.image_url
+                            FROM user_profiles p
+                            JOIN citizen_profiles_media cpm ON cpm.profile_id = p.profile_id AND cpm.is_active = true
+                            WHERE REGEXP_REPLACE(COALESCE(p.${col}::text, ''), '[^0-9]', '', 'g') = $1
+                            LIMIT 1
+                        `, [cleanId]).catch(() => ({ rows: [] }));
+                        if (imgRes.rows.length > 0 && imgRes.rows[0].image_url) {
+                            finalImage = imgRes.rows[0].image_url;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            return {
+                ...row,
+                user_image: finalImage || '/profile-img.jpg'
+            };
+        }));
+
+        res.json({ success: true, data: rowsWithImages });
     } catch (error) {
         console.error("Error fetching v2 leaders:", error);
         res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการดึงข้อมูล', error: error.message });
