@@ -6489,15 +6489,18 @@ app.get('/api/admin/profile/:accountId', async (req, res) => {
 // =========================================================================
 // ระบบจัดการผู้ใช้น้ำประปาหมู่บ้าน (Water Supply Management API)
 // =========================================================================
+// =========================================================================
+// ระบบจัดการผู้ใช้น้ำประปาหมู่บ้าน (Water Supply Management API - รองรับ UUID 100%)
+// =========================================================================
 
-// 1. ดึงรายชื่อบ้านเลขที่ + สมาชิกในบ้าน + ที่อยู่ละเอียด + รูป + เบอร์โทร (สำหรับ Dropdown เพิ่มผู้ใช้น้ำ)
+// 1. ดึงรายชื่อบ้านเลขที่ + สมาชิกในบ้าน + ที่อยู่ละเอียด + รูป + เบอร์โทร
 app.get('/api/water/households/:villageId', async (req, res) => {
     const { villageId } = req.params;
     try {
         const result = await pgPool.query(`
             SELECT
                 h.household_id,
-                h.house_no,
+                to_jsonb(h) AS h_json,
                 v.village_no,
                 v.village_name,
                 t.tambon_name_th,
@@ -6507,55 +6510,90 @@ app.get('/api/water/households/:villageId', async (req, res) => {
                 hm.first_name,
                 hm.last_name,
                 hm.citizen_id,
-                hm.phone,
                 hm.relationship,
+                to_jsonb(hm) AS hm_json,
                 (
                     SELECT cpm.image_url
                     FROM user_profiles up
                     JOIN citizen_profiles_media cpm ON cpm.profile_id = up.profile_id AND cpm.is_active = true
-                    WHERE REGEXP_REPLACE(COALESCE(up.national_id::text, ''), '[^0-9]', '', 'g') = REGEXP_REPLACE(COALESCE(hm.citizen_id::text, ''), '[^0-9]', '', 'g')
+                    WHERE REGEXP_REPLACE(
+                        COALESCE(
+                            to_jsonb(up)->>'national_id',
+                            to_jsonb(up)->>'citizen_id',
+                            to_jsonb(up)->>'id_card',
+                            to_jsonb(up)->>'id_card_number',
+                            ''
+                        ), '[^0-9]', '', 'g'
+                    ) = REGEXP_REPLACE(COALESCE(hm.citizen_id::text, ''), '[^0-9]', '', 'g')
+                    AND COALESCE(hm.citizen_id::text, '') <> ''
                     LIMIT 1
-                ) AS member_image
+                ) AS member_image,
+                (
+                    SELECT ua.username_phone
+                    FROM user_profiles up
+                    JOIN user_accounts ua ON ua.profile_id = up.profile_id
+                    WHERE REGEXP_REPLACE(
+                        COALESCE(
+                            to_jsonb(up)->>'national_id',
+                            to_jsonb(up)->>'citizen_id',
+                            to_jsonb(up)->>'id_card',
+                            to_jsonb(up)->>'id_card_number',
+                            ''
+                        ), '[^0-9]', '', 'g'
+                    ) = REGEXP_REPLACE(COALESCE(hm.citizen_id::text, ''), '[^0-9]', '', 'g')
+                    AND COALESCE(hm.citizen_id::text, '') <> ''
+                    LIMIT 1
+                ) AS account_phone
             FROM households h
             LEFT JOIN villages v ON h.village_id::text = v.village_id::text
             LEFT JOIN sys_tambons t ON v.tambon_id = t.tambon_id
             LEFT JOIN sys_amphures am ON t.amphure_id = am.amphure_id
             LEFT JOIN sys_provinces pr ON am.province_id = pr.province_id
-            LEFT JOIN household_members hm ON hm.household_id = h.household_id AND hm.status = 'ACTIVE'
+            LEFT JOIN household_members hm ON hm.household_id::text = h.household_id::text AND hm.status = 'ACTIVE'
             WHERE h.village_id::text = $1::text
-            ORDER BY h.house_no ASC, hm.member_id ASC
+            ORDER BY hm.member_id ASC
         `, [String(villageId)]);
 
         // จัดกลุ่มสมาชิกเข้าตามบ้านเลขที่
         const houseMap = new Map();
         for (const row of result.rows) {
+            const hJson = row.h_json || {};
+            const hmJson = row.hm_json || {};
+            const houseNo = hJson.house_no || hJson.house_number || hJson.address_no || String(row.household_id);
+
             if (!houseMap.has(row.household_id)) {
                 const vName = row.village_name
                     ? (row.village_name.startsWith('บ้าน') ? row.village_name : `บ้าน${row.village_name}`)
                     : '';
-                const fullAddress = `บ้านเลขที่ ${row.house_no} หมู่ ${row.village_no || '-'} ${vName} ต.${row.tambon_name_th || '-'} อ.${row.amphure_name_th || '-'} จ.${row.province_name_th || '-'}`.trim();
+                const fullAddress = `บ้านเลขที่ ${houseNo} หมู่ ${row.village_no || '-'} ${vName} ต.${row.tambon_name_th || '-'} อ.${row.amphure_name_th || '-'} จ.${row.province_name_th || '-'}`.trim();
 
                 houseMap.set(row.household_id, {
                     household_id: row.household_id,
-                    house_no: row.house_no,
+                    house_no: houseNo,
                     full_address: fullAddress,
                     members: []
                 });
             }
             if (row.member_id) {
+                const phone = hmJson.phone || hmJson.phone_number || hmJson.tel || row.account_phone || '';
                 houseMap.get(row.household_id).members.push({
                     member_id: row.member_id,
                     first_name: row.first_name,
                     last_name: row.last_name,
                     full_name: `${row.first_name || ''} ${row.last_name || ''}`.trim(),
-                    phone: row.phone || '',
+                    phone,
                     relationship: row.relationship || '',
                     member_image: row.member_image || '/profile-img.jpg'
                 });
             }
         }
 
-        res.json({ success: true, data: Array.from(houseMap.values()) });
+        // เรียงลำดับตามเลขที่บ้านแบบตัวเลข (เช่น 2 มาก่อน 10)
+        const sortedHouses = Array.from(houseMap.values()).sort((a, b) =>
+            String(a.house_no).localeCompare(String(b.house_no), 'th', { numeric: true })
+        );
+
+        res.json({ success: true, data: sortedHouses });
     } catch (err) {
         console.error('Get Water Households Error:', err);
         res.status(500).json({ success: false, message: err.message });
@@ -6569,7 +6607,8 @@ app.get('/api/water/meters/:villageId', async (req, res) => {
         const result = await pgPool.query(`
             SELECT
                 wm.*,
-                h.house_no,
+                to_jsonb(h) AS h_json,
+                to_jsonb(hm) AS hm_json,
                 v.village_no,
                 v.village_name,
                 t.tambon_name_th,
@@ -6577,34 +6616,65 @@ app.get('/api/water/meters/:villageId', async (req, res) => {
                 pr.province_name_th,
                 hm.first_name,
                 hm.last_name,
-                hm.phone,
                 hm.citizen_id,
                 (
                     SELECT cpm.image_url
                     FROM user_profiles up
                     JOIN citizen_profiles_media cpm ON cpm.profile_id = up.profile_id AND cpm.is_active = true
-                    WHERE REGEXP_REPLACE(COALESCE(up.national_id::text, ''), '[^0-9]', '', 'g') = REGEXP_REPLACE(COALESCE(hm.citizen_id::text, ''), '[^0-9]', '', 'g')
+                    WHERE REGEXP_REPLACE(
+                        COALESCE(
+                            to_jsonb(up)->>'national_id',
+                            to_jsonb(up)->>'citizen_id',
+                            to_jsonb(up)->>'id_card',
+                            to_jsonb(up)->>'id_card_number',
+                            ''
+                        ), '[^0-9]', '', 'g'
+                    ) = REGEXP_REPLACE(COALESCE(hm.citizen_id::text, ''), '[^0-9]', '', 'g')
+                    AND COALESCE(hm.citizen_id::text, '') <> ''
                     LIMIT 1
-                ) AS member_image
+                ) AS member_image,
+                (
+                    SELECT ua.username_phone
+                    FROM user_profiles up
+                    JOIN user_accounts ua ON ua.profile_id = up.profile_id
+                    WHERE REGEXP_REPLACE(
+                        COALESCE(
+                            to_jsonb(up)->>'national_id',
+                            to_jsonb(up)->>'citizen_id',
+                            to_jsonb(up)->>'id_card',
+                            to_jsonb(up)->>'id_card_number',
+                            ''
+                        ), '[^0-9]', '', 'g'
+                    ) = REGEXP_REPLACE(COALESCE(hm.citizen_id::text, ''), '[^0-9]', '', 'g')
+                    AND COALESCE(hm.citizen_id::text, '') <> ''
+                    LIMIT 1
+                ) AS account_phone
             FROM water_meters wm
-            JOIN households h ON wm.household_id = h.household_id
-            JOIN household_members hm ON wm.member_id = hm.member_id
+            LEFT JOIN households h ON wm.household_id::text = h.household_id::text
+            LEFT JOIN household_members hm ON wm.member_id::text = hm.member_id::text
             LEFT JOIN villages v ON wm.village_id::text = v.village_id::text
             LEFT JOIN sys_tambons t ON v.tambon_id = t.tambon_id
             LEFT JOIN sys_amphures am ON t.amphure_id = am.amphure_id
             LEFT JOIN sys_provinces pr ON am.province_id = pr.province_id
             WHERE wm.village_id::text = $1::text AND wm.is_active = true
-            ORDER BY h.house_no ASC, wm.meter_id DESC
+            ORDER BY wm.meter_id DESC
         `, [String(villageId)]);
 
         const formatted = result.rows.map((r) => {
+            const hJson = r.h_json || {};
+            const hmJson = r.hm_json || {};
+            const houseNo = hJson.house_no || hJson.house_number || hJson.address_no || '-';
+            const phone = hmJson.phone || hmJson.phone_number || hmJson.tel || r.account_phone || '';
             const vName = r.village_name
                 ? (r.village_name.startsWith('บ้าน') ? r.village_name : `บ้าน${r.village_name}`)
                 : '';
+
             return {
                 ...r,
+                house_no: houseNo,
+                phone,
                 full_name: `${r.first_name || ''} ${r.last_name || ''}`.trim(),
-                full_address: `บ้านเลขที่ ${r.house_no} หมู่ ${r.village_no || '-'} ${vName} ต.${r.tambon_name_th || '-'} อ.${r.amphure_name_th || '-'} จ.${r.province_name_th || '-'}`.trim(),
+                full_address: `บ้านเลขที่ ${houseNo} หมู่ ${r.village_no || '-'} ${vName} ต.${r.tambon_name_th || '-'} อ.${r.amphure_name_th || '-'} จ.${r.province_name_th || '-'}`.trim(),
                 member_image: r.member_image || '/profile-img.jpg'
             };
         });
@@ -6616,7 +6686,7 @@ app.get('/api/water/meters/:villageId', async (req, res) => {
     }
 });
 
-// 3. เพิ่มผู้ใช้น้ำประปาใหม่ (พร้อมบันทึกประวัติสถานะเริ่มต้น)
+// 3. เพิ่มผู้ใช้น้ำประปาใหม่ (รองรับทั้ง UUID และตัวเลข)
 app.post('/api/water/meters', async (req, res) => {
     const {
         village_id, household_id, member_id, meter_code, meter_photo_url,
@@ -6638,7 +6708,7 @@ app.post('/api/water/meters', async (req, res) => {
             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
             RETURNING *
         `, [
-            Number(village_id), Number(household_id), Number(member_id), meter_code.trim(),
+            String(village_id), String(household_id), String(member_id), meter_code.trim(),
             meter_photo_url || null, meter_status || 'ACTIVE', payment_status || 'PAID',
             latitude || null, longitude || null, Number(last_meter_reading || 0), note || null
         ]);
@@ -6657,13 +6727,14 @@ app.post('/api/water/meters', async (req, res) => {
         if (err.code === '23505') {
             return res.status(400).json({ success: false, message: 'เลขมิเตอร์นี้มีอยู่ในระบบแล้ว' });
         }
+        console.error('Create Water Meter Error:', err);
         res.status(500).json({ success: false, message: err.message });
     } finally {
         client.release();
     }
 });
 
-// 4. แก้ไขข้อมูลมิเตอร์ / อัปเดตสถานะ / พิกัด GPS (พร้อมเก็บประวัติ Audit Log)
+// 4. แก้ไขข้อมูลมิเตอร์ / อัปเดตสถานะ / พิกัด GPS
 app.put('/api/water/meters/:meterId', async (req, res) => {
     const { meterId } = req.params;
     const {
@@ -6694,6 +6765,7 @@ app.put('/api/water/meters/:meterId', async (req, res) => {
         res.json({ success: true, message: 'อัปเดตข้อมูลผู้ใช้น้ำเรียบร้อยแล้ว' });
     } catch (err) {
         await client.query('ROLLBACK');
+        console.error('Update Water Meter Error:', err);
         res.status(500).json({ success: false, message: err.message });
     } finally {
         client.release();
