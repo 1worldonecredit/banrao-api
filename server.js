@@ -5606,6 +5606,57 @@ async function verifyApprovalPin(client, approverAccountId, inputPin) {
     return pinStr === defaultPin;
 }
 
+
+// ฟังก์ชันช่วย Sync ตำแหน่งที่อนุมัติแล้วลงตาราง user_positions (เพื่อให้หน้าบ้านแสดงตำแหน่ง + หลังบ้าน Login ได้)
+async function syncPositionToUserPositions(client, empId, positionId) {
+    // หา account_id จาก hr_employees (ถ้ายังไม่มี ให้หาจากเบอร์โทรใน user_accounts)
+    let empRes = await client.query(`SELECT account_id, phone FROM hr_employees WHERE emp_id = $1`, [empId]);
+    if (empRes.rows.length === 0) return;
+
+    let accountId = empRes.rows[0].account_id;
+    const phone = empRes.rows[0].phone;
+
+    if (!accountId && phone) {
+        const cleanPhone = String(phone).replace(/\D/g, '');
+        const uaRes = await client.query(`
+            SELECT account_id, profile_id FROM user_accounts
+            WHERE REGEXP_REPLACE(COALESCE(username_phone, ''), '[^0-9]', '', 'g') = $1
+            LIMIT 1
+        `, [cleanPhone]);
+        if (uaRes.rows.length > 0) {
+            accountId = uaRes.rows[0].account_id;
+            await client.query(
+                `UPDATE hr_employees SET account_id = $1, profile_id = COALESCE(profile_id, $2) WHERE emp_id = $3`,
+                [accountId, uaRes.rows[0].profile_id, empId]
+            );
+        }
+    }
+
+    if (!accountId) return;
+
+    // ปิดตำแหน่งเก่าทั้งหมดของบัญชีนี้ใน user_positions
+    await client.query(`UPDATE user_positions SET is_active = false WHERE account_id = $1`, [accountId]);
+
+    // ถ้ามี positionId ใหม่ ให้เปิดใช้งานใน user_positions
+    if (positionId) {
+        const existPos = await client.query(
+            `SELECT 1 FROM user_positions WHERE account_id = $1 AND position_id = $2 LIMIT 1`,
+            [accountId, Number(positionId)]
+        );
+        if (existPos.rows.length > 0) {
+            await client.query(
+                `UPDATE user_positions SET is_active = true WHERE account_id = $1 AND position_id = $2`,
+                [accountId, Number(positionId)]
+            );
+        } else {
+            await client.query(
+                `INSERT INTO user_positions (account_id, position_id, is_active) VALUES ($1, $2, true)`,
+                [accountId, Number(positionId)]
+            );
+        }
+    }
+}
+
 // 1. ดึงข้อมูล Dropdown 4 ชั้น (หน่วยงาน -> แผนก -> ตำแหน่ง)
 app.get('/api/hr/orgs', async (req, res) => {
     try {
