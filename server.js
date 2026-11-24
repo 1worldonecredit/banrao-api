@@ -6275,7 +6275,126 @@ app.put('/api/hr/approval-pin', async (req, res) => {
     }
 });
 
+// =========================================================================
+// ดึงข้อมูลโปรไฟล์เต็มของผู้ใช้งานที่ Login เข้าระบบหลังบ้าน (emp.banrao.life/profile)
+// =========================================================================
+app.get('/api/admin/profile/:accountId', async (req, res) => {
+    const { accountId } = req.params;
+    try {
+        // 1. ดึงข้อมูลบัญชี + โปรไฟล์ส่วนตัว
+        const userRes = await pgPool.query(`
+            SELECT
+                ua.account_id, ua.profile_id, ua.username_phone, ua.role,
+                ua.area_code, ua.is_active, ua.created_at AS join_date,
+                to_jsonb(ua) AS ua_json,
+                to_jsonb(up) AS up_json,
+                up.first_name, up.last_name, up.nickname
+            FROM user_accounts ua
+            LEFT JOIN user_profiles up ON ua.profile_id = up.profile_id
+            WHERE ua.account_id = $1
+            LIMIT 1
+        `, [accountId]);
 
+        if (userRes.rows.length === 0) {
+            return res.status(404).json({ success: false, message: 'ไม่พบข้อมูลผู้ใช้งาน' });
+        }
+
+        const u = userRes.rows[0];
+        const upJson = u.up_json || {};
+        const uaJson = u.ua_json || {};
+
+        // ฟังก์ชันช่วยหา URL รูปโปรไฟล์จากทุกชื่อคอลัมน์ที่เป็นไปได้
+        const findAvatar = (obj) => {
+            if (!obj || typeof obj !== 'object') return null;
+            const preferred = [
+                'profile_image_url', 'avatar_url', 'profile_image', 'profile_pic',
+                'profile_picture', 'photo_url', 'image_url', 'picture_url', 'avatar', 'img_url'
+            ];
+            for (const key of preferred) {
+                if (typeof obj[key] === 'string' && obj[key].trim()) return obj[key].trim();
+            }
+            for (const [k, v] of Object.entries(obj)) {
+                if (/(avatar|image|photo|pic|img)/i.test(k) && typeof v === 'string' && v.trim()) {
+                    return v.trim();
+                }
+            }
+            return null;
+        };
+
+        // 2. ดึงข้อมูลพนักงานจาก hr_employees (รหัสพนักงาน, อีเมล, เบอร์โทร, เลขบัตร)
+        const empRes = await pgPool.query(`
+            SELECT * FROM hr_employees
+            WHERE account_id = $1 OR profile_id = $2
+            LIMIT 1
+        `, [accountId, u.profile_id || null]).catch(() => ({ rows: [] }));
+        const emp = empRes.rows[0] || null;
+
+        // 3. ดึงประวัติตำแหน่งงานทั้งหมดจาก hr_assignments
+        let assignments = [];
+        if (emp?.emp_id) {
+            const assignRes = await pgPool.query(`
+                SELECT a.assignment_id, a.scope_level, a.area_code, a.area_name,
+                       a.status, a.is_current, a.start_date, a.end_date, a.created_at, a.note,
+                       o.org_code, o.org_name,
+                       d.dept_code, d.department_name,
+                       pos.pos_code, pos.position_name
+                FROM hr_assignments a
+                LEFT JOIN sys_organizations o ON a.org_id = o.org_id
+                LEFT JOIN sys_departments d ON a.department_id = d.department_id
+                LEFT JOIN sys_positions pos ON a.position_id = pos.position_id
+                WHERE a.emp_id = $1 AND COALESCE(a.is_active, true) = true
+                ORDER BY a.is_current DESC, COALESCE(a.start_date, a.created_at) DESC
+            `, [emp.emp_id]).catch(() => ({ rows: [] }));
+            assignments = assignRes.rows;
+        }
+
+        // 4. ดึงตำแหน่งสำรองจาก user_positions (กรณีบัญชี Super Admin หรือยังไม่มีใน hr_assignments)
+        const activePosRes = await pgPool.query(`
+            SELECT sp.position_id, sp.pos_code, sp.position_name, sp.position_level
+            FROM user_positions upos
+            JOIN sys_positions sp ON upos.position_id = sp.position_id
+            WHERE upos.account_id = $1 AND COALESCE(upos.is_active, true) = true
+        `, [accountId]).catch(() => ({ rows: [] }));
+
+        const currentAssign = assignments.find((a) => a.is_current) || assignments[0] || null;
+        const primaryPosition =
+            currentAssign?.position_name ||
+            activePosRes.rows[0]?.position_name ||
+            (u.username_phone === '0000000000' ? 'Super Admin' : u.role || 'ผู้ใช้งานระบบ');
+
+        res.json({
+            success: true,
+            data: {
+                account_id: u.account_id,
+                profile_id: u.profile_id,
+                username: u.username_phone,
+                emp_code: emp?.emp_code || null,
+                national_id: emp?.national_id || upJson.national_id || upJson.id_card || upJson.id_card_number || null,
+                first_name: emp?.first_name || u.first_name || '',
+                last_name: emp?.last_name || u.last_name || '',
+                nickname: emp?.nickname || u.nickname || '',
+                role: primaryPosition,
+                org_name: currentAssign?.org_name || null,
+                department_name: currentAssign?.department_name || null,
+                scope_level: currentAssign?.scope_level || null,
+                area_code: currentAssign?.area_code || u.area_code || 'TH',
+                area_name: currentAssign?.area_name || 'ส่วนกลาง',
+                email: emp?.email || upJson.email || uaJson.email || '-',
+                phone: emp?.phone || u.username_phone || '-',
+                birth_date: upJson.birth_date || upJson.date_of_birth || upJson.dob || null,
+                gender: upJson.gender || upJson.sex || '-',
+                education: upJson.education || upJson.education_level || null,
+                join_date: u.join_date || null,
+                is_active: Boolean(u.is_active),
+                avatar_url: findAvatar(upJson) || findAvatar(uaJson) || null,
+                assignments
+            }
+        });
+    } catch (err) {
+        console.error('Get Admin Profile Error:', err);
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
 
 
 app.listen(port, () => {
