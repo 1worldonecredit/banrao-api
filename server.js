@@ -7038,7 +7038,7 @@ app.get('/api/water/bills/:villageId', async (req, res) => {
     }
 });
 
-// 9. บันทึกการจดมิเตอร์และออกใบเสร็จ (รวมค่าจ้างคนจดมิเตอร์ + วันที่จด + วันครบกำหนดชำระ)
+// 9. บันทึกการจดมิเตอร์และออกใบเสร็จ (แก้ parameter $18 ซ้ำซ้อนแล้ว)
 app.post('/api/water/bills', async (req, res) => {
     const {
         village_id, meter_id, household_id, member_id, billing_month,
@@ -7063,7 +7063,8 @@ app.post('/api/water/bills', async (req, res) => {
     const rFee = Number(reader_fee || 0);
     const totalAmount = Number((unitsUsed * rate + fee + rFee).toFixed(2));
     const finalPaymentStatus = payment_status || 'UNPAID';
-    const finalMethod = finalPaymentStatus === 'PAID' ? (payment_method || 'CASH') : 'NONE';
+    const isPaidNow = finalPaymentStatus === 'PAID';
+    const finalMethod = isPaidNow ? (payment_method || 'CASH') : 'NONE';
     const billNo = `WB-${String(billing_month).replace('-', '')}-${String(meter_id).padStart(4, '0')}`;
 
     const client = await pgPool.connect();
@@ -7080,7 +7081,7 @@ app.post('/api/water/bills', async (req, res) => {
                 $1, $2, $3, $4, $5, $6,
                 $7, $8, $9, $10, $11, $12, $13,
                 $14, $15, $16, $17, $18, $19,
-                $20, $21, $22, CASE WHEN $18 = 'PAID' THEN CURRENT_TIMESTAMP ELSE NULL END
+                $20, $21, $22, CASE WHEN $23::boolean THEN CURRENT_TIMESTAMP ELSE NULL END
             )
             ON CONFLICT (meter_id, billing_month) DO UPDATE SET
                 previous_reading = EXCLUDED.previous_reading,
@@ -7107,7 +7108,7 @@ app.post('/api/water/bills', async (req, res) => {
             prevNum, currNum, unitsUsed, rate, fee, rFee, totalAmount,
             reading_date || null, due_date || null, reading_photo_url || null,
             visit_status || 'NORMAL', finalPaymentStatus, finalMethod,
-            slip_url || null, note || null, recorded_by || 'STAFF'
+            slip_url || null, note || null, recorded_by || 'STAFF', isPaidNow
         ]);
 
         const unpaidCheck = await client.query(
@@ -7143,7 +7144,7 @@ app.post('/api/water/bills', async (req, res) => {
     }
 });
 
-// 10. รับชำระเงินสำหรับบิลค้างจ่าย / แจ้งโอนแนบสลิปจากเจ้าของบ้าน
+// 10. รับชำระเงินสำหรับบิลค้างจ่าย / แจ้งโอนแนบสลิป (แก้ parameter $1 ซ้ำซ้อนแล้ว)
 app.put('/api/water/bills/:billId/pay', async (req, res) => {
     const { billId } = req.params;
     const { payment_method, payment_status, slip_url, note, changed_by } = req.body;
@@ -7153,17 +7154,18 @@ app.put('/api/water/bills/:billId/pay', async (req, res) => {
         await client.query('BEGIN');
 
         const newStatus = payment_status || 'PAID';
+        const isPaidNow = newStatus === 'PAID';
         const billRes = await client.query(`
             UPDATE water_bills
             SET payment_status = $1,
                 payment_method = $2,
                 slip_url = COALESCE($3, slip_url),
                 note = COALESCE($4, note),
-                paid_at = CASE WHEN $1 = 'PAID' THEN CURRENT_TIMESTAMP ELSE paid_at END,
+                paid_at = CASE WHEN $5::boolean THEN CURRENT_TIMESTAMP ELSE paid_at END,
                 updated_at = CURRENT_TIMESTAMP
-            WHERE bill_id = $5
+            WHERE bill_id = $6
             RETURNING *
-        `, [newStatus, payment_method || 'CASH', slip_url || null, note || null, billId]);
+        `, [newStatus, payment_method || 'CASH', slip_url || null, note || null, isPaidNow, billId]);
 
         if (billRes.rows.length === 0) {
             await client.query('ROLLBACK');
@@ -7193,7 +7195,7 @@ app.put('/api/water/bills/:billId/pay', async (req, res) => {
         ]);
 
         await client.query('COMMIT');
-        res.json({ success: true, message: newStatus === 'PAID' ? 'บันทึกการรับชำระเงินเรียบร้อยแล้ว' : 'ส่งหลักฐานการโอนเงินแล้ว รอเจ้าหน้าที่ตรวจสอบ', data: bill });
+        res.json({ success: true, message: isPaidNow ? 'บันทึกการรับชำระเงินเรียบร้อยแล้ว' : 'ส่งหลักฐานการโอนเงินแล้ว รอเจ้าหน้าที่ตรวจสอบ', data: bill });
     } catch (err) {
         await client.query('ROLLBACK');
         console.error('Pay Water Bill Error:', err);
