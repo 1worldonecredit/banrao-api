@@ -6022,7 +6022,7 @@ app.post('/api/hr/assignments/:assignmentId/approve', async (req, res) => {
 
         await client.query('BEGIN');
 
-        const targetRes = await client.query(`SELECT emp_id FROM hr_assignments WHERE assignment_id = $1`, [assignmentId]);
+        const targetRes = await client.query(`SELECT emp_id , position_id FROM hr_assignments WHERE assignment_id = $1`, [assignmentId]);
         if (targetRes.rows.length === 0) {
             await client.query('ROLLBACK');
             return res.status(404).json({ success: false, message: 'ไม่พบรายการที่ต้องการอนุมัติ' });
@@ -6042,7 +6042,7 @@ app.post('/api/hr/assignments/:assignmentId/approve', async (req, res) => {
             SET status = 'ACTIVE', is_current = true, approved_by = $1, approved_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
             WHERE assignment_id = $2
         `, [approver_id || null, assignmentId]);
-
+        await syncPositionToUserPositions(client, empId, targetRes.rows[0].position_id);
         await client.query('COMMIT');
         res.json({ success: true, message: 'อนุมัติตำแหน่งปัจจุบันเรียบร้อยแล้ว!' });
     } catch (err) {
@@ -6093,7 +6093,9 @@ app.post('/api/hr/assignments/:empId/transfer', async (req, res) => {
             scope_level, area_code || 'TH', area_name || 'ส่วนกลาง', status, isCurrent, note || null,
             isCurrent ? (approver_id || null) : null, isCurrent ? new Date() : null
         ]);
-
+            if (isCurrent) {
+             await syncPositionToUserPositions(client, empId, position_id);
+            }
         await client.query('COMMIT');
         res.json({
             success: true,
