@@ -6782,12 +6782,11 @@ app.delete('/api/water/meters/:meterId', async (req, res) => {
     }
 });
 
-
 // =========================================================================
-// ระบบจดมิเตอร์ ออกบิล รับชำระเงิน (เงินสด / QR พร้อมเพย์) และหน้าค่าน้ำเจ้าของบ้าน
+// ระบบจดมิเตอร์ ออกบิล ค่าจ้างคนจดมิเตอร์ รอบวันที่เก็บ และยอดค้างชำระย้อนหลัง
 // =========================================================================
 
-// 6. ดึงการตั้งค่าเรทค่าน้ำ & บัญชีรับเงิน (PromptPay) ของหมู่บ้าน
+// 6. ดึงการตั้งค่าเรทค่าน้ำ ค่าจ้างคนจดมิเตอร์ รอบวันเก็บ/ครบกำหนด และบัญชีรับเงิน
 app.get('/api/water/settings/:villageId', async (req, res) => {
     const { villageId } = req.params;
     try {
@@ -6799,6 +6798,10 @@ app.get('/api/water/settings/:villageId', async (req, res) => {
             village_id: String(villageId),
             unit_rate: 7,
             meter_fee: 10,
+            reader_fee: 5,
+            reading_day: 25,
+            due_day: 5,
+            due_next_month: true,
             bank_name: '',
             account_name: '',
             account_number: '',
@@ -6811,18 +6814,26 @@ app.get('/api/water/settings/:villageId', async (req, res) => {
     }
 });
 
-// 7. บันทึกการตั้งค่าเรทค่าน้ำ & บัญชีรับเงิน (สำหรับกรรมการหมู่บ้าน)
+// 7. บันทึกการตั้งค่าเรทค่าน้ำ ค่าจ้างคนจดมิเตอร์ รอบวันเก็บ/ครบกำหนด และบัญชีรับเงิน
 app.put('/api/water/settings/:villageId', async (req, res) => {
     const { villageId } = req.params;
-    const { unit_rate, meter_fee, bank_name, account_name, account_number, promptpay_id, updated_by } = req.body;
+    const {
+        unit_rate, meter_fee, reader_fee, reading_day, due_day, due_next_month,
+        bank_name, account_name, account_number, promptpay_id, updated_by
+    } = req.body;
     try {
         const result = await pgPool.query(`
             INSERT INTO water_settings (
-                village_id, unit_rate, meter_fee, bank_name, account_name, account_number, promptpay_id, updated_by, updated_at
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CURRENT_TIMESTAMP)
+                village_id, unit_rate, meter_fee, reader_fee, reading_day, due_day, due_next_month,
+                bank_name, account_name, account_number, promptpay_id, updated_by, updated_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, CURRENT_TIMESTAMP)
             ON CONFLICT (village_id) DO UPDATE SET
                 unit_rate = EXCLUDED.unit_rate,
                 meter_fee = EXCLUDED.meter_fee,
+                reader_fee = EXCLUDED.reader_fee,
+                reading_day = EXCLUDED.reading_day,
+                due_day = EXCLUDED.due_day,
+                due_next_month = EXCLUDED.due_next_month,
                 bank_name = EXCLUDED.bank_name,
                 account_name = EXCLUDED.account_name,
                 account_number = EXCLUDED.account_number,
@@ -6834,32 +6845,70 @@ app.put('/api/water/settings/:villageId', async (req, res) => {
             String(villageId),
             Number(unit_rate ?? 7),
             Number(meter_fee ?? 10),
+            Number(reader_fee ?? 5),
+            Math.min(31, Math.max(1, Number(reading_day ?? 25))),
+            Math.min(31, Math.max(1, Number(due_day ?? 5))),
+            due_next_month !== undefined ? Boolean(due_next_month) : true,
             bank_name || '',
             account_name || '',
             account_number || '',
             String(promptpay_id || '').replace(/\D/g, ''),
             updated_by || 'ADMIN'
         ]);
-        res.json({ success: true, message: 'บันทึกการตั้งค่าค่าน้ำและบัญชีรับเงินเรียบร้อยแล้ว', data: result.rows[0] });
+        res.json({ success: true, message: 'บันทึกการตั้งค่าค่าน้ำและรอบเก็บเงินเรียบร้อยแล้ว', data: result.rows[0] });
     } catch (err) {
         console.error('Save Water Settings Error:', err);
         res.status(500).json({ success: false, message: err.message });
     }
 });
 
-// 8. ดึงรายการจดมิเตอร์รายเดือน + สรุปยอดคนจดมิเตอร์ (เก็บได้เท่าไหร่ เงินสด/โอน บ้านไหนค้างจ่าย)
+// 8. ดึงรายการผู้ใช้น้ำสำหรับจดมิเตอร์ + ยอดค้างย้อนหลังแต่ละรอบเดือน + สรุปยอดคนจดมิเตอร์
 app.get('/api/water/bills/:villageId', async (req, res) => {
     const { villageId } = req.params;
     const billingMonth = req.query.month || new Date().toISOString().slice(0, 7);
 
     try {
-        // ดึงการตั้งค่าหมู่บ้าน
-        const setRes = await pgPool.query(`SELECT * FROM water_settings WHERE village_id = $1 LIMIT 1`, [String(villageId)]);
+        const setRes = await pgPool.query(
+            `SELECT * FROM water_settings WHERE village_id = $1 LIMIT 1`,
+            [String(villageId)]
+        ).catch(() => ({ rows: [] }));
+
         const settings = setRes.rows[0] || {
-            unit_rate: 7, meter_fee: 10, bank_name: '', account_name: '', account_number: '', promptpay_id: ''
+            unit_rate: 7,
+            meter_fee: 10,
+            reader_fee: 5,
+            reading_day: 25,
+            due_day: 5,
+            due_next_month: true,
+            bank_name: '',
+            account_name: '',
+            account_number: '',
+            promptpay_id: ''
         };
 
-        // ดึงมิเตอร์ทั้งหมดที่เปิดใช้งาน ผูกกับบิลของเดือนที่เลือก
+        // ดึงรายการค้างชำระของเดือนอื่นๆ ทั้งหมดในหมู่บ้าน (เพื่อนำมาแสดงว่าค้างรอบเดือนอะไร + ยอดค้างรวม)
+        const arrearsRes = await pgPool.query(`
+            SELECT meter_id, bill_id, bill_no, billing_month, total_amount, payment_status
+            FROM water_bills
+            WHERE village_id::text = $1::text
+              AND payment_status <> 'PAID'
+              AND billing_month <> $2
+            ORDER BY billing_month ASC
+        `, [String(villageId), billingMonth]).catch(() => ({ rows: [] }));
+
+        const arrearsMap = new Map();
+        for (const a of arrearsRes.rows) {
+            if (!arrearsMap.has(a.meter_id)) arrearsMap.set(a.meter_id, []);
+            arrearsMap.get(a.meter_id).push({
+                bill_id: a.bill_id,
+                bill_no: a.bill_no,
+                billing_month: a.billing_month,
+                total_amount: Number(a.total_amount || 0),
+                payment_status: a.payment_status
+            });
+        }
+
+        // ดึงผู้ใช้น้ำทั้งหมดที่เปิดใช้งาน ผูกกับบิลของรอบเดือนที่เลือก
         const result = await pgPool.query(`
             SELECT
                 wm.meter_id, wm.village_id, wm.household_id, wm.member_id,
@@ -6872,7 +6921,8 @@ app.get('/api/water/bills/:villageId', async (req, res) => {
                 t.tambon_name_th, am.amphure_name_th, pr.province_name_th,
                 wb.bill_id, wb.bill_no, wb.billing_month,
                 wb.previous_reading, wb.current_reading, wb.units_used,
-                wb.unit_rate, wb.meter_fee, wb.total_amount,
+                wb.unit_rate, wb.meter_fee, COALESCE(wb.reader_fee, 0) AS reader_fee,
+                wb.total_amount, wb.reading_date, wb.due_date,
                 wb.reading_photo_url, wb.visit_status,
                 wb.payment_status AS bill_payment_status,
                 wb.payment_method, wb.slip_url, wb.note AS bill_note,
@@ -6920,17 +6970,27 @@ app.get('/api/water/bills/:villageId', async (req, res) => {
                 ? (r.village_name.startsWith('บ้าน') ? r.village_name : `บ้าน${r.village_name}`)
                 : '';
 
+            const arrearsList = arrearsMap.get(r.meter_id) || [];
+            const arrearsTotal = Number(
+                arrearsList.reduce((sum, x) => sum + Number(x.total_amount || 0), 0).toFixed(2)
+            );
+            const currentAmount = Number(r.total_amount || 0);
+            const grandTotalWithArrears = Number((currentAmount + arrearsTotal).toFixed(2));
+
             return {
                 ...r,
                 house_no: houseNo,
                 phone,
                 full_name: `${r.first_name || ''} ${r.last_name || ''}`.trim(),
                 full_address: `บ้านเลขที่ ${houseNo} หมู่ ${r.village_no || '-'} ${vName} ต.${r.tambon_name_th || '-'} อ.${r.amphure_name_th || '-'} จ.${r.province_name_th || '-'}`.trim(),
-                member_image: r.member_image || '/profile-img.jpg'
+                member_image: r.member_image || '/profile-img.jpg',
+                arrears_list: arrearsList,
+                arrears_total: arrearsTotal,
+                grand_total_with_arrears: grandTotalWithArrears
             };
         }).sort((a, b) => String(a.house_no).localeCompare(String(b.house_no), 'th', { numeric: true }));
 
-        // คำนวณยอดสรุปให้คนจดมิเตอร์
+        // สรุปยอดรวมทั้งหมดให้คนจดมิเตอร์และเหรัญญิก
         const summary = {
             total_meters: items.length,
             recorded_count: 0,
@@ -6942,14 +7002,19 @@ app.get('/api/water/bills/:villageId', async (req, res) => {
             collected_total: 0,
             collected_cash: 0,
             collected_qr: 0,
-            unpaid_amount: 0
+            unpaid_amount: 0,
+            total_arrears_previous: 0,
+            total_reader_fee: 0
         };
 
         for (const it of items) {
+            summary.total_arrears_previous += Number(it.arrears_total || 0);
+
             if (it.bill_id) {
                 summary.recorded_count += 1;
                 const amt = Number(it.total_amount || 0);
                 summary.total_billed_amount += amt;
+                summary.total_reader_fee += Number(it.reader_fee || 0);
 
                 if (it.bill_payment_status === 'PAID') {
                     summary.paid_count += 1;
@@ -6973,13 +7038,13 @@ app.get('/api/water/bills/:villageId', async (req, res) => {
     }
 });
 
-// 9. บันทึกการจดมิเตอร์และออกบิล/ใบเสร็จ (พร้อมอัปเดตยอดล่าสุด + Audit Log)
+// 9. บันทึกการจดมิเตอร์และออกใบเสร็จ (รวมค่าจ้างคนจดมิเตอร์ + วันที่จด + วันครบกำหนดชำระ)
 app.post('/api/water/bills', async (req, res) => {
     const {
         village_id, meter_id, household_id, member_id, billing_month,
-        previous_reading, current_reading, unit_rate, meter_fee,
-        reading_photo_url, visit_status, payment_status, payment_method,
-        slip_url, note, recorded_by
+        previous_reading, current_reading, unit_rate, meter_fee, reader_fee,
+        reading_date, due_date, reading_photo_url, visit_status,
+        payment_status, payment_method, slip_url, note, recorded_by
     } = req.body;
 
     if (!meter_id || !billing_month) {
@@ -6995,7 +7060,8 @@ app.post('/api/water/bills', async (req, res) => {
     const unitsUsed = Number((currNum - prevNum).toFixed(2));
     const rate = Number(unit_rate || 0);
     const fee = Number(meter_fee || 0);
-    const totalAmount = Number((unitsUsed * rate + fee).toFixed(2));
+    const rFee = Number(reader_fee || 0);
+    const totalAmount = Number((unitsUsed * rate + fee + rFee).toFixed(2));
     const finalPaymentStatus = payment_status || 'UNPAID';
     const finalMethod = finalPaymentStatus === 'PAID' ? (payment_method || 'CASH') : 'NONE';
     const billNo = `WB-${String(billing_month).replace('-', '')}-${String(meter_id).padStart(4, '0')}`;
@@ -7007,14 +7073,14 @@ app.post('/api/water/bills', async (req, res) => {
         const billRes = await client.query(`
             INSERT INTO water_bills (
                 bill_no, village_id, meter_id, household_id, member_id, billing_month,
-                previous_reading, current_reading, units_used, unit_rate, meter_fee, total_amount,
-                reading_photo_url, visit_status, payment_status, payment_method, slip_url, note,
-                recorded_by, paid_at
+                previous_reading, current_reading, units_used, unit_rate, meter_fee, reader_fee, total_amount,
+                reading_date, due_date, reading_photo_url, visit_status, payment_status, payment_method,
+                slip_url, note, recorded_by, paid_at
             ) VALUES (
                 $1, $2, $3, $4, $5, $6,
-                $7, $8, $9, $10, $11, $12,
-                $13, $14, $15, $16, $17, $18,
-                $19, CASE WHEN $15 = 'PAID' THEN CURRENT_TIMESTAMP ELSE NULL END
+                $7, $8, $9, $10, $11, $12, $13,
+                $14, $15, $16, $17, $18, $19,
+                $20, $21, $22, CASE WHEN $18 = 'PAID' THEN CURRENT_TIMESTAMP ELSE NULL END
             )
             ON CONFLICT (meter_id, billing_month) DO UPDATE SET
                 previous_reading = EXCLUDED.previous_reading,
@@ -7022,7 +7088,10 @@ app.post('/api/water/bills', async (req, res) => {
                 units_used = EXCLUDED.units_used,
                 unit_rate = EXCLUDED.unit_rate,
                 meter_fee = EXCLUDED.meter_fee,
+                reader_fee = EXCLUDED.reader_fee,
                 total_amount = EXCLUDED.total_amount,
+                reading_date = EXCLUDED.reading_date,
+                due_date = EXCLUDED.due_date,
                 reading_photo_url = COALESCE(EXCLUDED.reading_photo_url, water_bills.reading_photo_url),
                 visit_status = EXCLUDED.visit_status,
                 payment_status = EXCLUDED.payment_status,
@@ -7035,38 +7104,36 @@ app.post('/api/water/bills', async (req, res) => {
             RETURNING *
         `, [
             billNo, String(village_id), Number(meter_id), String(household_id), String(member_id), billing_month,
-            prevNum, currNum, unitsUsed, rate, fee, totalAmount,
-            reading_photo_url || null, visit_status || 'NORMAL', finalPaymentStatus, finalMethod,
+            prevNum, currNum, unitsUsed, rate, fee, rFee, totalAmount,
+            reading_date || null, due_date || null, reading_photo_url || null,
+            visit_status || 'NORMAL', finalPaymentStatus, finalMethod,
             slip_url || null, note || null, recorded_by || 'STAFF'
         ]);
 
-        // เช็กว่ามิเตอร์นี้มีบิลค้างชำระเหลืออยู่หรือไม่
         const unpaidCheck = await client.query(
             `SELECT COUNT(*)::int AS cnt FROM water_bills WHERE meter_id = $1 AND payment_status <> 'PAID'`,
             [Number(meter_id)]
         );
         const meterPayStatus = unpaidCheck.rows[0].cnt > 0 ? 'OVERDUE' : 'PAID';
 
-        // อัปเดตเลขมิเตอร์ล่าสุดและสถานะการจ่ายในตาราง water_meters
         await client.query(`
             UPDATE water_meters
             SET last_meter_reading = $1, payment_status = $2, updated_at = CURRENT_TIMESTAMP
             WHERE meter_id = $3
         `, [currNum, meterPayStatus, Number(meter_id)]);
 
-        // เก็บ Audit Log
         await client.query(`
             INSERT INTO water_meter_status_logs (meter_id, meter_status, payment_status, note, changed_by)
             VALUES ($1, 'ACTIVE', $2, $3, $4)
         `, [
             Number(meter_id),
             meterPayStatus,
-            `จดมิเตอร์รอบ ${billing_month} (${prevNum}→${currNum} = ${unitsUsed} หน่วย, ${totalAmount} บาท, ${finalPaymentStatus})`,
+            `จดมิเตอร์รอบ ${billing_month} (${prevNum}→${currNum} = ${unitsUsed} หน่วย, ค่าจด ${rFee} บ., รวม ${totalAmount} บ., ${finalPaymentStatus})`,
             recorded_by || 'STAFF'
         ]);
 
         await client.query('COMMIT');
-        res.json({ success: true, message: 'บันทึกการจดมิเตอร์และออกบิลเรียบร้อยแล้ว', data: billRes.rows[0] });
+        res.json({ success: true, message: 'บันทึกการจดมิเตอร์และออกใบเสร็จเรียบร้อยแล้ว', data: billRes.rows[0] });
     } catch (err) {
         await client.query('ROLLBACK');
         console.error('Save Water Bill Error:', err);
@@ -7136,11 +7203,10 @@ app.put('/api/water/bills/:billId/pay', async (req, res) => {
     }
 });
 
-// 11. ดึงบิลค่าน้ำสำหรับเจ้าของบ้าน (เชื่อมจากบัญชีที่ Login -> เลขบัตร -> บ้านของตนเอง)
+// 11. ดึงบิลค่าน้ำสำหรับเจ้าของบ้าน (พร้อมยอดค้างรวมและวันที่ไทย)
 app.get('/api/water/my-bills/:accountId', async (req, res) => {
     const { accountId } = req.params;
     try {
-        // 1. หาเลขบัตรประชาชนจากบัญชีที่ Login
         const userRes = await pgPool.query(`
             SELECT ua.account_id, ua.village_id, to_jsonb(up) AS up_json
             FROM user_accounts ua
@@ -7158,7 +7224,6 @@ app.get('/api/water/my-bills/:accountId', async (req, res) => {
             upJson.national_id || upJson.citizen_id || upJson.id_card || upJson.id_card_number || ''
         ).replace(/\D/g, '');
 
-        // 2. หา household_id ทั้งหมดที่บุคคลนี้อาศัยอยู่
         let householdIds = [];
         if (cleanCid.length === 13) {
             const hmRes = await pgPool.query(`
@@ -7174,10 +7239,10 @@ app.get('/api/water/my-bills/:accountId', async (req, res) => {
             return res.json({ success: true, data: [], settings: null });
         }
 
-        // 3. ดึงบิลค่าน้ำทั้งหมดของบ้านที่ผู้ใช้นี้อาศัยอยู่
         const billsRes = await pgPool.query(`
             SELECT
                 wb.*,
+                COALESCE(wb.reader_fee, 0) AS reader_fee,
                 wm.meter_code, wm.meter_status,
                 to_jsonb(h) AS h_json,
                 hm.first_name, hm.last_name,
