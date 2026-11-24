@@ -6281,14 +6281,20 @@ app.put('/api/hr/approval-pin', async (req, res) => {
 app.get('/api/admin/profile/:accountId', async (req, res) => {
     const { accountId } = req.params;
     try {
-        // 1. ดึงข้อมูลบัญชี + โปรไฟล์ส่วนตัว
+        // 1. ดึงข้อมูลบัญชี + โปรไฟล์ส่วนตัว + รูปโปรไฟล์จาก citizen_profiles_media
         const userRes = await pgPool.query(`
             SELECT
                 ua.account_id, ua.profile_id, ua.username_phone, ua.role,
                 ua.area_code, ua.is_active, ua.created_at AS join_date,
                 to_jsonb(ua) AS ua_json,
                 to_jsonb(up) AS up_json,
-                up.first_name, up.last_name, up.nickname
+                up.first_name, up.last_name, up.nickname,
+                (
+                    SELECT cpm.image_url
+                    FROM citizen_profiles_media cpm
+                    WHERE cpm.profile_id = ua.profile_id AND cpm.is_active = true
+                    LIMIT 1
+                ) AS user_image
             FROM user_accounts ua
             LEFT JOIN user_profiles up ON ua.profile_id = up.profile_id
             WHERE ua.account_id = $1
@@ -6303,7 +6309,7 @@ app.get('/api/admin/profile/:accountId', async (req, res) => {
         const upJson = u.up_json || {};
         const uaJson = u.ua_json || {};
 
-        // ฟังก์ชันช่วยหา URL รูปโปรไฟล์จากทุกชื่อคอลัมน์ที่เป็นไปได้
+        // ฟังก์ชันช่วยหา URL รูปโปรไฟล์สำรอง
         const findAvatar = (obj) => {
             if (!obj || typeof obj !== 'object') return null;
             const preferred = [
@@ -6321,7 +6327,7 @@ app.get('/api/admin/profile/:accountId', async (req, res) => {
             return null;
         };
 
-        // 2. ดึงข้อมูลพนักงานจาก hr_employees (รหัสพนักงาน, อีเมล, เบอร์โทร, เลขบัตร)
+        // 2. ดึงข้อมูลพนักงานจาก hr_employees
         const empRes = await pgPool.query(`
             SELECT * FROM hr_employees
             WHERE account_id = $1 OR profile_id = $2
@@ -6348,7 +6354,7 @@ app.get('/api/admin/profile/:accountId', async (req, res) => {
             assignments = assignRes.rows;
         }
 
-        // 4. ดึงตำแหน่งสำรองจาก user_positions (กรณีบัญชี Super Admin หรือยังไม่มีใน hr_assignments)
+        // 4. ดึงตำแหน่งสำรองจาก user_positions
         const activePosRes = await pgPool.query(`
             SELECT sp.position_id, sp.pos_code, sp.position_name, sp.position_level
             FROM user_positions upos
@@ -6386,7 +6392,7 @@ app.get('/api/admin/profile/:accountId', async (req, res) => {
                 education: upJson.education || upJson.education_level || null,
                 join_date: u.join_date || null,
                 is_active: Boolean(u.is_active),
-                avatar_url: findAvatar(upJson) || findAvatar(uaJson) || null,
+                avatar_url: u.user_image || findAvatar(upJson) || findAvatar(uaJson) || null,
                 assignments
             }
         });
@@ -6395,7 +6401,6 @@ app.get('/api/admin/profile/:accountId', async (req, res) => {
         res.status(500).json({ success: false, message: err.message });
     }
 });
-
 
 app.listen(port, () => {
     console.log(`Server is running on port ${port}`);
