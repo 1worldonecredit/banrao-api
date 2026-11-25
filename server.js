@@ -8301,14 +8301,14 @@ app.post('/api/water/bills/:billId/void', async (req, res) => {
     }
 });
 
-// 11. ดึงบิลค่าน้ำสำหรับเจ้าของบ้าน (แยกใบแจ้งหนี้ vs ใบเสร็จรับเงิน + ใช้ Snapshot ประวัติเดิมไม่เปลี่ยนตามกรรมการใหม่)
+// 11. ดึงบิลค่าน้ำสำหรับเจ้าของบ้าน (ส่งชื่อผู้ใช้น้ำ + เบอร์โทร + Snapshot ครบถ้วน)
 app.get('/api/water/my-bills/:accountId', async (req, res) => {
     const decoded = verifyRequestJwt(req);
     const accountId = decoded?.account_id || req.params.accountId;
 
     try {
         const userRes = await pgPool.query(`
-            SELECT ua.account_id, ua.village_id, to_jsonb(up) AS up_json
+            SELECT ua.account_id, ua.village_id, ua.username_phone, to_jsonb(up) AS up_json
             FROM user_accounts ua
             LEFT JOIN user_profiles up ON ua.profile_id = up.profile_id
             WHERE ua.account_id::text = $1::text
@@ -8347,14 +8347,29 @@ app.get('/api/water/my-bills/:accountId', async (req, res) => {
                 COALESCE(wb.is_locked, wb.payment_status = 'PAID') AS is_locked,
                 COALESCE(wb.is_voided, false) AS is_voided,
                 wm.meter_code, wm.meter_status,
+                to_jsonb(wm) AS wm_json,
                 to_jsonb(h) AS h_json,
                 hm.first_name, hm.last_name,
+                to_jsonb(hm) AS hm_json,
+                to_jsonb(up_m) AS up_json,
+                ua_m.username_phone AS account_phone,
                 v.village_no, v.village_name,
                 t.tambon_name_th, am.amphure_name_th, pr.province_name_th
             FROM water_bills wb
             JOIN water_meters wm ON wb.meter_id = wm.meter_id
             LEFT JOIN households h ON wb.household_id::text = h.household_id::text
             LEFT JOIN household_members hm ON wb.member_id::text = hm.member_id::text
+            LEFT JOIN LATERAL (
+                SELECT p.* FROM user_profiles p
+                WHERE COALESCE(hm.citizen_id::text, '') <> ''
+                  AND REGEXP_REPLACE(COALESCE(p.citizen_id, ''), '[^0-9]', '', 'g') = REGEXP_REPLACE(COALESCE(hm.citizen_id::text, ''), '[^0-9]', '', 'g')
+                LIMIT 1
+            ) up_m ON true
+            LEFT JOIN LATERAL (
+                SELECT a.username_phone FROM user_accounts a
+                WHERE a.profile_id = up_m.profile_id
+                LIMIT 1
+            ) ua_m ON true
             LEFT JOIN villages v ON wb.village_id::text = v.village_id::text
             LEFT JOIN sys_tambons t ON v.tambon_id = t.tambon_id
             LEFT JOIN sys_amphures am ON t.amphure_id = am.amphure_id
@@ -8376,15 +8391,30 @@ app.get('/api/water/my-bills/:accountId', async (req, res) => {
 
         const formatted = billsRes.rows.map((r) => {
             const hJson = r.h_json || {};
+            const hmj = r.hm_json || {};
+            const wmj = r.wm_json || {};
+            const upj = r.up_json || {};
             const houseNo = r.snapshot_house_no || hJson.house_no || hJson.house_number || hJson.address_no || '-';
             const vName = r.village_name
                 ? (r.village_name.startsWith('บ้าน') ? r.village_name : `บ้าน${r.village_name}`)
                 : '';
+            const fullName =
+                (r.snapshot_customer_name || '').trim() ||
+                `${r.first_name || ''} ${r.last_name || ''}`.trim() ||
+                `${upj.first_name || ''} ${upj.last_name || ''}`.trim() ||
+                '-';
+            const resolvedPhone =
+                hmj.phone || hmj.phone_number || hmj.tel ||
+                wmj.phone || wmj.contact_phone || wmj.phone_number ||
+                upj.phone || upj.phone_number || upj.tel ||
+                r.account_phone || '';
+
             return {
                 ...r,
                 house_no: houseNo,
                 meter_code: r.snapshot_meter_no || r.meter_code,
-                full_name: r.snapshot_customer_name || `${r.first_name || ''} ${r.last_name || ''}`.trim(),
+                full_name: fullName,
+                phone: resolvedPhone,
                 full_address: `บ้านเลขที่ ${houseNo} หมู่ ${r.village_no || '-'} ${vName} ต.${r.tambon_name_th || '-'} อ.${r.amphure_name_th || '-'} จ.${r.province_name_th || '-'}`.trim()
             };
         });
