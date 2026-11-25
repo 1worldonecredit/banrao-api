@@ -7581,95 +7581,180 @@ app.put('/api/water/rates/:villageId', async (req, res) => {
         client.release();
     }
 });
+// =========================================================================
+// 🌟 ระบบเอกสารน้ำประปา V2: แยกใบแจ้งหนี้/ใบเสร็จ + Snapshot + ล็อกห้ามลบ + ยกเลิก (Void)
+// =========================================================================
 
-// 8. ดึงรายการผู้ใช้น้ำสำหรับจดมิเตอร์ + ยอดค้างย้อนหลัง + ข้อมูลหัวสลิปหมู่บ้าน/ประธานกรรมการ
+// ตัวช่วยดึงข้อมูล Snapshot ณ วันที่ออกเอกสาร/รับเงิน (เปลี่ยนกรรมการในอนาคต บิลเก่าไม่เปลี่ยนตาม)
+async function buildWaterBillSnapshot(client, { villageId, meterId, householdId, memberId, readerAccountId, readerNameInput }) {
+    const setRes = await client.query(
+        `SELECT * FROM water_settings WHERE village_id::text = $1::text LIMIT 1`,
+        [String(villageId)]
+    ).catch(() => ({ rows: [] }));
+    const settings = setRes.rows[0] || null;
+    const header = typeof getVillageSlipHeader === 'function'
+        ? await getVillageSlipHeader(villageId, settings).catch(() => null)
+        : null;
+
+    // ดึงชื่อผู้ใหญ่บ้าน / ประธานประปา / เหรัญญิก ณ ปัจจุบันเพื่อเก็บเป็น Snapshot
+    const vRes = await client.query(`
+        SELECT v.village_name, v.village_no, t.tambon_name_th, am.amphure_name_th, pr.province_name_th,
+               COALESCE(hp.first_name || ' ' || hp.last_name, '') AS headman_name
+        FROM villages v
+        LEFT JOIN sys_tambons t ON v.tambon_id = t.tambon_id
+        LEFT JOIN sys_amphures am ON t.amphure_id = am.amphure_id
+        LEFT JOIN sys_provinces pr ON am.province_id = pr.province_id
+        LEFT JOIN user_accounts ha ON v.headman_account_id = ha.account_id
+        LEFT JOIN user_profiles hp ON ha.profile_id = hp.profile_id
+        WHERE v.village_id::text = $1::text
+        LIMIT 1
+    `, [String(villageId)]).catch(() => ({ rows: [] }));
+    const vRow = vRes.rows[0] || {};
+
+    const waterOfficersRes = await client.query(`
+        SELECT up.role_template_code,
+               COALESCE(prof.first_name || ' ' || prof.last_name, hm.first_name || ' ' || hm.last_name, '') AS full_name
+        FROM user_positions up
+        LEFT JOIN user_accounts ua ON up.account_id = ua.account_id
+        LEFT JOIN user_profiles prof ON ua.profile_id = prof.profile_id
+        LEFT JOIN household_members hm ON up.member_id IS NOT NULL AND hm.member_id::text = up.member_id::text
+        WHERE up.village_id::text = $1::text
+          AND up.is_active = true
+          AND up.status = 'ACTIVE'
+          AND up.role_template_code IN ('WATER_PRESIDENT', 'WATER_TREASURER')
+        ORDER BY up.approved_at DESC NULLS LAST, up.id DESC
+    `, [String(villageId)]).catch(() => ({ rows: [] }));
+
+    const activePresident = waterOfficersRes.rows.find((r) => r.role_template_code === 'WATER_PRESIDENT')?.full_name?.trim() || '';
+    const activeTreasurer = waterOfficersRes.rows.find((r) => r.role_template_code === 'WATER_TREASURER')?.full_name?.trim() || '';
+
+    const meterRes = await client.query(`
+        SELECT wm.meter_code, to_jsonb(h) AS h_json, hm.first_name, hm.last_name
+        FROM water_meters wm
+        LEFT JOIN households h ON wm.household_id::text = h.household_id::text
+        LEFT JOIN household_members hm ON wm.member_id::text = hm.member_id::text
+        WHERE wm.meter_id = $1
+        LIMIT 1
+    `, [Number(meterId)]).catch(() => ({ rows: [] }));
+    const mRow = meterRes.rows[0] || {};
+    const hj = mRow.h_json || {};
+
+    const vName = vRow.village_name
+        ? (vRow.village_name.startsWith('บ้าน') ? vRow.village_name : `บ้าน${vRow.village_name}`)
+        : (header?.village_title || '');
+    const vFullAddr = header?.village_full_address || [
+        vRow.village_no ? `หมู่ที่ ${vRow.village_no}` : '',
+        vName,
+        vRow.tambon_name_th ? `ต.${vRow.tambon_name_th}` : '',
+        vRow.amphure_name_th ? `อ.${vRow.amphure_name_th}` : '',
+        vRow.province_name_th ? `จ.${vRow.province_name_th}` : ''
+    ].filter(Boolean).join(' ');
+
+    return {
+        snapshot_village_name: header?.village_title || vName || null,
+        snapshot_village_address: vFullAddr || null,
+        snapshot_headman_name: vRow.headman_name?.trim() || null,
+        snapshot_president_name: (settings?.president_name || '').trim() || activePresident || header?.president_name || null,
+        snapshot_treasurer_name: activeTreasurer || null,
+        snapshot_reader_account_id: isValidUuidV3(readerAccountId) ? readerAccountId : null,
+        snapshot_reader_name: (readerNameInput || '').trim() || null,
+        snapshot_customer_name: `${mRow.first_name || ''} ${mRow.last_name || ''}`.trim() || null,
+        snapshot_house_no: hj.house_no || hj.house_number || hj.address_no || null,
+        snapshot_meter_no: mRow.meter_code || null
+    };
+}
+
+// คำนวณสถานะมิเตอร์ใหม่ (นับเฉพาะบิลที่ยังไม่ถูกยกเลิก)
+async function recalcMeterPaymentStatus(client, meterId) {
+    const unpaidCheck = await client.query(`
+        SELECT COUNT(*)::int AS cnt
+        FROM water_bills
+        WHERE meter_id = $1
+          AND COALESCE(is_voided, false) = false
+          AND payment_status <> 'PAID'
+    `, [Number(meterId)]);
+    const meterPayStatus = unpaidCheck.rows[0].cnt > 0 ? 'OVERDUE' : 'PAID';
+    await client.query(
+        `UPDATE water_meters SET payment_status = $1, updated_at = CURRENT_TIMESTAMP WHERE meter_id = $2`,
+        [meterPayStatus, Number(meterId)]
+    );
+    return meterPayStatus;
+}
+
+// 8. ดึงรายการจดมิเตอร์และบิลประจำเดือนของหมู่บ้าน (แยกบิลใช้งานจริง vs บิลที่ยกเลิก + ส่ง Snapshot ครบ)
 app.get('/api/water/bills/:villageId', async (req, res) => {
     const { villageId } = req.params;
     const billingMonth = req.query.month || new Date().toISOString().slice(0, 7);
 
     try {
         const setRes = await pgPool.query(
-            `SELECT * FROM water_settings WHERE village_id = $1 LIMIT 1`,
+            `SELECT * FROM water_settings WHERE village_id::text = $1::text LIMIT 1`,
             [String(villageId)]
-        ).catch(() => ({ rows: [] }));
-
+        );
         const settings = setRes.rows[0] || {
-            unit_rate: 7,
-            meter_fee: 10,
-            reader_fee: 5,
-            reading_day: 25,
-            due_day: 5,
-            due_next_month: true,
-            bank_name: '',
-            account_name: '',
-            account_number: '',
-            promptpay_id: '',
-            president_name: ''
+            unit_rate: 7, meter_fee: 10, reader_fee: 5,
+            reading_day: 25, due_day: 5, due_next_month: true,
+            bank_name: '', account_name: '', account_number: '', promptpay_id: '', president_name: ''
         };
+        const villageInfo = typeof getVillageSlipHeader === 'function'
+            ? await getVillageSlipHeader(villageId, settings)
+            : { village_title: 'หมู่บ้านประปาชุมชน', village_full_address: '', president_name: settings.president_name || '' };
 
-        const villageInfo = await getVillageSlipHeader(villageId, settings);
-
-        const arrearsRes = await pgPool.query(`
-            SELECT meter_id, bill_id, bill_no, billing_month, total_amount, payment_status
-            FROM water_bills
-            WHERE village_id::text = $1::text
-              AND payment_status <> 'PAID'
-              AND billing_month <> $2
-            ORDER BY billing_month ASC
-        `, [String(villageId), billingMonth]).catch(() => ({ rows: [] }));
-
-        const arrearsMap = new Map();
-        for (const a of arrearsRes.rows) {
-            if (!arrearsMap.has(a.meter_id)) arrearsMap.set(a.meter_id, []);
-            arrearsMap.get(a.meter_id).push({
-                bill_id: a.bill_id,
-                bill_no: a.bill_no,
-                billing_month: a.billing_month,
-                total_amount: Number(a.total_amount || 0),
-                payment_status: a.payment_status
-            });
-        }
-
-        const result = await pgPool.query(`
+        // ดึงมิเตอร์ที่ Active + บิลรอบเดือนนี้ (เฉพาะที่ไม่ถูกยกเลิก)
+        const metersRes = await pgPool.query(`
             SELECT
-                wm.meter_id, wm.village_id, wm.household_id, wm.member_id,
-                wm.meter_code, wm.meter_status, wm.payment_status AS meter_payment_status,
-                wm.last_meter_reading, wm.latitude, wm.longitude,
+                wm.meter_id,
+                wm.meter_code,
+                wm.household_id,
+                wm.member_id,
+                wm.meter_status,
+                wm.last_meter_reading,
+                to_jsonb(wm) AS wm_json,
                 to_jsonb(h) AS h_json,
+                hm.first_name,
+                hm.last_name,
                 to_jsonb(hm) AS hm_json,
-                hm.first_name, hm.last_name, hm.citizen_id,
-                v.village_no, v.village_name,
-                t.tambon_name_th, am.amphure_name_th, pr.province_name_th,
-                wb.bill_id, wb.bill_no, wb.billing_month,
-                wb.previous_reading, wb.current_reading, wb.units_used,
-                wb.unit_rate, wb.meter_fee, COALESCE(wb.reader_fee, 0) AS reader_fee,
-                wb.total_amount, wb.reading_date, wb.due_date,
-                wb.reading_photo_url, wb.visit_status,
+                v.village_no,
+                v.village_name,
+                t.tambon_name_th,
+                am.amphure_name_th,
+                pr.province_name_th,
+                COALESCE(media.image_url, '/profile-img.jpg') AS member_image,
+                wb.bill_id,
+                wb.bill_no,
+                wb.billing_month,
+                wb.previous_reading,
+                wb.current_reading,
+                wb.units_used,
+                wb.unit_rate,
+                wb.meter_fee,
+                COALESCE(wb.reader_fee, 0) AS reader_fee,
+                wb.total_amount,
+                wb.reading_date,
+                wb.due_date,
+                wb.reading_photo_url,
+                wb.visit_status,
                 wb.payment_status AS bill_payment_status,
-                wb.payment_method, wb.slip_url, wb.note AS bill_note,
-                wb.recorded_by, wb.paid_at, wb.created_at AS bill_created_at,
-                (
-                    SELECT cpm.image_url
-                    FROM user_profiles up
-                    JOIN citizen_profiles_media cpm ON cpm.profile_id = up.profile_id AND cpm.is_active = true
-                    WHERE REGEXP_REPLACE(
-                        COALESCE(to_jsonb(up)->>'national_id', to_jsonb(up)->>'citizen_id', to_jsonb(up)->>'id_card', ''),
-                        '[^0-9]', '', 'g'
-                    ) = REGEXP_REPLACE(COALESCE(hm.citizen_id::text, ''), '[^0-9]', '', 'g')
-                    AND COALESCE(hm.citizen_id::text, '') <> ''
-                    LIMIT 1
-                ) AS member_image,
-                (
-                    SELECT ua.username_phone
-                    FROM user_profiles up
-                    JOIN user_accounts ua ON ua.profile_id = up.profile_id
-                    WHERE REGEXP_REPLACE(
-                        COALESCE(to_jsonb(up)->>'national_id', to_jsonb(up)->>'citizen_id', to_jsonb(up)->>'id_card', ''),
-                        '[^0-9]', '', 'g'
-                    ) = REGEXP_REPLACE(COALESCE(hm.citizen_id::text, ''), '[^0-9]', '', 'g')
-                    AND COALESCE(hm.citizen_id::text, '') <> ''
-                    LIMIT 1
-                ) AS account_phone
+                wb.payment_method,
+                wb.slip_url,
+                wb.note AS bill_note,
+                wb.recorded_by,
+                wb.paid_at,
+                COALESCE(wb.document_stage, CASE WHEN wb.payment_status = 'PAID' THEN 'RECEIPT' ELSE 'INVOICE' END) AS document_stage,
+                wb.receipt_no,
+                wb.receipt_issued_at,
+                COALESCE(wb.is_locked, wb.payment_status = 'PAID') AS is_locked,
+                COALESCE(wb.is_voided, false) AS is_voided,
+                wb.snapshot_village_name,
+                wb.snapshot_village_address,
+                wb.snapshot_headman_name,
+                wb.snapshot_president_name,
+                wb.snapshot_treasurer_name,
+                wb.snapshot_reader_name,
+                wb.snapshot_receiver_name,
+                wb.snapshot_customer_name,
+                wb.snapshot_house_no,
+                wb.snapshot_meter_no
             FROM water_meters wm
             LEFT JOIN households h ON wm.household_id::text = h.household_id::text
             LEFT JOIN household_members hm ON wm.member_id::text = hm.member_id::text
@@ -7677,85 +7762,127 @@ app.get('/api/water/bills/:villageId', async (req, res) => {
             LEFT JOIN sys_tambons t ON v.tambon_id = t.tambon_id
             LEFT JOIN sys_amphures am ON t.amphure_id = am.amphure_id
             LEFT JOIN sys_provinces pr ON am.province_id = pr.province_id
-            LEFT JOIN water_bills wb ON wb.meter_id = wm.meter_id AND wb.billing_month = $2
-            WHERE wm.village_id::text = $1::text AND wm.is_active = true
-            ORDER BY wm.meter_id ASC
+            LEFT JOIN user_profiles up ON REGEXP_REPLACE(COALESCE(up.citizen_id, ''), '[^0-9]', '', 'g') = REGEXP_REPLACE(COALESCE(hm.citizen_id::text, ''), '[^0-9]', '', 'g')
+            LEFT JOIN LATERAL (
+                SELECT cpm.image_url FROM citizen_profiles_media cpm
+                WHERE cpm.profile_id = up.profile_id AND cpm.is_active = true
+                LIMIT 1
+            ) media ON true
+            LEFT JOIN water_bills wb
+                ON wb.meter_id = wm.meter_id
+               AND wb.billing_month = $2
+               AND COALESCE(wb.is_voided, false) = false
+            WHERE wm.village_id::text = $1::text
+              AND wm.is_active = true
+            ORDER BY COALESCE(to_jsonb(h)->>'house_no', to_jsonb(h)->>'house_number', ''), wm.meter_id ASC
         `, [String(villageId), billingMonth]);
 
-        const items = result.rows.map((r) => {
-            const hJson = r.h_json || {};
-            const hmJson = r.hm_json || {};
-            const houseNo = hJson.house_no || hJson.house_number || hJson.address_no || '-';
-            const phone = hmJson.phone || hmJson.phone_number || hmJson.tel || r.account_phone || '';
-            const vName = r.village_name
-                ? (r.village_name.startsWith('บ้าน') ? r.village_name : `บ้าน${r.village_name}`)
-                : '';
+        // ดึงบิลค้างชำระเดือนก่อนๆ (เฉพาะที่ไม่ถูกยกเลิก)
+        const arrearsRes = await pgPool.query(`
+            SELECT bill_id, bill_no, meter_id, billing_month, total_amount
+            FROM water_bills
+            WHERE village_id::text = $1::text
+              AND billing_month < $2
+              AND COALESCE(is_voided, false) = false
+              AND payment_status <> 'PAID'
+            ORDER BY billing_month ASC
+        `, [String(villageId), billingMonth]);
 
-            const arrearsList = arrearsMap.get(r.meter_id) || [];
-            const arrearsTotal = Number(
-                arrearsList.reduce((sum, x) => sum + Number(x.total_amount || 0), 0).toFixed(2)
-            );
-            const currentAmount = Number(r.total_amount || 0);
-            const grandTotalWithArrears = Number((currentAmount + arrearsTotal).toFixed(2));
+        const arrearsByMeter = {};
+        for (const a of arrearsRes.rows) {
+            if (!arrearsByMeter[a.meter_id]) arrearsByMeter[a.meter_id] = [];
+            arrearsByMeter[a.meter_id].push(a);
+        }
 
-            return {
-                ...r,
-                house_no: houseNo,
-                phone,
-                full_name: `${r.first_name || ''} ${r.last_name || ''}`.trim(),
-                full_address: `บ้านเลขที่ ${houseNo} หมู่ ${r.village_no || '-'} ${vName} ต.${r.tambon_name_th || '-'} อ.${r.amphure_name_th || '-'} จ.${r.province_name_th || '-'}`.trim(),
-                member_image: r.member_image || '/profile-img.jpg',
-                arrears_list: arrearsList,
-                arrears_total: arrearsTotal,
-                grand_total_with_arrears: grandTotalWithArrears
-            };
-        }).sort((a, b) => String(a.house_no).localeCompare(String(b.house_no), 'th', { numeric: true }));
+        // ดึงบิลที่ถูกยกเลิก (Voided) ในรอบเดือนนี้เพื่อแสดงในรายงานตรวจสอบบัญชี
+        const voidedRes = await pgPool.query(`
+            SELECT
+                wb.bill_id, wb.bill_no, wb.receipt_no, wb.billing_month, wb.total_amount,
+                wb.units_used, wb.previous_reading, wb.current_reading,
+                wb.voided_at, wb.voided_by_name, wb.void_reason,
+                COALESCE(wb.snapshot_house_no, to_jsonb(h)->>'house_no', '-') AS house_no,
+                COALESCE(wb.snapshot_meter_no, wm.meter_code, '-') AS meter_code,
+                COALESCE(wb.snapshot_customer_name, hm.first_name || ' ' || hm.last_name, '-') AS full_name,
+                COALESCE(wb.snapshot_reader_name, wb.recorded_by, '-') AS reader_name
+            FROM water_bills wb
+            LEFT JOIN water_meters wm ON wb.meter_id = wm.meter_id
+            LEFT JOIN households h ON wb.household_id::text = h.household_id::text
+            LEFT JOIN household_members hm ON wb.member_id::text = hm.member_id::text
+            WHERE wb.village_id::text = $1::text
+              AND wb.billing_month = $2
+              AND COALESCE(wb.is_voided, false) = true
+            ORDER BY wb.voided_at DESC NULLS LAST, wb.bill_id DESC
+        `, [String(villageId), billingMonth]);
 
         const summary = {
-            total_meters: items.length,
+            total_meters: metersRes.rows.length,
             recorded_count: 0,
             unrecorded_count: 0,
             paid_count: 0,
             unpaid_count: 0,
             not_found_count: 0,
-            total_billed_amount: 0,
             collected_total: 0,
             collected_cash: 0,
             collected_qr: 0,
             unpaid_amount: 0,
             total_arrears_previous: 0,
-            total_reader_fee: 0
+            total_reader_fee: 0,
+            voided_count: voidedRes.rows.length
         };
 
-        for (const it of items) {
-            summary.total_arrears_previous += Number(it.arrears_total || 0);
-            if (it.bill_id) {
+        const data = metersRes.rows.map((r) => {
+            const hj = r.h_json || {};
+            const hmj = r.hm_json || {};
+            const wmj = r.wm_json || {};
+            const houseNo = r.snapshot_house_no || hj.house_no || hj.house_number || hj.address_no || '-';
+            const vName = r.village_name
+                ? (r.village_name.startsWith('บ้าน') ? r.village_name : `บ้าน${r.village_name}`)
+                : '';
+            const fullName = r.snapshot_customer_name || `${r.first_name || ''} ${r.last_name || ''}`.trim() || '-';
+            const fullAddress = `บ้านเลขที่ ${houseNo} หมู่ ${r.village_no || '-'} ${vName} ต.${r.tambon_name_th || '-'} อ.${r.amphure_name_th || '-'} จ.${r.province_name_th || '-'}`.trim();
+
+            const arrearsList = arrearsByMeter[r.meter_id] || [];
+            const arrearsTotal = arrearsList.reduce((s, a) => s + Number(a.total_amount || 0), 0);
+            summary.total_arrears_previous += arrearsTotal;
+
+            if (r.bill_id) {
                 summary.recorded_count += 1;
-                const amt = Number(it.total_amount || 0);
-                summary.total_billed_amount += amt;
-                summary.total_reader_fee += Number(it.reader_fee || 0);
-                if (it.bill_payment_status === 'PAID') {
+                summary.total_reader_fee += Number(r.reader_fee || 0);
+                if (r.bill_payment_status === 'PAID') {
                     summary.paid_count += 1;
-                    summary.collected_total += amt;
-                    if (it.payment_method === 'CASH') summary.collected_cash += amt;
-                    else summary.collected_qr += amt;
+                    summary.collected_total += Number(r.total_amount || 0);
+                    if (r.payment_method === 'CASH') summary.collected_cash += Number(r.total_amount || 0);
+                    else summary.collected_qr += Number(r.total_amount || 0);
                 } else {
                     summary.unpaid_count += 1;
-                    summary.unpaid_amount += amt;
+                    summary.unpaid_amount += Number(r.total_amount || 0);
+                    if (r.visit_status === 'NOT_FOUND') summary.not_found_count += 1;
                 }
-                if (it.visit_status === 'NOT_FOUND') summary.not_found_count += 1;
             } else {
                 summary.unrecorded_count += 1;
             }
-        }
+
+            return {
+                ...r,
+                house_no: houseNo,
+                full_name: fullName,
+                full_address: fullAddress,
+                phone: hmj.phone || hmj.phone_number || hmj.tel || '',
+                latitude: wmj.latitude ?? wmj.lat ?? null,
+                longitude: wmj.longitude ?? wmj.lng ?? null,
+                arrears_list: arrearsList,
+                arrears_total: arrearsTotal,
+                grand_total_with_arrears: Number(r.total_amount || 0) + arrearsTotal
+            };
+        });
 
         res.json({
             success: true,
-            billing_month: billingMonth,
             settings,
             village_info: villageInfo,
             summary,
-            data: items
+            data,
+            voided_bills: voidedRes.rows
         });
     } catch (err) {
         console.error('Get Water Bills Error:', err);
@@ -7763,7 +7890,7 @@ app.get('/api/water/bills/:villageId', async (req, res) => {
     }
 });
 
-// 9. บันทึกการจดมิเตอร์และออกใบเสร็จ (แก้ parameter $18 ซ้ำซ้อนแล้ว)
+// 9. บันทึกการจดมิเตอร์ -> ออก "ใบแจ้งหนี้" (หรือ "ใบเสร็จรับเงิน" ทันทีถ้าจ่ายสด/QR) + เก็บ Snapshot + ห้ามแก้ทับบิลที่ล็อกแล้ว
 app.post('/api/water/bills', async (req, res) => {
     const {
         village_id, meter_id, household_id, member_id, billing_month,
@@ -7782,6 +7909,9 @@ app.post('/api/water/bills', async (req, res) => {
         return res.status(400).json({ success: false, message: 'เลขมิเตอร์ครั้งนี้ต้องไม่น้อยกว่าเลขมิเตอร์เดือนก่อน' });
     }
 
+    const decoded = verifyRequestJwt(req);
+    const actorAccountId = decoded?.account_id || req.headers['x-account-id'] || null;
+
     const unitsUsed = Number((currNum - prevNum).toFixed(2));
     const rate = Number(unit_rate || 0);
     const fee = Number(meter_fee || 0);
@@ -7790,63 +7920,164 @@ app.post('/api/water/bills', async (req, res) => {
     const finalPaymentStatus = payment_status || 'UNPAID';
     const isPaidNow = finalPaymentStatus === 'PAID';
     const finalMethod = isPaidNow ? (payment_method || 'CASH') : 'NONE';
-    const billNo = `WB-${String(billing_month).replace('-', '')}-${String(meter_id).padStart(4, '0')}`;
+    const docStage = isPaidNow ? 'RECEIPT' : 'INVOICE';
 
     const client = await pgPool.connect();
     try {
         await client.query('BEGIN');
 
-        const billRes = await client.query(`
-            INSERT INTO water_bills (
-                bill_no, village_id, meter_id, household_id, member_id, billing_month,
-                previous_reading, current_reading, units_used, unit_rate, meter_fee, reader_fee, total_amount,
-                reading_date, due_date, reading_photo_url, visit_status, payment_status, payment_method,
-                slip_url, note, recorded_by, paid_at
-            ) VALUES (
-                $1, $2, $3, $4, $5, $6,
-                $7, $8, $9, $10, $11, $12, $13,
-                $14, $15, $16, $17, $18, $19,
-                $20, $21, $22, CASE WHEN $23::boolean THEN CURRENT_TIMESTAMP ELSE NULL END
-            )
-            ON CONFLICT (meter_id, billing_month) DO UPDATE SET
-                previous_reading = EXCLUDED.previous_reading,
-                current_reading = EXCLUDED.current_reading,
-                units_used = EXCLUDED.units_used,
-                unit_rate = EXCLUDED.unit_rate,
-                meter_fee = EXCLUDED.meter_fee,
-                reader_fee = EXCLUDED.reader_fee,
-                total_amount = EXCLUDED.total_amount,
-                reading_date = EXCLUDED.reading_date,
-                due_date = EXCLUDED.due_date,
-                reading_photo_url = COALESCE(EXCLUDED.reading_photo_url, water_bills.reading_photo_url),
-                visit_status = EXCLUDED.visit_status,
-                payment_status = EXCLUDED.payment_status,
-                payment_method = EXCLUDED.payment_method,
-                slip_url = COALESCE(EXCLUDED.slip_url, water_bills.slip_url),
-                note = EXCLUDED.note,
-                recorded_by = EXCLUDED.recorded_by,
-                paid_at = CASE WHEN EXCLUDED.payment_status = 'PAID' THEN COALESCE(water_bills.paid_at, CURRENT_TIMESTAMP) ELSE NULL END,
-                updated_at = CURRENT_TIMESTAMP
-            RETURNING *
-        `, [
-            billNo, String(village_id), Number(meter_id), String(household_id), String(member_id), billing_month,
-            prevNum, currNum, unitsUsed, rate, fee, rFee, totalAmount,
-            reading_date || null, due_date || null, reading_photo_url || null,
-            visit_status || 'NORMAL', finalPaymentStatus, finalMethod,
-            slip_url || null, note || null, recorded_by || 'STAFF', isPaidNow
-        ]);
+        // ตรวจบิลที่ยังใช้งานอยู่ของมิเตอร์และรอบเดือนนี้
+        const existingRes = await client.query(`
+            SELECT * FROM water_bills
+            WHERE meter_id = $1
+              AND billing_month = $2
+              AND COALESCE(is_voided, false) = false
+            LIMIT 1
+        `, [Number(meter_id), billing_month]);
 
-        const unpaidCheck = await client.query(
-            `SELECT COUNT(*)::int AS cnt FROM water_bills WHERE meter_id = $1 AND payment_status <> 'PAID'`,
-            [Number(meter_id)]
+        const existing = existingRes.rows[0] || null;
+
+        // 🔒 กติกาห้ามแก้/ห้ามลบ: หากออกใบเสร็จชำระเงินแล้ว ล็อกเด็ดขาด!
+        if (existing && (existing.payment_status === 'PAID' || existing.is_locked || existing.receipt_no)) {
+            await client.query('ROLLBACK');
+            return res.status(403).json({
+                success: false,
+                code: 'BILL_LOCKED',
+                message: `บิลเลขที่ ${existing.receipt_no || existing.bill_no} ชำระเงินและออกใบเสร็จรับเงินแล้ว ถูกล็อกห้ามแก้ไขหรือลบ หากข้อมูลผิดกรุณาใช้ปุ่ม "ยกเลิกเอกสาร" พร้อมระบุเหตุผล`
+            });
+        }
+
+        // เก็บ Snapshot ข้อเท็จจริง ณ วันออกเอกสาร
+        const snap = await buildWaterBillSnapshot(client, {
+            villageId: village_id,
+            meterId: meter_id,
+            householdId: household_id,
+            memberId: member_id,
+            readerAccountId: actorAccountId,
+            readerNameInput: recorded_by || 'STAFF'
+        });
+
+        let savedBill;
+        if (existing) {
+            // อัปเดตใบแจ้งหนี้ที่ยังไม่ชำระ (แก้ไขได้จนกว่าจะจ่ายเงิน)
+            const updRes = await client.query(`
+                UPDATE water_bills
+                SET previous_reading = $1,
+                    current_reading = $2,
+                    units_used = $3,
+                    unit_rate = $4,
+                    meter_fee = $5,
+                    reader_fee = $6,
+                    total_amount = $7,
+                    reading_date = $8,
+                    due_date = $9,
+                    reading_photo_url = COALESCE($10, reading_photo_url),
+                    visit_status = $11,
+                    payment_status = $12,
+                    payment_method = $13,
+                    slip_url = COALESCE($14, slip_url),
+                    note = $15,
+                    recorded_by = $16,
+                    document_stage = $17,
+                    is_locked = $18,
+                    paid_at = CASE WHEN $18::boolean THEN CURRENT_TIMESTAMP ELSE NULL END,
+                    receipt_issued_at = CASE WHEN $18::boolean THEN CURRENT_TIMESTAMP ELSE NULL END,
+                    snapshot_village_name = COALESCE(snapshot_village_name, $19),
+                    snapshot_village_address = COALESCE(snapshot_village_address, $20),
+                    snapshot_headman_name = COALESCE(snapshot_headman_name, $21),
+                    snapshot_president_name = COALESCE(snapshot_president_name, $22),
+                    snapshot_treasurer_name = COALESCE(snapshot_treasurer_name, $23),
+                    snapshot_reader_account_id = COALESCE($24::uuid, snapshot_reader_account_id),
+                    snapshot_reader_name = COALESCE($25, snapshot_reader_name),
+                    snapshot_receiver_account_id = CASE WHEN $18::boolean THEN $24::uuid ELSE snapshot_receiver_account_id END,
+                    snapshot_receiver_name = CASE WHEN $18::boolean THEN $25 ELSE snapshot_receiver_name END,
+                    snapshot_customer_name = COALESCE(snapshot_customer_name, $26),
+                    snapshot_house_no = COALESCE(snapshot_house_no, $27),
+                    snapshot_meter_no = COALESCE(snapshot_meter_no, $28),
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE bill_id = $29
+                RETURNING *
+            `, [
+                prevNum, currNum, unitsUsed, rate, fee, rFee, totalAmount,
+                reading_date || null, due_date || null, reading_photo_url || null,
+                visit_status || 'NORMAL', finalPaymentStatus, finalMethod,
+                slip_url || null, note || null, recorded_by || 'STAFF',
+                docStage, isPaidNow,
+                snap.snapshot_village_name, snap.snapshot_village_address,
+                snap.snapshot_headman_name, snap.snapshot_president_name, snap.snapshot_treasurer_name,
+                snap.snapshot_reader_account_id, snap.snapshot_reader_name,
+                snap.snapshot_customer_name, snap.snapshot_house_no, snap.snapshot_meter_no,
+                existing.bill_id
+            ]);
+            savedBill = updRes.rows[0];
+        } else {
+            // ตรวจว่าเคยมีใบที่ถูกยกเลิก (Voided) ในเดือนนี้ไหม เพื่อรันเลขใบแจ้งหนี้ใหม่ไม่ให้ชนกัน
+            const voidCntRes = await client.query(
+                `SELECT COUNT(*)::int AS cnt FROM water_bills WHERE meter_id = $1 AND billing_month = $2`,
+                [Number(meter_id), billing_month]
+            );
+            const revNum = voidCntRes.rows[0].cnt;
+            const baseBillNo = `WB-${String(billing_month).replace('-', '')}-${String(meter_id).padStart(4, '0')}`;
+            const billNo = revNum > 0 ? `${baseBillNo}-R${revNum + 1}` : baseBillNo;
+
+            const insRes = await client.query(`
+                INSERT INTO water_bills (
+                    bill_no, village_id, meter_id, household_id, member_id, billing_month,
+                    previous_reading, current_reading, units_used, unit_rate, meter_fee, reader_fee, total_amount,
+                    reading_date, due_date, reading_photo_url, visit_status, payment_status, payment_method,
+                    slip_url, note, recorded_by,
+                    document_stage, is_locked, is_voided,
+                    paid_at, receipt_issued_at,
+                    snapshot_village_name, snapshot_village_address,
+                    snapshot_headman_name, snapshot_president_name, snapshot_treasurer_name,
+                    snapshot_reader_account_id, snapshot_reader_name,
+                    snapshot_receiver_account_id, snapshot_receiver_name,
+                    snapshot_customer_name, snapshot_house_no, snapshot_meter_no
+                ) VALUES (
+                    $1, $2, $3, $4, $5, $6,
+                    $7, $8, $9, $10, $11, $12, $13,
+                    $14, $15, $16, $17, $18, $19,
+                    $20, $21, $22,
+                    $23, $24, false,
+                    CASE WHEN $24::boolean THEN CURRENT_TIMESTAMP ELSE NULL END,
+                    CASE WHEN $24::boolean THEN CURRENT_TIMESTAMP ELSE NULL END,
+                    $25, $26, $27, $28, $29,
+                    $30::uuid, $31,
+                    CASE WHEN $24::boolean THEN $30::uuid ELSE NULL END,
+                    CASE WHEN $24::boolean THEN $31 ELSE NULL END,
+                    $32, $33, $34
+                )
+                RETURNING *
+            `, [
+                billNo, String(village_id), Number(meter_id), String(household_id), String(member_id), billing_month,
+                prevNum, currNum, unitsUsed, rate, fee, rFee, totalAmount,
+                reading_date || null, due_date || null, reading_photo_url || null,
+                visit_status || 'NORMAL', finalPaymentStatus, finalMethod,
+                slip_url || null, note || null, recorded_by || 'STAFF',
+                docStage, isPaidNow,
+                snap.snapshot_village_name, snap.snapshot_village_address,
+                snap.snapshot_headman_name, snap.snapshot_president_name, snap.snapshot_treasurer_name,
+                snap.snapshot_reader_account_id, snap.snapshot_reader_name,
+                snap.snapshot_customer_name, snap.snapshot_house_no, snap.snapshot_meter_no
+            ]);
+            savedBill = insRes.rows[0];
+        }
+
+        // หากชำระทันที -> ออกเลขที่ใบเสร็จรับเงิน (REC-YYYYMM-XXXX) แยกจากเลขใบแจ้งหนี้
+        if (isPaidNow && !savedBill.receipt_no) {
+            const receiptNo = `REC-${String(billing_month).replace('-', '')}-${String(savedBill.bill_id).padStart(4, '0')}`;
+            const recUpd = await client.query(
+                `UPDATE water_bills SET receipt_no = $1, receipt_issued_at = COALESCE(receipt_issued_at, CURRENT_TIMESTAMP), document_stage = 'RECEIPT', is_locked = true WHERE bill_id = $2 RETURNING *`,
+                [receiptNo, savedBill.bill_id]
+            );
+            savedBill = recUpd.rows[0];
+        }
+
+        const meterPayStatus = await recalcMeterPaymentStatus(client, meter_id);
+        await client.query(
+            `UPDATE water_meters SET last_meter_reading = $1, updated_at = CURRENT_TIMESTAMP WHERE meter_id = $2`,
+            [currNum, Number(meter_id)]
         );
-        const meterPayStatus = unpaidCheck.rows[0].cnt > 0 ? 'OVERDUE' : 'PAID';
-
-        await client.query(`
-            UPDATE water_meters
-            SET last_meter_reading = $1, payment_status = $2, updated_at = CURRENT_TIMESTAMP
-            WHERE meter_id = $3
-        `, [currNum, meterPayStatus, Number(meter_id)]);
 
         await client.query(`
             INSERT INTO water_meter_status_logs (meter_id, meter_status, payment_status, note, changed_by)
@@ -7854,12 +8085,20 @@ app.post('/api/water/bills', async (req, res) => {
         `, [
             Number(meter_id),
             meterPayStatus,
-            `จดมิเตอร์รอบ ${billing_month} (${prevNum}→${currNum} = ${unitsUsed} หน่วย, ค่าจด ${rFee} บ., รวม ${totalAmount} บ., ${finalPaymentStatus})`,
+            isPaidNow
+                ? `จดมิเตอร์และออกใบเสร็จรับเงิน ${savedBill.receipt_no} (${prevNum}→${currNum} = ${unitsUsed} หน่วย, รวม ${totalAmount} บ.)`
+                : `จดมิเตอร์และออกใบแจ้งหนี้ ${savedBill.bill_no} (${prevNum}→${currNum} = ${unitsUsed} หน่วย, รวม ${totalAmount} บ., รอชำระ)`,
             recorded_by || 'STAFF'
         ]);
 
         await client.query('COMMIT');
-        res.json({ success: true, message: 'บันทึกการจดมิเตอร์และออกใบเสร็จเรียบร้อยแล้ว', data: billRes.rows[0] });
+        res.json({
+            success: true,
+            message: isPaidNow
+                ? `รับชำระและออกใบเสร็จรับเงินเลขที่ ${savedBill.receipt_no} เรียบร้อยแล้ว`
+                : `ออกใบแจ้งหนี้เลขที่ ${savedBill.bill_no} เรียบร้อยแล้ว (รอชำระเงิน)`,
+            data: savedBill
+        });
     } catch (err) {
         await client.query('ROLLBACK');
         console.error('Save Water Bill Error:', err);
@@ -7869,45 +8108,80 @@ app.post('/api/water/bills', async (req, res) => {
     }
 });
 
-// 10. รับชำระเงินสำหรับบิลค้างจ่าย / แจ้งโอนแนบสลิป (แก้ parameter $1 ซ้ำซ้อนแล้ว)
+// 10. รับชำระเงินสำหรับใบแจ้งหนี้ค้างจ่าย -> เปลี่ยนสถานะเป็นออก "ใบเสร็จรับเงิน" + ล็อกห้ามลบ + บันทึกชื่อผู้รับเงิน Snapshot
 app.put('/api/water/bills/:billId/pay', async (req, res) => {
     const { billId } = req.params;
     const { payment_method, payment_status, slip_url, note, changed_by } = req.body;
+    const decoded = verifyRequestJwt(req);
+    const actorAccountId = decoded?.account_id || req.headers['x-account-id'] || null;
 
     const client = await pgPool.connect();
     try {
         await client.query('BEGIN');
 
+        const curRes = await client.query(`SELECT * FROM water_bills WHERE bill_id = $1 LIMIT 1`, [billId]);
+        if (curRes.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ success: false, message: 'ไม่พบเลขที่บิลนี้' });
+        }
+        const cur = curRes.rows[0];
+        if (cur.is_voided) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ success: false, message: 'เอกสารนี้ถูกยกเลิกไปแล้ว ไม่สามารถรับชำระได้' });
+        }
+        if (cur.payment_status === 'PAID' && cur.receipt_no) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ success: false, message: `บิลนี้ออกใบเสร็จรับเงินเลขที่ ${cur.receipt_no} ไปแล้ว` });
+        }
+
         const newStatus = payment_status || 'PAID';
         const isPaidNow = newStatus === 'PAID';
+        const receiptNo = isPaidNow
+            ? (cur.receipt_no || `REC-${String(cur.billing_month || '').replace('-', '')}-${String(cur.bill_id).padStart(4, '0')}`)
+            : cur.receipt_no;
+
+        // หาชื่อจริงผู้รับเงินจากบัญชีที่กดรับชำระ
+        let receiverName = (changed_by || '').trim() || 'เจ้าหน้าที่ประปา';
+        if (isValidUuidV3(actorAccountId)) {
+            const pRes = await client.query(`
+                SELECT p.first_name, p.last_name FROM user_accounts a
+                LEFT JOIN user_profiles p ON a.profile_id = p.profile_id
+                WHERE a.account_id = $1::uuid LIMIT 1
+            `, [actorAccountId]).catch(() => ({ rows: [] }));
+            const full = `${pRes.rows[0]?.first_name || ''} ${pRes.rows[0]?.last_name || ''}`.trim();
+            if (full) receiverName = full;
+        }
+
         const billRes = await client.query(`
             UPDATE water_bills
             SET payment_status = $1,
                 payment_method = $2,
                 slip_url = COALESCE($3, slip_url),
                 note = COALESCE($4, note),
+                document_stage = CASE WHEN $5::boolean THEN 'RECEIPT' ELSE 'INVOICE' END,
+                receipt_no = $6,
+                receipt_issued_at = CASE WHEN $5::boolean THEN CURRENT_TIMESTAMP ELSE receipt_issued_at END,
                 paid_at = CASE WHEN $5::boolean THEN CURRENT_TIMESTAMP ELSE paid_at END,
+                is_locked = CASE WHEN $5::boolean THEN true ELSE is_locked END,
+                snapshot_receiver_account_id = CASE WHEN $5::boolean THEN $7::uuid ELSE snapshot_receiver_account_id END,
+                snapshot_receiver_name = CASE WHEN $5::boolean THEN $8 ELSE snapshot_receiver_name END,
                 updated_at = CURRENT_TIMESTAMP
-            WHERE bill_id = $6
+            WHERE bill_id = $9
             RETURNING *
-        `, [newStatus, payment_method || 'CASH', slip_url || null, note || null, isPaidNow, billId]);
-
-        if (billRes.rows.length === 0) {
-            await client.query('ROLLBACK');
-            return res.status(404).json({ success: false, message: 'ไม่พบเลขที่บิลนี้' });
-        }
+        `, [
+            newStatus,
+            payment_method || 'CASH',
+            slip_url || null,
+            note || null,
+            isPaidNow,
+            receiptNo || null,
+            isValidUuidV3(actorAccountId) ? actorAccountId : null,
+            receiverName,
+            billId
+        ]);
 
         const bill = billRes.rows[0];
-        const unpaidCheck = await client.query(
-            `SELECT COUNT(*)::int AS cnt FROM water_bills WHERE meter_id = $1 AND payment_status <> 'PAID'`,
-            [bill.meter_id]
-        );
-        const meterPayStatus = unpaidCheck.rows[0].cnt > 0 ? 'OVERDUE' : 'PAID';
-
-        await client.query(
-            `UPDATE water_meters SET payment_status = $1, updated_at = CURRENT_TIMESTAMP WHERE meter_id = $2`,
-            [meterPayStatus, bill.meter_id]
-        );
+        const meterPayStatus = await recalcMeterPaymentStatus(client, bill.meter_id);
 
         await client.query(`
             INSERT INTO water_meter_status_logs (meter_id, meter_status, payment_status, note, changed_by)
@@ -7915,12 +8189,20 @@ app.put('/api/water/bills/:billId/pay', async (req, res) => {
         `, [
             bill.meter_id,
             meterPayStatus,
-            `อัปเดตชำระบิล ${bill.bill_no} (${newStatus} / ${payment_method || 'CASH'})`,
-            changed_by || 'USER'
+            isPaidNow
+                ? `รับชำระเงินและออกใบเสร็จ ${bill.receipt_no} (อ้างอิง ${bill.bill_no} / ${payment_method || 'CASH'})`
+                : `ลูกบ้านแนบสลิปโอนเงินใบแจ้งหนี้ ${bill.bill_no} (รอตรวจสอบ)`,
+            receiverName
         ]);
 
         await client.query('COMMIT');
-        res.json({ success: true, message: isPaidNow ? 'บันทึกการรับชำระเงินเรียบร้อยแล้ว' : 'ส่งหลักฐานการโอนเงินแล้ว รอเจ้าหน้าที่ตรวจสอบ', data: bill });
+        res.json({
+            success: true,
+            message: isPaidNow
+                ? `รับชำระเงินและออกใบเสร็จรับเงินเลขที่ ${bill.receipt_no} เรียบร้อยแล้ว`
+                : 'ส่งหลักฐานการโอนเงินแล้ว รอเจ้าหน้าที่ตรวจสอบเพื่อออกใบเสร็จรับเงิน',
+            data: bill
+        });
     } catch (err) {
         await client.query('ROLLBACK');
         console.error('Pay Water Bill Error:', err);
@@ -7930,10 +8212,183 @@ app.put('/api/water/bills/:billId/pay', async (req, res) => {
     }
 });
 
+// 10.1 ลบใบแจ้งหนี้ (อนุญาตเฉพาะใบแจ้งหนี้ที่ยังไม่ชำระเท่านั้น — ใบเสร็จรับเงินห้ามลบเด็ดขาด!)
+app.delete('/api/water/bills/:billId', async (req, res) => {
+    const { billId } = req.params;
+    const decoded = verifyRequestJwt(req);
+    const actorAccountId = decoded?.account_id || req.headers['x-account-id'] || null;
 
-// 11. ดึงบิลค่าน้ำสำหรับเจ้าของบ้าน (พร้อมข้อมูลหัวสลิปหมู่บ้านและประธานกรรมการ)
+    const client = await pgPool.connect();
+    try {
+        const secCheck = await resolveUserSecurityContext(client, actorAccountId);
+        if (!secCheck.ok) {
+            return res.status(401).json({ success: false, message: secCheck.reason || 'กรุณาเข้าสู่ระบบใหม่' });
+        }
+        const ctx = secCheck.context;
+        const canDeleteInvoice =
+            ctx.is_super_admin ||
+            ctx.role_templates.some((r) => ['VILLAGE_HEADMAN', 'VILLAGE_ADMIN', 'WATER_PRESIDENT', 'WATER_TREASURER', 'WATER_READER'].includes(r));
+
+        if (!canDeleteInvoice) {
+            return res.status(403).json({ success: false, message: 'คุณไม่มีสิทธิ์ลบใบแจ้งหนี้' });
+        }
+
+        await client.query('BEGIN');
+        const curRes = await client.query(`SELECT * FROM water_bills WHERE bill_id = $1 LIMIT 1`, [billId]);
+        if (curRes.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ success: false, message: 'ไม่พบเอกสารบิลนี้' });
+        }
+        const bill = curRes.rows[0];
+
+        if (!ctx.is_super_admin && String(bill.village_id) !== String(ctx.village_id)) {
+            await client.query('ROLLBACK');
+            return res.status(403).json({ success: false, message: 'ไม่อนุญาตให้ลบข้อมูลข้ามหมู่บ้าน' });
+        }
+
+        // 🔒 กติกาห้ามลบเด็ดขาดสำหรับบิลที่ชำระแล้ว / มีใบเสร็จ / ถูกล็อก / ถูกยกเลิกแล้ว
+        if (bill.payment_status === 'PAID' || bill.receipt_no || bill.is_locked || bill.is_voided) {
+            await client.query('ROLLBACK');
+            return res.status(403).json({
+                success: false,
+                code: 'DELETE_FORBIDDEN_LOCKED',
+                message: 'ห้ามลบบิลหรือใบเสร็จรับเงินที่ชำระเงินแล้ว (ถูกล็อกทางบัญชี) กรุณาใช้ปุ่ม "ยกเลิกเอกสาร" พร้อมระบุเหตุผลแทน'
+            });
+        }
+
+        await client.query(`DELETE FROM water_bills WHERE bill_id = $1`, [billId]);
+        await recalcMeterPaymentStatus(client, bill.meter_id);
+
+        await client.query(`
+            INSERT INTO water_meter_status_logs (meter_id, meter_status, payment_status, note, changed_by)
+            VALUES ($1, 'ACTIVE', 'OVERDUE', $2, $3)
+        `, [bill.meter_id, `ลบใบแจ้งหนี้ที่ยังไม่ชำระ ${bill.bill_no}`, ctx.full_name]);
+
+        await client.query('COMMIT');
+        res.json({ success: true, message: `ลบใบแจ้งหนี้ ${bill.bill_no} เรียบร้อยแล้ว` });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error('Delete Water Bill Error:', err);
+        res.status(500).json({ success: false, message: err.message });
+    } finally {
+        client.release();
+    }
+});
+
+// 10.2 ยกเลิกเอกสารพร้อมเหตุผล (Void) แทนการลบ -> เก็บประวัติถาวรในรายงาน (ต้องยืนยัน PIN ผู้ใหญ่บ้านหากเป็นใบเสร็จที่ชำระแล้ว)
+app.post('/api/water/bills/:billId/void', async (req, res) => {
+    const { billId } = req.params;
+    const { void_reason, pin_code } = req.body;
+    const decoded = verifyRequestJwt(req);
+    const actorAccountId = decoded?.account_id || req.headers['x-account-id'] || null;
+
+    if (!void_reason || String(void_reason).trim().length < 3) {
+        return res.status(400).json({ success: false, message: 'กรุณาระบุเหตุผลในการยกเลิกเอกสารให้ชัดเจน' });
+    }
+
+    const client = await pgPool.connect();
+    try {
+        const secCheck = await resolveUserSecurityContext(client, actorAccountId);
+        if (!secCheck.ok) {
+            return res.status(401).json({ success: false, message: secCheck.reason || 'กรุณาเข้าสู่ระบบใหม่' });
+        }
+        const ctx = secCheck.context;
+        const canVoid =
+            ctx.is_super_admin ||
+            ctx.role_templates.some((r) => ['VILLAGE_HEADMAN', 'WATER_PRESIDENT', 'WATER_TREASURER'].includes(r));
+
+        if (!canVoid) {
+            return res.status(403).json({
+                success: false,
+                message: 'เฉพาะผู้ใหญ่บ้าน ประธานประปา หรือเหรัญญิก เท่านั้นที่สามารถยกเลิกเอกสารใบเสร็จได้'
+            });
+        }
+
+        await client.query('BEGIN');
+        const curRes = await client.query(`SELECT * FROM water_bills WHERE bill_id = $1 LIMIT 1`, [billId]);
+        if (curRes.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ success: false, message: 'ไม่พบเอกสารบิลนี้' });
+        }
+        const bill = curRes.rows[0];
+
+        if (!ctx.is_super_admin && String(bill.village_id) !== String(ctx.village_id)) {
+            await client.query('ROLLBACK');
+            return res.status(403).json({ success: false, message: 'ไม่อนุญาตให้ยกเลิกเอกสารข้ามหมู่บ้าน' });
+        }
+        if (bill.is_voided) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ success: false, message: 'เอกสารนี้ถูกยกเลิกไปแล้ว' });
+        }
+
+        // หากเป็นใบเสร็จที่ชำระเงินแล้ว ต้องยืนยันด้วยรหัส PIN ผู้ใหญ่บ้านเสมอ (ยกเว้น Super Admin)
+        if ((bill.payment_status === 'PAID' || bill.receipt_no) && !ctx.is_super_admin) {
+            const pinOk = await verifyVillageHeadmanPin(client, bill.village_id, pin_code);
+            if (!pinOk) {
+                await client.query('ROLLBACK');
+                return res.status(403).json({ success: false, message: 'รหัส PIN อนุมัติของผู้ใหญ่บ้านไม่ถูกต้อง' });
+            }
+        }
+
+        const voidRes = await client.query(`
+            UPDATE water_bills
+            SET is_voided = true,
+                document_stage = 'VOIDED',
+                is_locked = true,
+                voided_at = CURRENT_TIMESTAMP,
+                voided_by = $1::uuid,
+                voided_by_name = $2,
+                void_reason = $3,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE bill_id = $4
+            RETURNING *
+        `, [ctx.account_id, ctx.full_name, String(void_reason).trim(), billId]);
+
+        const meterPayStatus = await recalcMeterPaymentStatus(client, bill.meter_id);
+
+        await client.query(`
+            INSERT INTO water_meter_status_logs (meter_id, meter_status, payment_status, note, changed_by)
+            VALUES ($1, 'ACTIVE', $2, $3, $4)
+        `, [
+            bill.meter_id,
+            meterPayStatus,
+            `ยกเลิกเอกสาร ${bill.receipt_no || bill.bill_no} (เหตุผล: ${String(void_reason).trim()})`,
+            ctx.full_name
+        ]);
+
+        await client.query(`
+            INSERT INTO sys_approval_logs (
+                village_id, target_type, target_id, target_account_id,
+                action_type, old_status, new_status, approved_by, note
+            ) VALUES ($1::uuid, 'WATER_BILL', $2, NULL, 'VOID', $3, 'VOIDED', $4::uuid, $5)
+        `, [
+            bill.village_id,
+            String(bill.bill_id),
+            bill.document_stage || bill.payment_status,
+            ctx.account_id,
+            `ยกเลิกเอกสาร ${bill.receipt_no || bill.bill_no} เหตุผล: ${String(void_reason).trim()}`
+        ]).catch(() => {});
+
+        await client.query('COMMIT');
+        res.json({
+            success: true,
+            message: `ยกเลิกเอกสาร ${bill.receipt_no || bill.bill_no} แล้ว (เก็บหลักฐานไว้ในรายงานถาวรและสามารถจดออกใบแจ้งหนี้ใหม่ได้)`,
+            data: voidRes.rows[0]
+        });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error('Void Water Bill Error:', err);
+        res.status(500).json({ success: false, message: err.message });
+    } finally {
+        client.release();
+    }
+});
+
+// 11. ดึงบิลค่าน้ำสำหรับเจ้าของบ้าน (แยกใบแจ้งหนี้ vs ใบเสร็จรับเงิน + ใช้ Snapshot ประวัติเดิมไม่เปลี่ยนตามกรรมการใหม่)
 app.get('/api/water/my-bills/:accountId', async (req, res) => {
-    const { accountId } = req.params;
+    const decoded = verifyRequestJwt(req);
+    const accountId = decoded?.account_id || req.params.accountId;
+
     try {
         const userRes = await pgPool.query(`
             SELECT ua.account_id, ua.village_id, to_jsonb(up) AS up_json
@@ -7971,6 +8426,9 @@ app.get('/api/water/my-bills/:accountId', async (req, res) => {
             SELECT
                 wb.*,
                 COALESCE(wb.reader_fee, 0) AS reader_fee,
+                COALESCE(wb.document_stage, CASE WHEN wb.payment_status = 'PAID' THEN 'RECEIPT' ELSE 'INVOICE' END) AS document_stage,
+                COALESCE(wb.is_locked, wb.payment_status = 'PAID') AS is_locked,
+                COALESCE(wb.is_voided, false) AS is_voided,
                 wm.meter_code, wm.meter_status,
                 to_jsonb(h) AS h_json,
                 hm.first_name, hm.last_name,
@@ -7985,28 +8443,31 @@ app.get('/api/water/my-bills/:accountId', async (req, res) => {
             LEFT JOIN sys_amphures am ON t.amphure_id = am.amphure_id
             LEFT JOIN sys_provinces pr ON am.province_id = pr.province_id
             WHERE wb.household_id::text = ANY($1::text[])
-            ORDER BY wb.billing_month DESC, wb.bill_id DESC
+            ORDER BY wb.billing_month DESC, wb.is_voided ASC, wb.bill_id DESC
         `, [householdIds]);
 
         const villageId = billsRes.rows[0]?.village_id || userRes.rows[0].village_id;
         let settings = null;
         let villageInfo = null;
         if (villageId) {
-            const setRes = await pgPool.query(`SELECT * FROM water_settings WHERE village_id = $1 LIMIT 1`, [String(villageId)]);
+            const setRes = await pgPool.query(`SELECT * FROM water_settings WHERE village_id::text = $1::text LIMIT 1`, [String(villageId)]);
             settings = setRes.rows[0] || null;
-            villageInfo = await getVillageSlipHeader(villageId, settings);
+            villageInfo = typeof getVillageSlipHeader === 'function'
+                ? await getVillageSlipHeader(villageId, settings)
+                : null;
         }
 
         const formatted = billsRes.rows.map((r) => {
             const hJson = r.h_json || {};
-            const houseNo = hJson.house_no || hJson.house_number || hJson.address_no || '-';
+            const houseNo = r.snapshot_house_no || hJson.house_no || hJson.house_number || hJson.address_no || '-';
             const vName = r.village_name
                 ? (r.village_name.startsWith('บ้าน') ? r.village_name : `บ้าน${r.village_name}`)
                 : '';
             return {
                 ...r,
                 house_no: houseNo,
-                full_name: `${r.first_name || ''} ${r.last_name || ''}`.trim(),
+                meter_code: r.snapshot_meter_no || r.meter_code,
+                full_name: r.snapshot_customer_name || `${r.first_name || ''} ${r.last_name || ''}`.trim(),
                 full_address: `บ้านเลขที่ ${houseNo} หมู่ ${r.village_no || '-'} ${vName} ต.${r.tambon_name_th || '-'} อ.${r.amphure_name_th || '-'} จ.${r.province_name_th || '-'}`.trim()
             };
         });
@@ -8014,6 +8475,205 @@ app.get('/api/water/my-bills/:accountId', async (req, res) => {
         res.json({ success: true, settings, village_info: villageInfo, data: formatted });
     } catch (err) {
         console.error('Get My Water Bills Error:', err);
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// =========================================================================
+// 🌟 V3.1: ระบบผลัดเปลี่ยนกรรมการ / ส่งมอบงาน (ปรับคนเดิมกลับเป็นประชาชน + เก็บประวัติถาวร)
+// =========================================================================
+app.post('/api/v3/committee-leaders/handover', async (req, res) => {
+    const {
+        village_id, approver_account_id, pin_code,
+        outgoing_record_id,
+        incoming_account_id, incoming_member_id, incoming_citizen_id, incoming_full_name,
+        handover_reason, start_date, end_date
+    } = req.body;
+
+    if (!isValidUuidV3(village_id) || !isValidUuidV3(approver_account_id) || !outgoing_record_id) {
+        return res.status(400).json({ success: false, message: 'ข้อมูลส่งมอบงานไม่ครบถ้วน' });
+    }
+    if (!pin_code) {
+        return res.status(400).json({ success: false, message: 'กรุณากรอกรหัส PIN อนุมัติของผู้ใหญ่บ้าน' });
+    }
+
+    const client = await pgPool.connect();
+    try {
+        await client.query('BEGIN');
+
+        const pinOk = await verifyVillageHeadmanPin(client, village_id, pin_code);
+        if (!pinOk) {
+            await client.query('ROLLBACK');
+            return res.status(403).json({ success: false, message: 'รหัส PIN อนุมัติของผู้ใหญ่บ้านไม่ถูกต้อง' });
+        }
+
+        const outRes = await client.query(`
+            SELECT up.*, cc.committee_name,
+                   COALESCE(prof.first_name || ' ' || prof.last_name, hm.first_name || ' ' || hm.last_name, '') AS outgoing_name
+            FROM user_positions up
+            LEFT JOIN community_committees cc ON up.committee_id = cc.committee_id
+            LEFT JOIN user_accounts ua ON up.account_id = ua.account_id
+            LEFT JOIN user_profiles prof ON ua.profile_id = prof.profile_id
+            LEFT JOIN household_members hm ON up.member_id IS NOT NULL AND hm.member_id::text = up.member_id::text
+            WHERE up.id = $1 AND (up.village_id = $2::uuid OR up.village_id IS NULL)
+            LIMIT 1
+        `, [Number(outgoing_record_id), village_id]);
+
+        if (outRes.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ success: false, message: 'ไม่พบข้อมูลตำแหน่งเดิมที่ต้องการส่งมอบ' });
+        }
+        const outRec = outRes.rows[0];
+
+        // 1. ปิดวาระคนเดิม (ไม่ลบประวัติเก่าในระบบ — แค่ปิด active)
+        await client.query(`
+            UPDATE user_positions
+            SET status = 'REVOKED',
+                is_active = false,
+                end_date = CURRENT_DATE,
+                end_reason = $1
+            WHERE id = $2
+        `, [handover_reason || 'ส่งมอบงานและผลัดเปลี่ยนกรรมการ', outRec.id]);
+
+        // ปรับสิทธิ์คนเดิมกลับเป็น CITIZEN อัตโนมัติหากไม่มีตำแหน่งอื่น
+        const outShift = outRec.account_id
+            ? await syncUserAccountRoleFromPositions(client, outRec.account_id)
+            : { oldRole: null, newRole: 'CITIZEN' };
+
+        // 2. แต่งตั้งคนใหม่มารับช่วงต่อในตำแหน่งและชุดสิทธิ์เดียวกัน (ถ้ามีการเลือกคนใหม่)
+        let newRecord = null;
+        let realIncomingAccountId = null;
+        const hasIncoming = Boolean(incoming_account_id || incoming_member_id || incoming_citizen_id);
+
+        if (hasIncoming) {
+            realIncomingAccountId = await resolveRealUserAccountId(client, {
+                accountId: incoming_account_id,
+                citizenId: incoming_citizen_id
+            });
+            const cleanCid = String(incoming_citizen_id || '').replace(/\D/g, '') || null;
+
+            const insRes = await client.query(`
+                INSERT INTO user_positions (
+                    village_id, committee_id, account_id, member_id, citizen_id,
+                    position_id, custom_position_title, role_template_code,
+                    scope_type, scope_id, start_date, end_date,
+                    responsibilities, parent_id, assigned_by,
+                    approved_by, approved_at, approval_note,
+                    status, is_active
+                ) VALUES (
+                    $1::uuid, $2, $3::uuid, $4, $5,
+                    $6, $7, $8,
+                    'VILLAGE', $1::text, $9, $10,
+                    $11, $12, $13::uuid,
+                    $13::uuid, CURRENT_TIMESTAMP, $14,
+                    'ACTIVE', true
+                )
+                RETURNING *
+            `, [
+                village_id,
+                outRec.committee_id,
+                realIncomingAccountId,
+                incoming_member_id ? String(incoming_member_id) : null,
+                cleanCid,
+                outRec.position_id,
+                outRec.custom_position_title,
+                outRec.role_template_code,
+                start_date || new Date().toISOString().split('T')[0],
+                end_date || null,
+                outRec.responsibilities || '',
+                outRec.parent_id,
+                approver_account_id,
+                `รับมอบงานต่อจาก ${outRec.outgoing_name?.trim() || 'กรรมการเดิม'}`
+            ]);
+            newRecord = insRes.rows[0];
+
+            // ย้ายลูกน้องในผังเดิมมาอยู่ใต้คนใหม่
+            await client.query(
+                `UPDATE user_positions SET parent_id = $1 WHERE parent_id = $2 AND is_active = true`,
+                [newRecord.id, outRec.id]
+            );
+
+            if (realIncomingAccountId) {
+                await syncUserAccountRoleFromPositions(client, realIncomingAccountId);
+            }
+
+            // หากเปลี่ยนตัวประธานประปา อัปเดตชื่อประธานสำหรับบิลอนาคต (บิลเก่าที่เก็บ Snapshot แล้วจะไม่เปลี่ยน!)
+            if (outRec.role_template_code === 'WATER_PRESIDENT' && incoming_full_name) {
+                await client.query(
+                    `UPDATE water_settings SET president_name = $1, updated_at = CURRENT_TIMESTAMP WHERE village_id::text = $2::text`,
+                    [incoming_full_name.trim(), String(village_id)]
+                ).catch(() => {});
+            }
+        }
+
+        // หาชื่อผู้อนุมัติ
+        const apRes = await client.query(`
+            SELECT COALESCE(p.first_name || ' ' || p.last_name, a.username_phone) AS full_name
+            FROM user_accounts a
+            LEFT JOIN user_profiles p ON a.profile_id = p.profile_id
+            WHERE a.account_id = $1::uuid LIMIT 1
+        `, [approver_account_id]);
+        const approverName = apRes.rows[0]?.full_name || 'ผู้ใหญ่บ้าน';
+
+        // 3. บันทึกประวัติส่งมอบงานถาวร (ตารางนี้มี Trigger ล็อกห้ามลบใน DB)
+        await client.query(`
+            INSERT INTO committee_handover_logs (
+                village_id, committee_id, committee_name, position_record_id,
+                role_template_code, position_title,
+                outgoing_account_id, outgoing_full_name, outgoing_new_role,
+                incoming_account_id, incoming_full_name,
+                handover_reason, approved_by, approved_by_name
+            ) VALUES ($1::uuid, $2, $3, $4, $5, $6, $7::uuid, $8, $9, $10::uuid, $11, $12, $13::uuid, $14)
+        `, [
+            village_id,
+            outRec.committee_id,
+            outRec.committee_name || '',
+            outRec.id,
+            outRec.role_template_code,
+            outRec.custom_position_title || outRec.role_template_code,
+            outRec.account_id || null,
+            outRec.outgoing_name?.trim() || '-',
+            outShift.newRole || 'CITIZEN',
+            realIncomingAccountId,
+            (incoming_full_name || '').trim() || null,
+            handover_reason || 'ครบวาระ / ส่งมอบงานให้กรรมการชุดใหม่',
+            approver_account_id,
+            approverName
+        ]);
+
+        await client.query('COMMIT');
+        res.json({
+            success: true,
+            message: hasIncoming
+                ? `ส่งมอบงานเรียบร้อยแล้ว: ปรับ ${outRec.outgoing_name?.trim() || 'คนเดิม'} เป็น ${outShift.newRole} และแต่งตั้ง ${incoming_full_name} รับช่วงต่อทันที (ประวัติและรายงานเก่ายังคงเดิม 100%)`
+                : `ปรับสถานะ ${outRec.outgoing_name?.trim() || 'คนเดิม'} กลับเป็นประชาชน (${outShift.newRole}) และบันทึกประวัติส่งมอบงานเรียบร้อยแล้ว`,
+            data: { outgoing_new_role: outShift.newRole, incoming_record: newRecord }
+        });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error('V3 Committee Handover Error:', err);
+        res.status(500).json({ success: false, message: err.message });
+    } finally {
+        client.release();
+    }
+});
+
+// ดึงประวัติการผลัดเปลี่ยนกรรมการและส่งมอบงานของหมู่บ้าน (อ่านอย่างเดียว ห้ามลบ)
+app.get('/api/v3/committee-handovers/:villageId', async (req, res) => {
+    const { villageId } = req.params;
+    if (!isValidUuidV3(villageId)) {
+        return res.status(400).json({ success: false, message: 'รหัสหมู่บ้านไม่ถูกต้อง' });
+    }
+    try {
+        const result = await pgPool.query(`
+            SELECT * FROM committee_handover_logs
+            WHERE village_id = $1::uuid
+            ORDER BY handover_at DESC, handover_id DESC
+            LIMIT 100
+        `, [villageId]);
+        res.json({ success: true, data: result.rows });
+    } catch (err) {
+        console.error('Get Committee Handovers Error:', err);
         res.status(500).json({ success: false, message: err.message });
     }
 });
