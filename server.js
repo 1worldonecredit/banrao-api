@@ -1994,8 +1994,10 @@ app.post('/api/login', async (req, res) => {
         client.release();
     }
 });
+
+
 // ==========================================
-// 🌟 API ดึงเมนู Sidebar แบบ Dynamic ตามสิทธิ์จริงที่ได้รับอนุมัติ + ซ่อนบิลน้ำถ้าบ้านไม่มีมิเตอร์
+// 🌟 API ดึงเมนู Sidebar แบบ Dynamic ตามสิทธิ์จริง + โมดูลที่มีจริงในหมู่บ้านนั้น
 // ==========================================
 app.get('/api/sidebar-menus/:accountId', async (req, res) => {
     const decoded = verifyRequestJwt(req);
@@ -2068,11 +2070,21 @@ app.get('/api/sidebar-menus/:accountId', async (req, res) => {
 
         const groupMap = new Map();
         const permissionsMap = {};
+        const waterEnabled = Boolean(ctx.village_modules?.water);
 
         for (const r of menuRows) {
             if (!r.route_path) continue;
 
-            // ซ่อนเมนู "บิลล์ค่าน้ำ" อัตโนมัติ หากบ้านของบุคคลนี้ไม่ได้ติดตั้งมิเตอร์น้ำ
+            // 1. ซ่อนเมนูระบบประปาทั้งหมด หากหมู่บ้านนี้ไม่ได้เปิด/สร้างผังประปาหมู่บ้าน
+            if (
+                !ctx.is_super_admin &&
+                ['/water-users', '/water-billing', '/my-water-bills'].includes(r.route_path) &&
+                !waterEnabled
+            ) {
+                continue;
+            }
+
+            // 2. ซ่อนเมนู "บิลล์ค่าน้ำ" หากบ้านของบุคคลนี้ไม่ได้ติดตั้งมิเตอร์น้ำ
             if (!ctx.is_super_admin && r.route_path === '/my-water-bills' && !ctx.has_water_meter) {
                 continue;
             }
