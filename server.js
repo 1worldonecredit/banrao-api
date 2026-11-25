@@ -7889,8 +7889,7 @@ app.get('/api/water/bills/:villageId', async (req, res) => {
         res.status(500).json({ success: false, message: err.message });
     }
 });
-
-// 9. บันทึกการจดมิเตอร์ -> ออก "ใบแจ้งหนี้" (หรือ "ใบเสร็จรับเงิน" ทันทีถ้าจ่ายสด/QR) + เก็บ Snapshot + ห้ามแก้ทับบิลที่ล็อกแล้ว
+// 9. บันทึกการจดมิเตอร์ -> ออก "ใบแจ้งหนี้" (หรือ "ใบเสร็จรับเงิน" ทันทีถ้าจ่ายสด/QR) + เก็บ Snapshot (แก้พารามิเตอร์ไม่ซ้ำ 100%)
 app.post('/api/water/bills', async (req, res) => {
     const {
         village_id, meter_id, household_id, member_id, billing_month,
@@ -7926,7 +7925,6 @@ app.post('/api/water/bills', async (req, res) => {
     try {
         await client.query('BEGIN');
 
-        // ตรวจบิลที่ยังใช้งานอยู่ของมิเตอร์และรอบเดือนนี้
         const existingRes = await client.query(`
             SELECT * FROM water_bills
             WHERE meter_id = $1
@@ -7937,7 +7935,6 @@ app.post('/api/water/bills', async (req, res) => {
 
         const existing = existingRes.rows[0] || null;
 
-        // 🔒 กติกาห้ามแก้/ห้ามลบ: หากออกใบเสร็จชำระเงินแล้ว ล็อกเด็ดขาด!
         if (existing && (existing.payment_status === 'PAID' || existing.is_locked || existing.receipt_no)) {
             await client.query('ROLLBACK');
             return res.status(403).json({
@@ -7947,7 +7944,6 @@ app.post('/api/water/bills', async (req, res) => {
             });
         }
 
-        // เก็บ Snapshot ข้อเท็จจริง ณ วันออกเอกสาร
         const snap = await buildWaterBillSnapshot(client, {
             villageId: village_id,
             meterId: meter_id,
@@ -7957,9 +7953,12 @@ app.post('/api/water/bills', async (req, res) => {
             readerNameInput: recorded_by || 'STAFF'
         });
 
+        const paidAtVal = isPaidNow ? new Date() : null;
+        const receiverAccountId = isPaidNow ? snap.snapshot_reader_account_id : null;
+        const receiverName = isPaidNow ? snap.snapshot_reader_name : null;
+
         let savedBill;
         if (existing) {
-            // อัปเดตใบแจ้งหนี้ที่ยังไม่ชำระ (แก้ไขได้จนกว่าจะจ่ายเงิน)
             const updRes = await client.query(`
                 UPDATE water_bills
                 SET previous_reading = $1,
@@ -7980,38 +7979,38 @@ app.post('/api/water/bills', async (req, res) => {
                     recorded_by = $16,
                     document_stage = $17,
                     is_locked = $18,
-                    paid_at = CASE WHEN $18::boolean THEN CURRENT_TIMESTAMP ELSE NULL END,
-                    receipt_issued_at = CASE WHEN $18::boolean THEN CURRENT_TIMESTAMP ELSE NULL END,
-                    snapshot_village_name = COALESCE(snapshot_village_name, $19),
-                    snapshot_village_address = COALESCE(snapshot_village_address, $20),
-                    snapshot_headman_name = COALESCE(snapshot_headman_name, $21),
-                    snapshot_president_name = COALESCE(snapshot_president_name, $22),
-                    snapshot_treasurer_name = COALESCE(snapshot_treasurer_name, $23),
-                    snapshot_reader_account_id = COALESCE($24::uuid, snapshot_reader_account_id),
-                    snapshot_reader_name = COALESCE($25, snapshot_reader_name),
-                    snapshot_receiver_account_id = CASE WHEN $18::boolean THEN $24::uuid ELSE snapshot_receiver_account_id END,
-                    snapshot_receiver_name = CASE WHEN $18::boolean THEN $25 ELSE snapshot_receiver_name END,
-                    snapshot_customer_name = COALESCE(snapshot_customer_name, $26),
-                    snapshot_house_no = COALESCE(snapshot_house_no, $27),
-                    snapshot_meter_no = COALESCE(snapshot_meter_no, $28),
+                    paid_at = $19,
+                    receipt_issued_at = $20,
+                    snapshot_village_name = COALESCE(snapshot_village_name, $21),
+                    snapshot_village_address = COALESCE(snapshot_village_address, $22),
+                    snapshot_headman_name = COALESCE(snapshot_headman_name, $23),
+                    snapshot_president_name = COALESCE(snapshot_president_name, $24),
+                    snapshot_treasurer_name = COALESCE(snapshot_treasurer_name, $25),
+                    snapshot_reader_account_id = COALESCE($26::uuid, snapshot_reader_account_id),
+                    snapshot_reader_name = COALESCE($27, snapshot_reader_name),
+                    snapshot_receiver_account_id = COALESCE($28::uuid, snapshot_receiver_account_id),
+                    snapshot_receiver_name = COALESCE($29, snapshot_receiver_name),
+                    snapshot_customer_name = COALESCE(snapshot_customer_name, $30),
+                    snapshot_house_no = COALESCE(snapshot_house_no, $31),
+                    snapshot_meter_no = COALESCE(snapshot_meter_no, $32),
                     updated_at = CURRENT_TIMESTAMP
-                WHERE bill_id = $29
+                WHERE bill_id = $33
                 RETURNING *
             `, [
                 prevNum, currNum, unitsUsed, rate, fee, rFee, totalAmount,
                 reading_date || null, due_date || null, reading_photo_url || null,
                 visit_status || 'NORMAL', finalPaymentStatus, finalMethod,
                 slip_url || null, note || null, recorded_by || 'STAFF',
-                docStage, isPaidNow,
+                docStage, isPaidNow, paidAtVal, paidAtVal,
                 snap.snapshot_village_name, snap.snapshot_village_address,
                 snap.snapshot_headman_name, snap.snapshot_president_name, snap.snapshot_treasurer_name,
                 snap.snapshot_reader_account_id, snap.snapshot_reader_name,
+                receiverAccountId, receiverName,
                 snap.snapshot_customer_name, snap.snapshot_house_no, snap.snapshot_meter_no,
                 existing.bill_id
             ]);
             savedBill = updRes.rows[0];
         } else {
-            // ตรวจว่าเคยมีใบที่ถูกยกเลิก (Voided) ในเดือนนี้ไหม เพื่อรันเลขใบแจ้งหนี้ใหม่ไม่ให้ชนกัน
             const voidCntRes = await client.query(
                 `SELECT COUNT(*)::int AS cnt FROM water_bills WHERE meter_id = $1 AND billing_month = $2`,
                 [Number(meter_id), billing_month]
@@ -8039,13 +8038,12 @@ app.post('/api/water/bills', async (req, res) => {
                     $14, $15, $16, $17, $18, $19,
                     $20, $21, $22,
                     $23, $24, false,
-                    CASE WHEN $24::boolean THEN CURRENT_TIMESTAMP ELSE NULL END,
-                    CASE WHEN $24::boolean THEN CURRENT_TIMESTAMP ELSE NULL END,
-                    $25, $26, $27, $28, $29,
-                    $30::uuid, $31,
-                    CASE WHEN $24::boolean THEN $30::uuid ELSE NULL END,
-                    CASE WHEN $24::boolean THEN $31 ELSE NULL END,
-                    $32, $33, $34
+                    $25, $26,
+                    $27, $28,
+                    $29, $30, $31,
+                    $32::uuid, $33,
+                    $34::uuid, $35,
+                    $36, $37, $38
                 )
                 RETURNING *
             `, [
@@ -8055,15 +8053,16 @@ app.post('/api/water/bills', async (req, res) => {
                 visit_status || 'NORMAL', finalPaymentStatus, finalMethod,
                 slip_url || null, note || null, recorded_by || 'STAFF',
                 docStage, isPaidNow,
+                paidAtVal, paidAtVal,
                 snap.snapshot_village_name, snap.snapshot_village_address,
                 snap.snapshot_headman_name, snap.snapshot_president_name, snap.snapshot_treasurer_name,
                 snap.snapshot_reader_account_id, snap.snapshot_reader_name,
+                receiverAccountId, receiverName,
                 snap.snapshot_customer_name, snap.snapshot_house_no, snap.snapshot_meter_no
             ]);
             savedBill = insRes.rows[0];
         }
 
-        // หากชำระทันที -> ออกเลขที่ใบเสร็จรับเงิน (REC-YYYYMM-XXXX) แยกจากเลขใบแจ้งหนี้
         if (isPaidNow && !savedBill.receipt_no) {
             const receiptNo = `REC-${String(billing_month).replace('-', '')}-${String(savedBill.bill_id).padStart(4, '0')}`;
             const recUpd = await client.query(
@@ -8102,110 +8101,6 @@ app.post('/api/water/bills', async (req, res) => {
     } catch (err) {
         await client.query('ROLLBACK');
         console.error('Save Water Bill Error:', err);
-        res.status(500).json({ success: false, message: err.message });
-    } finally {
-        client.release();
-    }
-});
-
-// 10. รับชำระเงินสำหรับใบแจ้งหนี้ค้างจ่าย -> เปลี่ยนสถานะเป็นออก "ใบเสร็จรับเงิน" + ล็อกห้ามลบ + บันทึกชื่อผู้รับเงิน Snapshot
-app.put('/api/water/bills/:billId/pay', async (req, res) => {
-    const { billId } = req.params;
-    const { payment_method, payment_status, slip_url, note, changed_by } = req.body;
-    const decoded = verifyRequestJwt(req);
-    const actorAccountId = decoded?.account_id || req.headers['x-account-id'] || null;
-
-    const client = await pgPool.connect();
-    try {
-        await client.query('BEGIN');
-
-        const curRes = await client.query(`SELECT * FROM water_bills WHERE bill_id = $1 LIMIT 1`, [billId]);
-        if (curRes.rows.length === 0) {
-            await client.query('ROLLBACK');
-            return res.status(404).json({ success: false, message: 'ไม่พบเลขที่บิลนี้' });
-        }
-        const cur = curRes.rows[0];
-        if (cur.is_voided) {
-            await client.query('ROLLBACK');
-            return res.status(400).json({ success: false, message: 'เอกสารนี้ถูกยกเลิกไปแล้ว ไม่สามารถรับชำระได้' });
-        }
-        if (cur.payment_status === 'PAID' && cur.receipt_no) {
-            await client.query('ROLLBACK');
-            return res.status(400).json({ success: false, message: `บิลนี้ออกใบเสร็จรับเงินเลขที่ ${cur.receipt_no} ไปแล้ว` });
-        }
-
-        const newStatus = payment_status || 'PAID';
-        const isPaidNow = newStatus === 'PAID';
-        const receiptNo = isPaidNow
-            ? (cur.receipt_no || `REC-${String(cur.billing_month || '').replace('-', '')}-${String(cur.bill_id).padStart(4, '0')}`)
-            : cur.receipt_no;
-
-        // หาชื่อจริงผู้รับเงินจากบัญชีที่กดรับชำระ
-        let receiverName = (changed_by || '').trim() || 'เจ้าหน้าที่ประปา';
-        if (isValidUuidV3(actorAccountId)) {
-            const pRes = await client.query(`
-                SELECT p.first_name, p.last_name FROM user_accounts a
-                LEFT JOIN user_profiles p ON a.profile_id = p.profile_id
-                WHERE a.account_id = $1::uuid LIMIT 1
-            `, [actorAccountId]).catch(() => ({ rows: [] }));
-            const full = `${pRes.rows[0]?.first_name || ''} ${pRes.rows[0]?.last_name || ''}`.trim();
-            if (full) receiverName = full;
-        }
-
-        const billRes = await client.query(`
-            UPDATE water_bills
-            SET payment_status = $1,
-                payment_method = $2,
-                slip_url = COALESCE($3, slip_url),
-                note = COALESCE($4, note),
-                document_stage = CASE WHEN $5::boolean THEN 'RECEIPT' ELSE 'INVOICE' END,
-                receipt_no = $6,
-                receipt_issued_at = CASE WHEN $5::boolean THEN CURRENT_TIMESTAMP ELSE receipt_issued_at END,
-                paid_at = CASE WHEN $5::boolean THEN CURRENT_TIMESTAMP ELSE paid_at END,
-                is_locked = CASE WHEN $5::boolean THEN true ELSE is_locked END,
-                snapshot_receiver_account_id = CASE WHEN $5::boolean THEN $7::uuid ELSE snapshot_receiver_account_id END,
-                snapshot_receiver_name = CASE WHEN $5::boolean THEN $8 ELSE snapshot_receiver_name END,
-                updated_at = CURRENT_TIMESTAMP
-            WHERE bill_id = $9
-            RETURNING *
-        `, [
-            newStatus,
-            payment_method || 'CASH',
-            slip_url || null,
-            note || null,
-            isPaidNow,
-            receiptNo || null,
-            isValidUuidV3(actorAccountId) ? actorAccountId : null,
-            receiverName,
-            billId
-        ]);
-
-        const bill = billRes.rows[0];
-        const meterPayStatus = await recalcMeterPaymentStatus(client, bill.meter_id);
-
-        await client.query(`
-            INSERT INTO water_meter_status_logs (meter_id, meter_status, payment_status, note, changed_by)
-            VALUES ($1, 'ACTIVE', $2, $3, $4)
-        `, [
-            bill.meter_id,
-            meterPayStatus,
-            isPaidNow
-                ? `รับชำระเงินและออกใบเสร็จ ${bill.receipt_no} (อ้างอิง ${bill.bill_no} / ${payment_method || 'CASH'})`
-                : `ลูกบ้านแนบสลิปโอนเงินใบแจ้งหนี้ ${bill.bill_no} (รอตรวจสอบ)`,
-            receiverName
-        ]);
-
-        await client.query('COMMIT');
-        res.json({
-            success: true,
-            message: isPaidNow
-                ? `รับชำระเงินและออกใบเสร็จรับเงินเลขที่ ${bill.receipt_no} เรียบร้อยแล้ว`
-                : 'ส่งหลักฐานการโอนเงินแล้ว รอเจ้าหน้าที่ตรวจสอบเพื่อออกใบเสร็จรับเงิน',
-            data: bill
-        });
-    } catch (err) {
-        await client.query('ROLLBACK');
-        console.error('Pay Water Bill Error:', err);
         res.status(500).json({ success: false, message: err.message });
     } finally {
         client.release();
