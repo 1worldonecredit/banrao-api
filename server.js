@@ -6785,8 +6785,99 @@ app.delete('/api/water/meters/:meterId', async (req, res) => {
 // =========================================================================
 // ระบบจดมิเตอร์ ออกบิล ค่าจ้างคนจดมิเตอร์ รอบวันที่เก็บ และยอดค้างชำระย้อนหลัง
 // =========================================================================
+// =========================================================================
+// Helper: ดึงข้อมูลหัวสลิปของหมู่บ้าน (ชื่อหมู่บ้าน + ที่อยู่เต็มถึงจังหวัด + ประธานกรรมการ)
+// =========================================================================
+async function getVillageSlipHeader(villageId, savedSettings = null) {
+    let villageRow = null;
+    try {
+        const vRes = await pgPool.query(`
+            SELECT
+                v.village_no,
+                v.village_name,
+                t.tambon_name_th,
+                am.amphure_name_th,
+                pr.province_name_th
+            FROM villages v
+            LEFT JOIN sys_tambons t ON v.tambon_id = t.tambon_id
+            LEFT JOIN sys_amphures am ON t.amphure_id = am.amphure_id
+            LEFT JOIN sys_provinces pr ON am.province_id = pr.province_id
+            WHERE v.village_id::text = $1::text
+            LIMIT 1
+        `, [String(villageId)]);
+        villageRow = vRes.rows[0] || null;
+    } catch (e) {
+        console.error('Fetch village header error:', e.message);
+    }
 
-// 6. ดึงการตั้งค่าเรทค่าน้ำ ค่าจ้างคนจดมิเตอร์ รอบวันเก็บ/ครบกำหนด และบัญชีรับเงิน
+    // จัดรูปแบบชื่อหมู่บ้านไม่ให้ซ้ำคำว่า "บ้าน" (เช่น บ้านขมวด -> หมู่บ้านขมวด)
+    const rawName = String(villageRow?.village_name || '').trim();
+    let villageTitle = 'หมู่บ้านประปาชุมชน';
+    if (rawName) {
+        if (rawName.startsWith('หมู่บ้าน')) villageTitle = rawName;
+        else if (rawName.startsWith('บ้าน')) villageTitle = `หมู่${rawName}`;
+        else villageTitle = `หมู่บ้าน${rawName}`;
+    }
+
+    const addrParts = [];
+    if (villageRow?.village_no) addrParts.push(`หมู่ที่ ${villageRow.village_no}`);
+    if (villageRow?.tambon_name_th) addrParts.push(`ต.${villageRow.tambon_name_th}`);
+    if (villageRow?.amphure_name_th) addrParts.push(`อ.${villageRow.amphure_name_th}`);
+    if (villageRow?.province_name_th) addrParts.push(`จ.${villageRow.province_name_th}`);
+    const villageFullAddress = addrParts.join(' ');
+
+    // ดึงชื่อประธานกรรมการ (ใช้ค่าที่ตั้งไว้ก่อน ถ้าว่างให้ดึงอัตโนมัติจากผังคณะกรรมการน้ำประปาหมู่บ้าน)
+    let presidentName = String(savedSettings?.president_name || '').trim();
+    let presidentPosition = 'ประธานกรรมการน้ำประปาหมู่บ้าน';
+
+    if (!presidentName) {
+        try {
+            const pRes = await pgPool.query(`
+                SELECT
+                    sp.position_name,
+                    COALESCE(p.first_name, hm.first_name) AS first_name,
+                    COALESCE(p.last_name, hm.last_name) AS last_name
+                FROM user_positions upos
+                JOIN community_committees cc ON upos.committee_id::text = cc.committee_id::text
+                LEFT JOIN sys_positions sp ON upos.position_id = sp.position_id
+                LEFT JOIN user_accounts a ON upos.account_id::text = a.account_id::text
+                LEFT JOIN user_profiles p ON a.profile_id = p.profile_id
+                LEFT JOIN household_members hm ON upos.account_id::text = hm.member_id::text
+                WHERE cc.village_id::text = $1::text
+                  AND (
+                      cc.committee_name LIKE '%น้ำ%'
+                      OR cc.committee_name LIKE '%ประปา%'
+                      OR cc.committee_name LIKE '%ปะปา%'
+                  )
+                  AND sp.position_name LIKE '%ประธาน%'
+                ORDER BY upos.id ASC
+                LIMIT 1
+            `, [String(villageId)]);
+
+            if (pRes.rows.length > 0) {
+                const pr = pRes.rows[0];
+                presidentName = `${pr.first_name || ''} ${pr.last_name || ''}`.trim();
+                if (pr.position_name) presidentPosition = pr.position_name;
+            }
+        } catch (e) {
+            console.error('Auto-fetch water president error:', e.message);
+        }
+    }
+
+    return {
+        village_name: rawName,
+        village_no: villageRow?.village_no || '',
+        tambon_name_th: villageRow?.tambon_name_th || '',
+        amphure_name_th: villageRow?.amphure_name_th || '',
+        province_name_th: villageRow?.province_name_th || '',
+        village_title: villageTitle,
+        village_full_address: villageFullAddress,
+        president_name: presidentName,
+        president_position: presidentPosition
+    };
+}
+
+// 6. ดึงการตั้งค่าเรทค่าน้ำ ค่าจ้างคนจดมิเตอร์ รอบวันเก็บ/ครบกำหนด ประธานกรรมการ และบัญชีรับเงิน
 app.get('/api/water/settings/:villageId', async (req, res) => {
     const { villageId } = req.params;
     try {
@@ -6805,28 +6896,30 @@ app.get('/api/water/settings/:villageId', async (req, res) => {
             bank_name: '',
             account_name: '',
             account_number: '',
-            promptpay_id: ''
+            promptpay_id: '',
+            president_name: ''
         };
-        res.json({ success: true, data: settings });
+        const villageInfo = await getVillageSlipHeader(villageId, settings);
+        res.json({ success: true, data: settings, village_info: villageInfo });
     } catch (err) {
         console.error('Get Water Settings Error:', err);
         res.status(500).json({ success: false, message: err.message });
     }
 });
 
-// 7. บันทึกการตั้งค่าเรทค่าน้ำ ค่าจ้างคนจดมิเตอร์ รอบวันเก็บ/ครบกำหนด และบัญชีรับเงิน
+// 7. บันทึกการตั้งค่าเรทค่าน้ำ ค่าจ้างคนจดมิเตอร์ รอบวันเก็บ ประธานกรรมการ และบัญชีรับเงิน
 app.put('/api/water/settings/:villageId', async (req, res) => {
     const { villageId } = req.params;
     const {
         unit_rate, meter_fee, reader_fee, reading_day, due_day, due_next_month,
-        bank_name, account_name, account_number, promptpay_id, updated_by
+        bank_name, account_name, account_number, promptpay_id, president_name, updated_by
     } = req.body;
     try {
         const result = await pgPool.query(`
             INSERT INTO water_settings (
                 village_id, unit_rate, meter_fee, reader_fee, reading_day, due_day, due_next_month,
-                bank_name, account_name, account_number, promptpay_id, updated_by, updated_at
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, CURRENT_TIMESTAMP)
+                bank_name, account_name, account_number, promptpay_id, president_name, updated_by, updated_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, CURRENT_TIMESTAMP)
             ON CONFLICT (village_id) DO UPDATE SET
                 unit_rate = EXCLUDED.unit_rate,
                 meter_fee = EXCLUDED.meter_fee,
@@ -6838,6 +6931,7 @@ app.put('/api/water/settings/:villageId', async (req, res) => {
                 account_name = EXCLUDED.account_name,
                 account_number = EXCLUDED.account_number,
                 promptpay_id = EXCLUDED.promptpay_id,
+                president_name = EXCLUDED.president_name,
                 updated_by = EXCLUDED.updated_by,
                 updated_at = CURRENT_TIMESTAMP
             RETURNING *
@@ -6853,16 +6947,23 @@ app.put('/api/water/settings/:villageId', async (req, res) => {
             account_name || '',
             account_number || '',
             String(promptpay_id || '').replace(/\D/g, ''),
+            president_name || '',
             updated_by || 'ADMIN'
         ]);
-        res.json({ success: true, message: 'บันทึกการตั้งค่าค่าน้ำและรอบเก็บเงินเรียบร้อยแล้ว', data: result.rows[0] });
+        const villageInfo = await getVillageSlipHeader(villageId, result.rows[0]);
+        res.json({
+            success: true,
+            message: 'บันทึกการตั้งค่าค่าน้ำและข้อมูลหัวสลิปเรียบร้อยแล้ว',
+            data: result.rows[0],
+            village_info: villageInfo
+        });
     } catch (err) {
         console.error('Save Water Settings Error:', err);
         res.status(500).json({ success: false, message: err.message });
     }
 });
 
-// 8. ดึงรายการผู้ใช้น้ำสำหรับจดมิเตอร์ + ยอดค้างย้อนหลังแต่ละรอบเดือน + สรุปยอดคนจดมิเตอร์
+// 8. ดึงรายการผู้ใช้น้ำสำหรับจดมิเตอร์ + ยอดค้างย้อนหลัง + ข้อมูลหัวสลิปหมู่บ้าน/ประธานกรรมการ
 app.get('/api/water/bills/:villageId', async (req, res) => {
     const { villageId } = req.params;
     const billingMonth = req.query.month || new Date().toISOString().slice(0, 7);
@@ -6883,10 +6984,12 @@ app.get('/api/water/bills/:villageId', async (req, res) => {
             bank_name: '',
             account_name: '',
             account_number: '',
-            promptpay_id: ''
+            promptpay_id: '',
+            president_name: ''
         };
 
-        // ดึงรายการค้างชำระของเดือนอื่นๆ ทั้งหมดในหมู่บ้าน (เพื่อนำมาแสดงว่าค้างรอบเดือนอะไร + ยอดค้างรวม)
+        const villageInfo = await getVillageSlipHeader(villageId, settings);
+
         const arrearsRes = await pgPool.query(`
             SELECT meter_id, bill_id, bill_no, billing_month, total_amount, payment_status
             FROM water_bills
@@ -6908,7 +7011,6 @@ app.get('/api/water/bills/:villageId', async (req, res) => {
             });
         }
 
-        // ดึงผู้ใช้น้ำทั้งหมดที่เปิดใช้งาน ผูกกับบิลของรอบเดือนที่เลือก
         const result = await pgPool.query(`
             SELECT
                 wm.meter_id, wm.village_id, wm.household_id, wm.member_id,
@@ -6990,7 +7092,6 @@ app.get('/api/water/bills/:villageId', async (req, res) => {
             };
         }).sort((a, b) => String(a.house_no).localeCompare(String(b.house_no), 'th', { numeric: true }));
 
-        // สรุปยอดรวมทั้งหมดให้คนจดมิเตอร์และเหรัญญิก
         const summary = {
             total_meters: items.length,
             recorded_count: 0,
@@ -7009,13 +7110,11 @@ app.get('/api/water/bills/:villageId', async (req, res) => {
 
         for (const it of items) {
             summary.total_arrears_previous += Number(it.arrears_total || 0);
-
             if (it.bill_id) {
                 summary.recorded_count += 1;
                 const amt = Number(it.total_amount || 0);
                 summary.total_billed_amount += amt;
                 summary.total_reader_fee += Number(it.reader_fee || 0);
-
                 if (it.bill_payment_status === 'PAID') {
                     summary.paid_count += 1;
                     summary.collected_total += amt;
@@ -7031,7 +7130,14 @@ app.get('/api/water/bills/:villageId', async (req, res) => {
             }
         }
 
-        res.json({ success: true, billing_month: billingMonth, settings, summary, data: items });
+        res.json({
+            success: true,
+            billing_month: billingMonth,
+            settings,
+            village_info: villageInfo,
+            summary,
+            data: items
+        });
     } catch (err) {
         console.error('Get Water Bills Error:', err);
         res.status(500).json({ success: false, message: err.message });
@@ -7205,7 +7311,8 @@ app.put('/api/water/bills/:billId/pay', async (req, res) => {
     }
 });
 
-// 11. ดึงบิลค่าน้ำสำหรับเจ้าของบ้าน (พร้อมยอดค้างรวมและวันที่ไทย)
+
+// 11. ดึงบิลค่าน้ำสำหรับเจ้าของบ้าน (พร้อมข้อมูลหัวสลิปหมู่บ้านและประธานกรรมการ)
 app.get('/api/water/my-bills/:accountId', async (req, res) => {
     const { accountId } = req.params;
     try {
@@ -7218,7 +7325,7 @@ app.get('/api/water/my-bills/:accountId', async (req, res) => {
         `, [String(accountId)]);
 
         if (userRes.rows.length === 0) {
-            return res.json({ success: true, data: [], settings: null });
+            return res.json({ success: true, data: [], settings: null, village_info: null });
         }
 
         const upJson = userRes.rows[0].up_json || {};
@@ -7238,7 +7345,7 @@ app.get('/api/water/my-bills/:accountId', async (req, res) => {
         }
 
         if (householdIds.length === 0) {
-            return res.json({ success: true, data: [], settings: null });
+            return res.json({ success: true, data: [], settings: null, village_info: null });
         }
 
         const billsRes = await pgPool.query(`
@@ -7264,9 +7371,11 @@ app.get('/api/water/my-bills/:accountId', async (req, res) => {
 
         const villageId = billsRes.rows[0]?.village_id || userRes.rows[0].village_id;
         let settings = null;
+        let villageInfo = null;
         if (villageId) {
             const setRes = await pgPool.query(`SELECT * FROM water_settings WHERE village_id = $1 LIMIT 1`, [String(villageId)]);
             settings = setRes.rows[0] || null;
+            villageInfo = await getVillageSlipHeader(villageId, settings);
         }
 
         const formatted = billsRes.rows.map((r) => {
@@ -7283,12 +7392,13 @@ app.get('/api/water/my-bills/:accountId', async (req, res) => {
             };
         });
 
-        res.json({ success: true, settings, data: formatted });
+        res.json({ success: true, settings, village_info: villageInfo, data: formatted });
     } catch (err) {
         console.error('Get My Water Bills Error:', err);
         res.status(500).json({ success: false, message: err.message });
     }
 });
+
 
 app.listen(port, () => {
     console.log(`Server is running on port ${port}`);
