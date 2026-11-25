@@ -2716,6 +2716,7 @@ app.post('/api/community-leaders', async (req, res) => {
         client.release();
     }
 });
+
 // ==========================================
 // API: ค้นหาข้อมูลลูกบ้านด้วยเลขบัตรประชาชน
 // ==========================================
@@ -7620,6 +7621,928 @@ app.get('/api/water/my-bills/:accountId', async (req, res) => {
     }
 });
 
+
+// =========================================================================
+// 🌟 V3: ระบบผังผู้นำชุมชน (80,000 หมู่บ้าน) + อนุมัติด้วย PIN ผู้ใหญ่บ้าน + ปรับสถานะอัตโนมัติ
+// =========================================================================
+
+const cryptoV3 = require('crypto');
+
+const isValidUuidV3 = (val) =>
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(val || '').trim());
+
+const hashHeadmanPin = (villageId, pin) =>
+    cryptoV3.createHash('sha256').update(`banrao_headman_pin::${String(villageId)}::${String(pin || '').trim()}`).digest('hex');
+
+// แมปแม่แบบสิทธิ์กับ position_id มาตรฐานเดิม (เพื่อไม่ให้สร้างแถวซ้ำใน sys_positions)
+const CANONICAL_POSITION_ID = {
+    SUPER_ADMIN: 999,
+    VILLAGE_HEADMAN: 6,
+    VILLAGE_ADMIN: 1032,
+    WATER_PRESIDENT: 25,
+    WATER_TREASURER: 27,
+    WATER_READER: 26,
+    COMMITTEE_GENERAL: 14,
+    PLACE_GOV_HEAD: 11,
+    PLACE_BIZ_OWNER: 1018
+};
+
+// ลำดับขั้นของ role ใน user_accounts (สูงกว่าชนะ)
+const ACCOUNT_ROLE_PRIORITY = {
+    CITIZEN: 0,
+    PLACE_MANAGER: 1,
+    COMMITTEE: 2,
+    VILLAGE_ADMIN: 3,
+    HEADMAN: 4,
+    SUPER_ADMIN: 5
+};
+
+// หา account_id จริงใน user_accounts จาก accountId / profileId / citizenId
+async function resolveRealUserAccountId(client, { accountId, citizenId }) {
+    if (isValidUuidV3(accountId)) {
+        const direct = await client.query(
+            `SELECT account_id FROM user_accounts WHERE account_id = $1::uuid LIMIT 1`,
+            [accountId]
+        );
+        if (direct.rows.length > 0) return direct.rows[0].account_id;
+
+        // กรณีค่าที่ส่งมาคือ profile_id
+        const byProf = await client.query(
+            `SELECT account_id FROM user_accounts WHERE profile_id = $1::uuid LIMIT 1`,
+            [accountId]
+        );
+        if (byProf.rows.length > 0) return byProf.rows[0].account_id;
+    }
+
+    const cleanCid = String(citizenId || '').replace(/\D/g, '');
+    if (cleanCid.length === 13) {
+        const byCid = await client.query(`
+            SELECT ua.account_id
+            FROM user_accounts ua
+            JOIN user_profiles up ON ua.profile_id = up.profile_id
+            WHERE REGEXP_REPLACE(COALESCE(up.citizen_id, ''), '[^0-9]', '', 'g') = $1
+            LIMIT 1
+        `, [cleanCid]);
+        if (byCid.rows.length > 0) return byCid.rows[0].account_id;
+    }
+
+    return null;
+}
+
+// คำนวณและอัปเดต user_accounts.role อัตโนมัติจากตำแหน่งที่ได้รับอนุมัติ (ACTIVE) ทั้งหมด
+async function syncUserAccountRoleFromPositions(client, accountId) {
+    if (!isValidUuidV3(accountId)) return { oldRole: null, newRole: null };
+
+    const accRes = await client.query(
+        `SELECT account_id, role, village_id FROM user_accounts WHERE account_id = $1::uuid LIMIT 1`,
+        [accountId]
+    );
+    if (accRes.rows.length === 0) return { oldRole: null, newRole: null };
+
+    const oldRole = String(accRes.rows[0].role || 'CITIZEN').toUpperCase();
+    // ไม่ลดระดับ SUPER_ADMIN เด็ดขาด
+    if (oldRole === 'SUPER_ADMIN') return { oldRole, newRole: oldRole };
+
+    // เช็กว่าเป็นผู้ใหญ่บ้านประจำหมู่บ้านหรือไม่
+    const headRes = await client.query(
+        `SELECT village_id FROM villages WHERE headman_account_id = $1::uuid LIMIT 1`,
+        [accountId]
+    );
+    if (headRes.rows.length > 0) {
+        if (oldRole !== 'HEADMAN') {
+            await client.query(`UPDATE user_accounts SET role = 'HEADMAN' WHERE account_id = $1::uuid`, [accountId]);
+        }
+        return { oldRole, newRole: 'HEADMAN' };
+    }
+
+    // ดึงตำแหน่งทั้งหมดที่ได้รับอนุมัติและยังไม่หมดวาระ
+    const posRes = await client.query(`
+        SELECT rt.account_role_level
+        FROM user_positions up
+        JOIN sys_role_templates rt ON up.role_template_code = rt.role_template_code
+        WHERE up.account_id = $1::uuid
+          AND up.status = 'ACTIVE'
+          AND up.is_active = true
+          AND (up.end_date IS NULL OR up.end_date >= CURRENT_DATE)
+    `, [accountId]);
+
+    let bestRole = 'CITIZEN';
+    let bestScore = 0;
+    for (const r of posRes.rows) {
+        const lvl = String(r.account_role_level || 'CITIZEN').toUpperCase();
+        const score = ACCOUNT_ROLE_PRIORITY[lvl] ?? 0;
+        if (score > bestScore) {
+            bestScore = score;
+            bestRole = lvl;
+        }
+    }
+
+    if (bestRole !== oldRole) {
+        await client.query(`UPDATE user_accounts SET role = $1 WHERE account_id = $2::uuid`, [bestRole, accountId]);
+    }
+    return { oldRole, newRole: bestRole };
+}
+
+// ตรวจสอบรหัส PIN ผู้ใหญ่บ้านของหมู่บ้านนั้น (ใช้ตาราง sys_approval_pins)
+async function verifyVillageHeadmanPin(client, villageId, inputPin) {
+    const cleanPin = String(inputPin || '').trim();
+    if (!cleanPin) return false;
+
+    const pinRes = await client.query(`
+        SELECT pin_id, pin_hash, pin_code
+        FROM sys_approval_pins
+        WHERE village_id = $1::uuid
+          AND pin_purpose = 'HEADMAN_APPROVAL'
+          AND is_active = true
+        ORDER BY updated_at DESC
+        LIMIT 1
+    `, [villageId]);
+
+    if (pinRes.rows.length > 0) {
+        const row = pinRes.rows[0];
+        if (row.pin_hash && row.pin_hash === hashHeadmanPin(villageId, cleanPin)) return true;
+        if (!row.pin_hash && row.pin_code && row.pin_code !== 'HASHED' && row.pin_code === cleanPin) return true;
+        return false;
+    }
+
+    // Fallback: ตรวจ PIN เดิมของ headman_account_id ที่ยังไม่ได้ระบุ village_id
+    const vRes = await client.query(`SELECT headman_account_id FROM villages WHERE village_id = $1::uuid LIMIT 1`, [villageId]);
+    const headmanId = vRes.rows[0]?.headman_account_id;
+    if (headmanId) {
+        const legacyRes = await client.query(`
+            SELECT pin_code, pin_hash
+            FROM sys_approval_pins
+            WHERE account_id = $1::uuid AND is_active = true
+            ORDER BY updated_at DESC
+            LIMIT 1
+        `, [headmanId]);
+        if (legacyRes.rows.length > 0) {
+            const row = legacyRes.rows[0];
+            if (row.pin_hash && row.pin_hash === hashHeadmanPin(villageId, cleanPin)) return true;
+            if (row.pin_code && row.pin_code !== 'HASHED' && row.pin_code === cleanPin) return true;
+        }
+    }
+
+    return false;
+}
+
+// 1. ดึงแม่แบบสิทธิ์มาตรฐานสำหรับผูกกับตำแหน่งในผัง (ใช้เหมือนกันทั้ง 80,000 หมู่บ้าน)
+app.get('/api/v3/role-templates', async (req, res) => {
+    try {
+        const result = await pgPool.query(`
+            SELECT role_template_code, template_name_th, category, account_role_level, description
+            FROM sys_role_templates
+            WHERE is_active = true AND role_template_code <> 'SUPER_ADMIN'
+            ORDER BY display_order ASC
+        `);
+        res.json({ success: true, data: result.rows });
+    } catch (err) {
+        console.error('Get Role Templates Error:', err);
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// 2. ดึงรายชื่อคณะทำงานของหมู่บ้าน (รองรับ UUID 100% + นับจำนวนคนที่รออนุมัติในแต่ละผัง)
+app.get('/api/v3/committees/:villageId', async (req, res) => {
+    const { villageId } = req.params;
+    if (!isValidUuidV3(villageId)) {
+        return res.status(400).json({ success: false, message: 'รหัสหมู่บ้านไม่ถูกต้อง' });
+    }
+    try {
+        const result = await pgPool.query(`
+            SELECT
+                cc.*,
+                COALESCE(cnt.pending_count, 0)::int AS pending_count,
+                COALESCE(cnt.active_count, 0)::int AS active_count
+            FROM community_committees cc
+            LEFT JOIN (
+                SELECT
+                    committee_id,
+                    COUNT(*) FILTER (WHERE status = 'PENDING_APPROVAL' AND is_active = true) AS pending_count,
+                    COUNT(*) FILTER (WHERE status = 'ACTIVE' AND is_active = true) AS active_count
+                FROM user_positions
+                GROUP BY committee_id
+            ) cnt ON cnt.committee_id = cc.committee_id
+            WHERE cc.village_id = $1::uuid
+              AND COALESCE(cc.is_active, true) = true
+            ORDER BY cc.committee_id ASC
+        `, [villageId]);
+
+        res.json({ success: true, data: result.rows });
+    } catch (err) {
+        console.error('V3 Get Committees Error:', err);
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// 3. สร้างคณะทำงาน / ผังใหม่ (ตั้งชื่ออิสระ + เลือกประเภทงาน)
+app.post('/api/v3/committees', async (req, res) => {
+    const { village_id, committee_name, description, committee_type_code } = req.body;
+    if (!isValidUuidV3(village_id) || !committee_name?.trim()) {
+        return res.status(400).json({ success: false, message: 'กรุณาระบุหมู่บ้านและชื่อคณะทำงาน' });
+    }
+    try {
+        const result = await pgPool.query(`
+            INSERT INTO community_committees (village_id, committee_name, description, committee_type_code, is_active)
+            VALUES ($1::uuid, $2, $3, $4, true)
+            RETURNING *
+        `, [village_id, committee_name.trim(), description || '', committee_type_code || 'CUSTOM']);
+
+        res.json({ success: true, message: 'สร้างผังคณะทำงานใหม่สำเร็จ', data: result.rows[0] });
+    } catch (err) {
+        console.error('V3 Create Committee Error:', err);
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// 4. แก้ไขชื่อ / รายละเอียดผังคณะทำงาน (ล็อกขอบเขตหมู่บ้าน)
+app.put('/api/v3/committees/:committeeId', async (req, res) => {
+    const { committeeId } = req.params;
+    const { village_id, committee_name, description, committee_type_code } = req.body;
+    if (!committee_name?.trim()) {
+        return res.status(400).json({ success: false, message: 'กรุณาระบุชื่อคณะทำงาน' });
+    }
+    try {
+        await pgPool.query(`
+            UPDATE community_committees
+            SET committee_name = $1,
+                description = $2,
+                committee_type_code = COALESCE($3, committee_type_code)
+            WHERE committee_id = $4
+              AND ($5::text IS NULL OR village_id::text = $5::text)
+        `, [committee_name.trim(), description || '', committee_type_code || null, committeeId, village_id || null]);
+
+        res.json({ success: true, message: 'แก้ไขข้อมูลผังสำเร็จ' });
+    } catch (err) {
+        console.error('V3 Update Committee Error:', err);
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// 5. ลบผังคณะทำงาน (Soft Delete + ถอดถอนตำแหน่งในผัง + คำนวณสิทธิ์ใหม่)
+app.delete('/api/v3/committees/:committeeId', async (req, res) => {
+    const { committeeId } = req.params;
+    const villageId = req.query.village_id || req.body?.village_id || null;
+    const client = await pgPool.connect();
+    try {
+        await client.query('BEGIN');
+
+        const affected = await client.query(
+            `SELECT DISTINCT account_id FROM user_positions WHERE committee_id = $1 AND account_id IS NOT NULL`,
+            [committeeId]
+        );
+
+        await client.query(`
+            UPDATE user_positions
+            SET status = 'REVOKED', is_active = false, end_date = CURRENT_DATE, end_reason = 'ยุบผังคณะทำงาน'
+            WHERE committee_id = $1
+        `, [committeeId]);
+
+        await client.query(`
+            UPDATE community_committees
+            SET is_active = false
+            WHERE committee_id = $1
+              AND ($2::text IS NULL OR village_id::text = $2::text)
+        `, [committeeId, villageId]);
+
+        for (const r of affected.rows) {
+            await syncUserAccountRoleFromPositions(client, r.account_id);
+        }
+
+        await client.query('COMMIT');
+        res.json({ success: true, message: 'ลบผังคณะทำงานและปรับสถานะบุคคลที่เกี่ยวข้องเรียบร้อยแล้ว' });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error('V3 Delete Committee Error:', err);
+        res.status(500).json({ success: false, message: err.message });
+    } finally {
+        client.release();
+    }
+});
+
+// 6. ดึงรายชื่อบุคคลในผัง (แสดงสถานะ PENDING_APPROVAL / ACTIVE + ชุดสิทธิ์ + ชื่อผู้อนุมัติ)
+app.get('/api/v3/committees/:committeeId/leaders', async (req, res) => {
+    const { committeeId } = req.params;
+    const villageId = req.query.village_id || null;
+    try {
+        const result = await pgPool.query(`
+            SELECT
+                up.id,
+                up.id AS position_record_id,
+                up.committee_id,
+                up.village_id,
+                up.parent_id,
+                up.account_id,
+                up.member_id,
+                up.citizen_id,
+                up.position_id,
+                COALESCE(NULLIF(up.custom_position_title, ''), sp.position_name, 'ตำแหน่งใหม่') AS role_name,
+                COALESCE(up.role_template_code, sp.role_template_code, 'COMMITTEE_GENERAL') AS role_template_code,
+                rt.template_name_th,
+                rt.account_role_level,
+                up.status,
+                up.is_active,
+                up.start_date,
+                up.end_date,
+                up.responsibilities,
+                up.approved_by,
+                up.approved_at,
+                up.approval_note,
+                COALESCE(prof.first_name, hm.first_name, '') AS first_name,
+                COALESCE(prof.last_name, hm.last_name, '') AS last_name,
+                COALESCE(prof.dob, hm.dob) AS dob,
+                (ua.account_id IS NOT NULL) AS has_app_account,
+                ua.role AS current_account_role,
+                ua.is_active AS account_is_active,
+                COALESCE(media.image_url, '/profile-img.jpg') AS user_image,
+                COALESCE(ap_prof.first_name || ' ' || ap_prof.last_name, '') AS approver_name
+            FROM user_positions up
+            LEFT JOIN sys_positions sp ON up.position_id = sp.position_id
+            LEFT JOIN sys_role_templates rt ON COALESCE(up.role_template_code, sp.role_template_code) = rt.role_template_code
+            LEFT JOIN user_accounts ua ON up.account_id = ua.account_id
+            LEFT JOIN LATERAL (
+                SELECT p.profile_id, p.first_name, p.last_name, p.dob, p.citizen_id
+                FROM user_profiles p
+                WHERE (ua.profile_id IS NOT NULL AND p.profile_id = ua.profile_id)
+                   OR (up.account_id IS NOT NULL AND p.profile_id = up.account_id)
+                   OR (
+                        COALESCE(up.citizen_id, '') <> ''
+                        AND REGEXP_REPLACE(COALESCE(p.citizen_id, ''), '[^0-9]', '', 'g') = REGEXP_REPLACE(up.citizen_id, '[^0-9]', '', 'g')
+                   )
+                LIMIT 1
+            ) prof ON true
+            LEFT JOIN LATERAL (
+                SELECT m.member_id, m.first_name, m.last_name, m.dob, m.citizen_id
+                FROM household_members m
+                WHERE (up.member_id IS NOT NULL AND m.member_id::text = up.member_id::text)
+                   OR (up.account_id IS NOT NULL AND m.member_id::text = up.account_id::text)
+                   OR (
+                        COALESCE(up.citizen_id, '') <> ''
+                        AND REGEXP_REPLACE(COALESCE(m.citizen_id::text, ''), '[^0-9]', '', 'g') = REGEXP_REPLACE(up.citizen_id, '[^0-9]', '', 'g')
+                   )
+                LIMIT 1
+            ) hm ON true
+            LEFT JOIN LATERAL (
+                SELECT cpm.image_url
+                FROM citizen_profiles_media cpm
+                WHERE cpm.profile_id = prof.profile_id AND cpm.is_active = true
+                ORDER BY cpm.created_at DESC
+                LIMIT 1
+            ) media ON true
+            LEFT JOIN user_accounts ap_ua ON up.approved_by = ap_ua.account_id
+            LEFT JOIN user_profiles ap_prof ON ap_ua.profile_id = ap_prof.profile_id
+            WHERE up.committee_id = $1
+              AND up.is_active = true
+              AND up.status IN ('PENDING_APPROVAL', 'ACTIVE')
+              AND ($2::text IS NULL OR up.village_id IS NULL OR up.village_id::text = $2::text)
+            ORDER BY up.id ASC
+        `, [committeeId, villageId]);
+
+        res.json({ success: true, data: result.rows });
+    } catch (err) {
+        console.error('V3 Get Committee Leaders Error:', err);
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// 7. ค้นหาลูกบ้านด้วยเลขบัตร 13 หลัก (กั้นเขตเฉพาะหมู่บ้านของตัวเอง 100%)
+app.get('/api/v3/search-citizen/:villageId/:citizenId', async (req, res) => {
+    const { villageId, citizenId } = req.params;
+    const cleanCid = String(citizenId || '').replace(/\D/g, '');
+    if (!isValidUuidV3(villageId) || cleanCid.length !== 13) {
+        return res.status(400).json({ success: false, message: 'กรุณากรอกเลขบัตรประชาชนให้ครบ 13 หลัก' });
+    }
+
+    try {
+        // ค้นหาจากทะเบียนลูกบ้านในหมู่บ้านนี้ก่อน (household_members + households)
+        const hmRes = await pgPool.query(`
+            SELECT
+                hm.member_id::text AS member_id,
+                hm.first_name,
+                hm.last_name,
+                hm.dob,
+                hm.citizen_id,
+                hm.status AS member_status,
+                v.village_name,
+                v.village_no,
+                t.tambon_name_th,
+                am.amphure_name_th,
+                pr.province_name_th,
+                ua.account_id AS user_account_id,
+                ua.role AS current_role,
+                ua.is_active AS account_is_active,
+                COALESCE(cpm.image_url, '/profile-img.jpg') AS user_image
+            FROM household_members hm
+            JOIN households h ON hm.household_id::text = h.household_id::text
+            LEFT JOIN villages v ON h.village_id = v.village_id
+            LEFT JOIN sys_tambons t ON v.tambon_id = t.tambon_id
+            LEFT JOIN sys_amphures am ON t.amphure_id = am.amphure_id
+            LEFT JOIN sys_provinces pr ON am.province_id = pr.province_id
+            LEFT JOIN user_profiles up ON REGEXP_REPLACE(COALESCE(up.citizen_id, ''), '[^0-9]', '', 'g') = $2
+            LEFT JOIN user_accounts ua ON ua.profile_id = up.profile_id AND ua.village_id = $1::uuid
+            LEFT JOIN LATERAL (
+                SELECT image_url FROM citizen_profiles_media
+                WHERE profile_id = up.profile_id AND is_active = true
+                ORDER BY created_at DESC LIMIT 1
+            ) cpm ON true
+            WHERE h.village_id = $1::uuid
+              AND hm.status = 'ACTIVE'
+              AND REGEXP_REPLACE(COALESCE(hm.citizen_id::text, ''), '[^0-9]', '', 'g') = $2
+            LIMIT 1
+        `, [villageId, cleanCid]);
+
+        if (hmRes.rows.length > 0) {
+            const r = hmRes.rows[0];
+            return res.json({
+                success: true,
+                data: {
+                    ...r,
+                    citizen_id: cleanCid,
+                    account_id: r.user_account_id || null,
+                    has_app_account: Boolean(r.user_account_id)
+                }
+            });
+        }
+
+        // กรณีสมัครแอปอยู่ในหมู่บ้านนี้แล้ว แต่ยังไม่ได้เพิ่มลงทะเบียนบ้าน
+        const accRes = await pgPool.query(`
+            SELECT
+                ua.account_id AS user_account_id,
+                ua.role AS current_role,
+                ua.is_active AS account_is_active,
+                up.first_name,
+                up.last_name,
+                up.dob,
+                up.citizen_id,
+                v.village_name,
+                v.village_no,
+                t.tambon_name_th,
+                am.amphure_name_th,
+                pr.province_name_th,
+                COALESCE(cpm.image_url, '/profile-img.jpg') AS user_image
+            FROM user_accounts ua
+            JOIN user_profiles up ON ua.profile_id = up.profile_id
+            LEFT JOIN villages v ON ua.village_id = v.village_id
+            LEFT JOIN sys_tambons t ON v.tambon_id = t.tambon_id
+            LEFT JOIN sys_amphures am ON t.amphure_id = am.amphure_id
+            LEFT JOIN sys_provinces pr ON am.province_id = pr.province_id
+            LEFT JOIN LATERAL (
+                SELECT image_url FROM citizen_profiles_media
+                WHERE profile_id = up.profile_id AND is_active = true
+                ORDER BY created_at DESC LIMIT 1
+            ) cpm ON true
+            WHERE ua.village_id = $1::uuid
+              AND ua.is_active = true
+              AND REGEXP_REPLACE(COALESCE(up.citizen_id, ''), '[^0-9]', '', 'g') = $2
+            LIMIT 1
+        `, [villageId, cleanCid]);
+
+        if (accRes.rows.length > 0) {
+            const r = accRes.rows[0];
+            return res.json({
+                success: true,
+                data: {
+                    ...r,
+                    member_id: null,
+                    citizen_id: cleanCid,
+                    account_id: r.user_account_id,
+                    has_app_account: true
+                }
+            });
+        }
+
+        res.json({ success: false, message: 'ไม่พบข้อมูลลูกบ้านเลขบัตรนี้ในหมู่บ้านของคุณ (ห้ามดึงบุคคลข้ามหมู่บ้าน)' });
+    } catch (err) {
+        console.error('V3 Search Citizen Error:', err);
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// 8. เพิ่มบุคลากรลงผัง (สถานะเริ่มต้น = PENDING_APPROVAL รอผู้ใหญ่บ้านอนุมัติด้วย PIN)
+app.post('/api/v3/committee-leaders', async (req, res) => {
+    const {
+        village_id, committee_id, custom_position_title, role_template_code,
+        account_id, member_id, citizen_id, start_date, end_date,
+        responsibilities, parent_id, assigned_by
+    } = req.body;
+
+    if (!isValidUuidV3(village_id) || !committee_id || !custom_position_title?.trim() || !role_template_code) {
+        return res.status(400).json({ success: false, message: 'กรุณาระบุชื่อตำแหน่งและเลือกชุดสิทธิ์ระบบให้ครบถ้วน' });
+    }
+
+    const client = await pgPool.connect();
+    try {
+        const realAccountId = await resolveRealUserAccountId(client, { accountId: account_id, citizenId: citizen_id });
+        const canonicalPosId = CANONICAL_POSITION_ID[role_template_code] || 14;
+        const cleanCid = String(citizen_id || '').replace(/\D/g, '') || null;
+
+        const insertRes = await client.query(`
+            INSERT INTO user_positions (
+                village_id, committee_id, account_id, member_id, citizen_id,
+                position_id, custom_position_title, role_template_code,
+                scope_type, scope_id, start_date, end_date,
+                responsibilities, parent_id, assigned_by,
+                status, is_active
+            ) VALUES (
+                $1::uuid, $2, $3::uuid, $4, $5,
+                $6, $7, $8,
+                'VILLAGE', $1::text, $9, $10,
+                $11, $12, $13::uuid,
+                'PENDING_APPROVAL', true
+            )
+            RETURNING *
+        `, [
+            village_id,
+            Number(committee_id),
+            realAccountId,
+            member_id ? String(member_id) : null,
+            cleanCid,
+            canonicalPosId,
+            custom_position_title.trim(),
+            role_template_code,
+            start_date || new Date().toISOString().split('T')[0],
+            end_date || null,
+            responsibilities || '',
+            parent_id ? Number(parent_id) : null,
+            isValidUuidV3(assigned_by) ? assigned_by : null
+        ]);
+
+        res.json({
+            success: true,
+            message: 'เพิ่มบุคลากรลงผังแล้ว (สถานะ: รอผู้ใหญ่บ้านอนุมัติด้วยรหัส PIN)',
+            data: insertRes.rows[0]
+        });
+    } catch (err) {
+        console.error('V3 Create Leader Error:', err);
+        res.status(500).json({ success: false, message: err.message });
+    } finally {
+        client.release();
+    }
+});
+
+// 9. แก้ไขข้อมูลบุคลากรในผัง (หากเปลี่ยนชุดสิทธิ์ จะกลับเป็น PENDING_APPROVAL เพื่อรอผู้ใหญ่บ้านอนุมัติใหม่)
+app.put('/api/v3/committee-leaders/:recordId', async (req, res) => {
+    const { recordId } = req.params;
+    const {
+        village_id, custom_position_title, role_template_code,
+        start_date, end_date, responsibilities
+    } = req.body;
+
+    const client = await pgPool.connect();
+    try {
+        await client.query('BEGIN');
+
+        const curRes = await client.query(`SELECT * FROM user_positions WHERE id = $1 LIMIT 1`, [recordId]);
+        if (curRes.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ success: false, message: 'ไม่พบข้อมูลตำแหน่งนี้' });
+        }
+        const cur = curRes.rows[0];
+        if (village_id && cur.village_id && String(cur.village_id) !== String(village_id)) {
+            await client.query('ROLLBACK');
+            return res.status(403).json({ success: false, message: 'ไม่อนุญาตให้แก้ไขข้อมูลข้ามหมู่บ้าน' });
+        }
+
+        const nextTpl = role_template_code || cur.role_template_code || 'COMMITTEE_GENERAL';
+        const roleChanged = nextTpl !== cur.role_template_code;
+        const nextStatus = roleChanged ? 'PENDING_APPROVAL' : cur.status;
+        const canonicalPosId = CANONICAL_POSITION_ID[nextTpl] || cur.position_id || 14;
+
+        await client.query(`
+            UPDATE user_positions
+            SET custom_position_title = $1,
+                role_template_code = $2,
+                position_id = $3,
+                start_date = $4,
+                end_date = $5,
+                responsibilities = $6,
+                status = $7
+            WHERE id = $8
+        `, [
+            custom_position_title?.trim() || cur.custom_position_title,
+            nextTpl,
+            canonicalPosId,
+            start_date || cur.start_date,
+            end_date || null,
+            responsibilities ?? cur.responsibilities,
+            nextStatus,
+            recordId
+        ]);
+
+        if (roleChanged && cur.account_id) {
+            await syncUserAccountRoleFromPositions(client, cur.account_id);
+        }
+
+        await client.query('COMMIT');
+        res.json({
+            success: true,
+            message: roleChanged
+                ? 'แก้ไขชุดสิทธิ์แล้ว กรุณาให้ผู้ใหญ่บ้านกดอนุมัติด้วย PIN อีกครั้ง'
+                : 'อัปเดตข้อมูลเรียบร้อยแล้ว'
+        });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error('V3 Update Leader Error:', err);
+        res.status(500).json({ success: false, message: err.message });
+    } finally {
+        client.release();
+    }
+});
+
+// 10. เช็กสถานะรหัส PIN อนุมัติของผู้ใหญ่บ้านประจำหมู่บ้าน
+app.get('/api/v3/headman-pin/:villageId', async (req, res) => {
+    const { villageId } = req.params;
+    if (!isValidUuidV3(villageId)) {
+        return res.status(400).json({ success: false, message: 'รหัสหมู่บ้านไม่ถูกต้อง' });
+    }
+    try {
+        const vRes = await pgPool.query(`
+            SELECT v.village_id, v.village_name, v.headman_account_id,
+                   COALESCE(up.first_name || ' ' || up.last_name, '') AS headman_name
+            FROM villages v
+            LEFT JOIN user_accounts ua ON v.headman_account_id = ua.account_id
+            LEFT JOIN user_profiles up ON ua.profile_id = up.profile_id
+            WHERE v.village_id = $1::uuid
+            LIMIT 1
+        `, [villageId]);
+
+        const pinRes = await pgPool.query(`
+            SELECT pin_id, updated_at
+            FROM sys_approval_pins
+            WHERE village_id = $1::uuid AND pin_purpose = 'HEADMAN_APPROVAL' AND is_active = true
+            LIMIT 1
+        `, [villageId]);
+
+        res.json({
+            success: true,
+            data: {
+                village_id: villageId,
+                village_name: vRes.rows[0]?.village_name || '',
+                headman_account_id: vRes.rows[0]?.headman_account_id || null,
+                headman_name: vRes.rows[0]?.headman_name?.trim() || 'ผู้ใหญ่บ้าน',
+                has_pin: pinRes.rows.length > 0
+            }
+        });
+    } catch (err) {
+        console.error('V3 Check Headman PIN Error:', err);
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// 11. ตั้ง / เปลี่ยนรหัส PIN อนุมัติของผู้ใหญ่บ้าน (6 หลัก เก็บแบบ Hash ใน sys_approval_pins)
+app.post('/api/v3/headman-pin/:villageId/setup', async (req, res) => {
+    const { villageId } = req.params;
+    const { account_id, old_pin, new_pin } = req.body;
+
+    if (!isValidUuidV3(villageId) || !isValidUuidV3(account_id)) {
+        return res.status(400).json({ success: false, message: 'ข้อมูลหมู่บ้านหรือผู้ใช้งานไม่ถูกต้อง' });
+    }
+    if (!new_pin || String(new_pin).trim().length < 4) {
+        return res.status(400).json({ success: false, message: 'กรุณากำหนดรหัส PIN อย่างน้อย 4-6 หลัก' });
+    }
+
+    const client = await pgPool.connect();
+    try {
+        await client.query('BEGIN');
+
+        // ตรวจสิทธิ์ผู้ตั้งรหัส (ต้องเป็นผู้ใหญ่บ้านของหมู่บ้านนี้ หรือ Super Admin / Admin Villages)
+        const vRes = await client.query(`SELECT headman_account_id FROM villages WHERE village_id = $1::uuid LIMIT 1`, [villageId]);
+        const accRes = await client.query(`SELECT role, village_id FROM user_accounts WHERE account_id = $1::uuid LIMIT 1`, [account_id]);
+        const userRole = String(accRes.rows[0]?.role || '').toUpperCase();
+        const isAllowed =
+            String(vRes.rows[0]?.headman_account_id || '') === String(account_id) ||
+            userRole === 'SUPER_ADMIN' ||
+            userRole === 'HEADMAN' ||
+            (String(accRes.rows[0]?.village_id || '') === String(villageId) && userRole.includes('ADMIN'));
+
+        if (!isAllowed) {
+            await client.query('ROLLBACK');
+            return res.status(403).json({ success: false, message: 'เฉพาะผู้ใหญ่บ้านประจำหมู่บ้านเท่านั้นที่ตั้งรหัสอนุมัติได้' });
+        }
+
+        const existingRes = await client.query(`
+            SELECT pin_id FROM sys_approval_pins
+            WHERE village_id = $1::uuid AND pin_purpose = 'HEADMAN_APPROVAL' AND is_active = true
+            LIMIT 1
+        `, [villageId]);
+
+        if (existingRes.rows.length > 0) {
+            const okOld = await verifyVillageHeadmanPin(client, villageId, old_pin);
+            if (!okOld) {
+                await client.query('ROLLBACK');
+                return res.status(403).json({ success: false, message: 'รหัส PIN เดิมไม่ถูกต้อง' });
+            }
+            await client.query(`
+                UPDATE sys_approval_pins
+                SET pin_hash = $1, pin_code = 'HASHED', account_id = $2::uuid, updated_at = CURRENT_TIMESTAMP
+                WHERE pin_id = $3
+            `, [hashHeadmanPin(villageId, new_pin), account_id, existingRes.rows[0].pin_id]);
+        } else {
+            await client.query(`
+                INSERT INTO sys_approval_pins (account_id, village_id, scope_level, pin_purpose, pin_code, pin_hash, is_active)
+                VALUES ($1::uuid, $2::uuid, 'VILLAGE', 'HEADMAN_APPROVAL', 'HASHED', $3, true)
+            `, [account_id, villageId, hashHeadmanPin(villageId, new_pin)]);
+        }
+
+        // หาก villages.headman_account_id ยังว่าง ให้ผูกเป็นผู้ใหญ่บ้านคนนี้ด้วย
+        if (!vRes.rows[0]?.headman_account_id) {
+            await client.query(`UPDATE villages SET headman_account_id = $1::uuid WHERE village_id = $2::uuid`, [account_id, villageId]);
+        }
+
+        await client.query('COMMIT');
+        res.json({ success: true, message: 'บันทึกรหัส PIN อนุมัติของผู้ใหญ่บ้านเรียบร้อยแล้ว' });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error('V3 Setup Headman PIN Error:', err);
+        res.status(500).json({ success: false, message: err.message });
+    } finally {
+        client.release();
+    }
+});
+
+// 12. ผู้ใหญ่บ้านอนุมัติตำแหน่งด้วย PIN (รองรับทั้งอนุมัติรายคน และ อนุมัติทั้งผัง) -> ปรับสถานะประชาชนเป็นกรรมการทันที!
+app.post('/api/v3/committee-leaders/approve', async (req, res) => {
+    const { village_id, approver_account_id, pin_code, record_ids, committee_id, note } = req.body;
+
+    if (!isValidUuidV3(village_id) || !isValidUuidV3(approver_account_id)) {
+        return res.status(400).json({ success: false, message: 'ข้อมูลหมู่บ้านหรือผู้อนุมัติไม่ถูกต้อง' });
+    }
+    if (!pin_code) {
+        return res.status(400).json({ success: false, message: 'กรุณากรอกรหัส PIN อนุมัติของผู้ใหญ่บ้าน' });
+    }
+
+    const client = await pgPool.connect();
+    try {
+        await client.query('BEGIN');
+
+        // 1. ตรวจ PIN ผู้ใหญ่บ้าน
+        const pinOk = await verifyVillageHeadmanPin(client, village_id, pin_code);
+        if (!pinOk) {
+            await client.query('ROLLBACK');
+            return res.status(403).json({ success: false, message: 'รหัส PIN อนุมัติของผู้ใหญ่บ้านไม่ถูกต้อง' });
+        }
+
+        // 2. ค้นหารายการที่รออนุมัติในหมู่บ้านนี้เท่านั้น
+        let targetsRes;
+        if (Array.isArray(record_ids) && record_ids.length > 0) {
+            targetsRes = await client.query(`
+                SELECT * FROM user_positions
+                WHERE id = ANY($1::int[])
+                  AND (village_id = $2::uuid OR village_id IS NULL)
+                  AND is_active = true
+            `, [record_ids.map(Number), village_id]);
+        } else if (committee_id) {
+            targetsRes = await client.query(`
+                SELECT * FROM user_positions
+                WHERE committee_id = $1
+                  AND (village_id = $2::uuid OR village_id IS NULL)
+                  AND status = 'PENDING_APPROVAL'
+                  AND is_active = true
+            `, [Number(committee_id), village_id]);
+        } else {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ success: false, message: 'กรุณาระบุบุคคลหรือผังที่ต้องการอนุมัติ' });
+        }
+
+        if (targetsRes.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ success: false, message: 'ไม่พบรายการที่รออนุมัติ' });
+        }
+
+        let approvedCount = 0;
+        for (const rec of targetsRes.rows) {
+            // ผูกกับบัญชี Login จริงอัตโนมัติ (กรณีเพิ่งสมัครแอป)
+            const realAccountId = await resolveRealUserAccountId(client, {
+                accountId: rec.account_id,
+                citizenId: rec.citizen_id
+            });
+
+            await client.query(`
+                UPDATE user_positions
+                SET status = 'ACTIVE',
+                    is_active = true,
+                    village_id = $1::uuid,
+                    account_id = COALESCE($2::uuid, account_id),
+                    approved_by = $3::uuid,
+                    approved_at = CURRENT_TIMESTAMP,
+                    approval_note = $4
+                WHERE id = $5
+            `, [village_id, realAccountId, approver_account_id, note || 'อนุมัติแต่งตั้งตำแหน่งโดยผู้ใหญ่บ้าน', rec.id]);
+
+            // ปรับบทบาทใน user_accounts จาก CITIZEN -> COMMITTEE / VILLAGE_ADMIN / PLACE_MANAGER
+            const roleShift = realAccountId
+                ? await syncUserAccountRoleFromPositions(client, realAccountId)
+                : { oldRole: 'NO_ACCOUNT', newRole: 'PENDING_REGISTER' };
+
+            // บันทึกประวัติการอนุมัติลง sys_approval_logs
+            await client.query(`
+                INSERT INTO sys_approval_logs (
+                    village_id, target_type, target_id, target_account_id,
+                    action_type, old_status, new_status, old_role, new_role, approved_by, note
+                ) VALUES ($1::uuid, 'USER_POSITION', $2, $3::uuid, 'APPROVE', $4, 'ACTIVE', $5, $6, $7::uuid, $8)
+            `, [
+                village_id,
+                String(rec.id),
+                realAccountId,
+                rec.status,
+                roleShift.oldRole,
+                roleShift.newRole,
+                approver_account_id,
+                note || `อนุมัติตำแหน่ง ${rec.custom_position_title || rec.role_template_code}`
+            ]);
+
+            approvedCount += 1;
+        }
+
+        await client.query('COMMIT');
+        res.json({
+            success: true,
+            message: `ผู้ใหญ่บ้านอนุมัติตำแหน่งสำเร็จ ${approvedCount} รายการ และปรับสิทธิ์การใช้งานเรียบร้อยแล้ว`
+        });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error('V3 Approve Leaders Error:', err);
+        res.status(500).json({ success: false, message: err.message });
+    } finally {
+        client.release();
+    }
+});
+
+// 13. ผู้ใหญ่บ้านถอดถอน / ยกเลิกตำแหน่งด้วย PIN -> ลดสิทธิ์กลับเป็น CITIZEN อัตโนมัติหากไม่มีตำแหน่งอื่น
+app.post('/api/v3/committee-leaders/revoke', async (req, res) => {
+    const { village_id, approver_account_id, pin_code, record_id, reason } = req.body;
+
+    if (!isValidUuidV3(village_id) || !isValidUuidV3(approver_account_id) || !record_id) {
+        return res.status(400).json({ success: false, message: 'ข้อมูลไม่ครบถ้วน' });
+    }
+
+    const client = await pgPool.connect();
+    try {
+        await client.query('BEGIN');
+
+        const recRes = await client.query(
+            `SELECT * FROM user_positions WHERE id = $1 AND (village_id = $2::uuid OR village_id IS NULL) LIMIT 1`,
+            [Number(record_id), village_id]
+        );
+        if (recRes.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ success: false, message: 'ไม่พบข้อมูลตำแหน่งในหมู่บ้านนี้' });
+        }
+        const rec = recRes.rows[0];
+
+        // หากรายการได้รับอนุมัติ (ACTIVE) แล้ว ต้องยืนยันรหัส PIN ผู้ใหญ่บ้านก่อนถอดถอน
+        if (rec.status === 'ACTIVE') {
+            const pinOk = await verifyVillageHeadmanPin(client, village_id, pin_code);
+            if (!pinOk) {
+                await client.query('ROLLBACK');
+                return res.status(403).json({ success: false, message: 'รหัส PIN อนุมัติของผู้ใหญ่บ้านไม่ถูกต้อง' });
+            }
+        }
+
+        await client.query(`
+            UPDATE user_positions
+            SET status = 'REVOKED',
+                is_active = false,
+                end_date = CURRENT_DATE,
+                end_reason = $1
+            WHERE id = $2
+        `, [reason || 'พ้นจากตำแหน่ง/ถอดถอนโดยผู้ใหญ่บ้าน', rec.id]);
+
+        const roleShift = rec.account_id
+            ? await syncUserAccountRoleFromPositions(client, rec.account_id)
+            : { oldRole: null, newRole: null };
+
+        await client.query(`
+            INSERT INTO sys_approval_logs (
+                village_id, target_type, target_id, target_account_id,
+                action_type, old_status, new_status, old_role, new_role, approved_by, note
+            ) VALUES ($1::uuid, 'USER_POSITION', $2, $3::uuid, 'REVOKE', $4, 'REVOKED', $5, $6, $7::uuid, $8)
+        `, [
+            village_id,
+            String(rec.id),
+            rec.account_id,
+            rec.status,
+            roleShift.oldRole,
+            roleShift.newRole,
+            approver_account_id,
+            reason || `ถอดถอนจากตำแหน่ง ${rec.custom_position_title || rec.role_template_code}`
+        ]);
+
+        await client.query('COMMIT');
+        res.json({
+            success: true,
+            message: roleShift.newRole === 'CITIZEN'
+                ? 'ถอดถอนออกจากตำแหน่งแล้ว และปรับสถานะกลับเป็นประชาชนทั่วไป (CITIZEN) เรียบร้อย'
+                : 'ถอดถอนออกจากตำแหน่งเรียบร้อยแล้ว'
+        });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error('V3 Revoke Leader Error:', err);
+        res.status(500).json({ success: false, message: err.message });
+    } finally {
+        client.release();
+    }
+});
 
 app.listen(port, () => {
     console.log(`Server is running on port ${port}`);
