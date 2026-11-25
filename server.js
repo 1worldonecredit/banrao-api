@@ -1945,186 +1945,144 @@ app.post('/api/login', async (req, res) => {
         client.release();
     }
 });
+
 // ==========================================
-// API: ดึงเมนู Sidebar + สิทธิ์ Matrix ครบวงจร (Tier + คะแนนชุมชน + 4 มิติ Org/Dept/Pos)
+// 🌟 API ดึงเมนู Sidebar แบบ Dynamic ตามสิทธิ์จริงที่ได้รับอนุมัติ + คืนค่าตัวตน 6 มิติ
 // ==========================================
 app.get('/api/sidebar-menus/:accountId', async (req, res) => {
-    const { accountId } = req.params;
-    const appCode = (req.query.app_code || 'BANRAO_WEB').trim().toUpperCase();
-
-    if (!accountId || accountId === 'undefined') {
-        return res.status(400).json({ success: false, message: 'Invalid Account ID' });
-    }
+    // บังคับยึดตัวตนจาก JWT Token ก่อนเสมอ (ป้องกันปลอม accountId ใน URL)
+    const decoded = verifyRequestJwt(req);
+    const targetAccountId = decoded?.account_id || req.params.accountId;
 
     const client = await pgPool.connect();
-
     try {
-        // 1. ดึงข้อมูลบัญชี + ระดับผู้ใช้ (tier_code) + คะแนนชุมชน (community_score)
-        const userRes = await client.query(
-            `SELECT account_id, username_phone, role,
-                    COALESCE(tier_code, 'CITIZEN_FREE') AS tier_code,
-                    COALESCE(community_score, 0) AS community_score
-             FROM user_accounts
-             WHERE account_id = $1`,
-            [accountId]
-        );
-        if (userRes.rows.length === 0) {
-            return res.json({ success: true, data: [], permissionsMap: {} });
+        await syncExpiredPositions(client);
+
+        const secCheck = await resolveUserSecurityContext(client, targetAccountId);
+        if (!secCheck.ok) {
+            return res.status(secCheck.code || 403).json({
+                success: false,
+                code: 'ACCOUNT_BLOCKED',
+                message: secCheck.reason,
+                data: []
+            });
         }
 
-        const user = userRes.rows[0];
-        const isSuperAdmin = user.username_phone === '0000000000' || user.role === 'SUPER_ADMIN';
-        const userScore = Number(user.community_score) || 0;
+        const ctx = secCheck.context;
+        let menuRows = [];
 
-        // 2. คำนวณ Tier ทั้งหมดที่ผู้ใช้คนนี้มีสิทธิ์ได้รับ (ดึงจากตาราง sys_user_tiers จริง)
-        const autoTiersRes = await client.query(
-            `SELECT tier_code
-             FROM sys_user_tiers
-             WHERE is_active = TRUE
-               AND is_paid = FALSE
-               AND min_community_score <= $1`,
-            [userScore]
-        );
-
-        const eligibleTierCodes = new Set(autoTiersRes.rows.map(r => String(r.tier_code).trim().toUpperCase()));
-        if (user.tier_code) {
-            eligibleTierCodes.add(String(user.tier_code).trim().toUpperCase());
+        if (ctx.is_super_admin) {
+            // Super Admin เห็นทุกเมนูของแอป BANRAO_WEB
+            const mRes = await client.query(`
+                SELECT
+                    m.menu_id, m.group_id, COALESCE(g.group_name, 'เมนูระบบ') AS group_name,
+                    COALESCE(g.display_order, 99) AS group_order,
+                    m.menu_name, m.icon_name, COALESCE(m.route_path, m.path) AS route_path,
+                    m.display_order,
+                    true AS can_view, true AS can_create, true AS can_edit, true AS can_delete, true AS can_approve
+                FROM sys_menus m
+                LEFT JOIN sys_menu_groups g ON m.group_id = g.group_id
+                WHERE m.is_active = true
+                  AND COALESCE(m.app_code, 'BANRAO_WEB') = 'BANRAO_WEB'
+                  AND COALESCE(m.group_id, 0) NOT IN (10, 11)
+                ORDER BY group_order ASC, m.display_order ASC, m.menu_id ASC
+            `);
+            menuRows = mRes.rows;
+        } else {
+            // ประชาชน / กรรมการ / ผู้ใหญ่บ้าน: รวมสิทธิ์จาก tier_code + role_template_code ที่อนุมัติแล้วเท่านั้น
+            const mRes = await client.query(`
+                SELECT
+                    m.menu_id,
+                    m.group_id,
+                    COALESCE(g.group_name, 'เมนูทั่วไป') AS group_name,
+                    COALESCE(g.display_order, 99) AS group_order,
+                    m.menu_name,
+                    m.icon_name,
+                    COALESCE(m.route_path, m.path) AS route_path,
+                    m.display_order,
+                    BOOL_OR(p.can_view) AS can_view,
+                    BOOL_OR(p.can_create) AS can_create,
+                    BOOL_OR(p.can_edit) AS can_edit,
+                    BOOL_OR(p.can_delete) AS can_delete,
+                    BOOL_OR(p.can_approve) AS can_approve
+                FROM sys_menus m
+                LEFT JOIN sys_menu_groups g ON m.group_id = g.group_id
+                JOIN sys_menu_permissions p ON p.menu_id = m.menu_id AND p.is_active = true
+                WHERE m.is_active = true
+                  AND COALESCE(m.group_id, 0) NOT IN (10, 11)
+                  AND p.can_view = true
+                  AND (
+                      (p.tier_code IS NOT NULL AND p.tier_code = $1)
+                      OR (p.role_template_code IS NOT NULL AND p.role_template_code = ANY($2::text[]))
+                  )
+                GROUP BY m.menu_id, m.group_id, g.group_name, g.display_order, m.menu_name, m.icon_name, m.route_path, m.path, m.display_order
+                ORDER BY group_order ASC, m.display_order ASC, m.menu_id ASC
+            `, [ctx.tier_code, ctx.role_templates]);
+            menuRows = mRes.rows;
         }
 
-        // 3. ดึงตำแหน่ง + หน่วยงาน + แผนก ที่ Active อยู่จริงของบัญชีนี้
-        const posRes = await client.query(`
-            SELECT 
-                sp.position_id,
-                sp.position_name,
-                COALESCE(up.org_id, sp.org_id) AS org_id,
-                COALESCE(up.dept_id, sp.dept_id) AS dept_id
-            FROM user_positions up
-            JOIN sys_positions sp ON up.position_id = sp.position_id
-            WHERE up.account_id = $1
-              AND up.is_active = TRUE
-              AND (up.end_date IS NULL OR up.end_date >= CURRENT_DATE)
-        `, [accountId]);
-
-        const userPositions = posRes.rows;
-        const userPosIds = new Set(userPositions.map(r => String(r.position_id)));
-        const userPosNames = new Set(userPositions.map(r => String(r.position_name).trim()));
-
-        // 4. ดึงเมนูทั้งหมดที่เปิดใช้งานอยู่ (ทั้งเมนูและกรุ๊ปเมนูต้อง is_active = true)
-        const menuRes = await client.query(`
-            SELECT 
-                m.menu_id,
-                mg.group_name,
-                m.menu_name AS name,
-                m.icon_name AS icon,
-                COALESCE(m.route_path, m.path) AS path,
-                m.selected_roles
-            FROM sys_menus m
-            JOIN sys_menu_groups mg ON m.group_id = mg.group_id
-            WHERE m.is_active = TRUE
-              AND COALESCE(mg.is_active, TRUE) = TRUE
-              AND (m.app_code = $1 OR ($1 = 'BANRAO_WEB' AND m.app_code IS NULL))
-            ORDER BY mg.display_order ASC NULLS LAST, m.display_order ASC NULLS LAST, m.menu_id ASC
-        `, [appCode]);
-
-        // 5. ดึงสิทธิ์ Matrix ทั้งหมดของ App นี้ที่เปิดใช้งาน
-        const matrixRes = await client.query(`
-            SELECT menu_id, org_id, dept_id, position_id, tier_code,
-                   can_view, can_create, can_edit, can_delete, can_approve
-            FROM sys_menu_permissions
-            WHERE app_code = $1 AND is_active = TRUE
-        `, [appCode]);
-
-        const matrixRows = matrixRes.rows;
+        // จัดกลุ่มเมนูส่งให้ Sidebar.jsx ในรูปแบบเดิม 100% + สร้าง permissionsMap
+        const groupMap = new Map();
         const permissionsMap = {};
-        const allowedMenus = [];
 
-        for (const m of menuRes.rows) {
-            if (isSuperAdmin) {
-                const fullPerm = { can_view: true, can_create: true, can_edit: true, can_delete: true, can_approve: true };
-                permissionsMap[m.path] = fullPerm;
-                allowedMenus.push({ ...m, permissions: fullPerm });
-                continue;
-            }
-
-            // ตรวจว่าเมนูนี้มีการตั้งค่าในตาราง Matrix ไว้แล้วหรือไม่
-            const rulesForThisMenu = matrixRows.filter((r) => r.menu_id === m.menu_id);
-
-            if (rulesForThisMenu.length > 0) {
-                // คัดเฉพาะกฎที่ตรงกับ Tier หรือ ตำแหน่ง 4 มิติ ของผู้ใช้
-                const matchedRules = rulesForThisMenu.filter((rule) => {
-                    // กรณีที่ 1: กฎระดับ Tier (ประชาชนฟรี / คะแนนชุมชน / แพ็กเกจธุรกิจ)
-                    if (rule.tier_code) {
-                        return eligibleTierCodes.has(String(rule.tier_code).trim().toUpperCase());
-                    }
-
-                    // กรณีที่ 2: กฎส่วนกลาง (ไม่ได้ระบุ Org/Dept/Pos/Tier) = ทุกคนเห็นได้
-                    if (rule.org_id === null && rule.dept_id === null && rule.position_id === null) {
-                        return true;
-                    }
-
-                    // กรณีที่ 3: กฎโครงสร้างองค์กร 4 มิติ (Org -> Dept -> Pos)
-                    return userPositions.some((up) => {
-                        const orgMatch = rule.org_id === null || String(rule.org_id) === String(up.org_id);
-                        const deptMatch = rule.dept_id === null || String(rule.dept_id) === String(up.dept_id);
-                        const posMatch = rule.position_id === null || String(rule.position_id) === String(up.position_id);
-                        return orgMatch && deptMatch && posMatch;
-                    });
+        for (const r of menuRows) {
+            if (!r.route_path) continue;
+            if (!groupMap.has(r.group_id)) {
+                groupMap.set(r.group_id, {
+                    group_id: r.group_id,
+                    group_name: r.group_name,
+                    menus: []
                 });
-
-                if (matchedRules.length > 0) {
-                    const mergedPerm = matchedRules.reduce((acc, r) => ({
-                        can_view: acc.can_view || r.can_view,
-                        can_create: acc.can_create || r.can_create,
-                        can_edit: acc.can_edit || r.can_edit,
-                        can_delete: acc.can_delete || r.can_delete,
-                        can_approve: acc.can_approve || r.can_approve
-                    }), { can_view: false, can_create: false, can_edit: false, can_delete: false, can_approve: false });
-
-                    if (mergedPerm.can_view) {
-                        permissionsMap[m.path] = mergedPerm;
-                        allowedMenus.push({ ...m, permissions: mergedPerm });
-                    }
-                }
-            } else {
-                // Fallback: ถ้าเมนูนี้ยังไม่ได้กำหนดในหน้า Matrix ให้ใช้สิทธิ์จาก selected_roles เดิม
-                const roles = Array.isArray(m.selected_roles) ? m.selected_roles : [];
-                const canSeeLegacy = roles.length === 0 || roles.some((r) => userPosIds.has(String(r)) || userPosNames.has(String(r).trim()));
-                if (canSeeLegacy) {
-                    const legacyPerm = { can_view: true, can_create: true, can_edit: true, can_delete: false, can_approve: false };
-                    permissionsMap[m.path] = legacyPerm;
-                    allowedMenus.push({ ...m, permissions: legacyPerm });
-                }
             }
-        }
+            groupMap.get(r.group_id).menus.push({
+                menu_id: r.menu_id,
+                name: r.menu_name,
+                path: r.route_path,
+                icon: r.icon_name
+            });
 
-        // 6. จัดกลุ่มตาม group_name
-        const groupedMenus = allowedMenus.reduce((acc, row) => {
-            const group = acc.find(g => g.group_name === row.group_name);
-            const menuData = {
-                menu_id: row.menu_id,
-                name: row.name,
-                icon: row.icon,
-                path: row.path,
-                permissions: row.permissions
+            permissionsMap[r.route_path] = {
+                can_view: Boolean(r.can_view),
+                can_create: Boolean(r.can_create),
+                can_edit: Boolean(r.can_edit),
+                can_delete: Boolean(r.can_delete),
+                can_approve: Boolean(r.can_approve)
             };
-            if (group) group.menus.push(menuData);
-            else acc.push({ group_name: row.group_name, menus: [menuData] });
-            return acc;
-        }, []);
+        }
 
         res.json({
             success: true,
-            data: groupedMenus,
+            data: Array.from(groupMap.values()),
             permissionsMap,
-            userTier: {
-                tier_code: user.tier_code,
-                community_score: userScore,
-                eligible_tiers: Array.from(eligibleTierCodes)
-            }
+            securityContext: ctx
         });
-    } catch (error) {
-        console.error('Fetch Sidebar Menus Error:', error);
-        res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการดึงข้อมูลเมนู' });
+    } catch (err) {
+        console.error('Get Sidebar Menus Error:', err);
+        res.status(500).json({ success: false, message: err.message, data: [] });
+    } finally {
+        client.release();
+    }
+});
+
+// API ตรวจสอบตัวตน 6 มิติ (ใช้กับตัวกั้นหน้าเว็บ VillageAccessGuard)
+app.get('/api/auth/verify-context', async (req, res) => {
+    const decoded = verifyRequestJwt(req);
+    const accountId = decoded?.account_id || req.headers['x-account-id'] || null;
+    const client = await pgPool.connect();
+    try {
+        await syncExpiredPositions(client);
+        const check = await resolveUserSecurityContext(client, accountId);
+        if (!check.ok) {
+            return res.status(check.code || 401).json({
+                success: false,
+                message: check.reason,
+                data: check.context || null
+            });
+        }
+        res.json({ success: true, data: check.context });
+    } catch (err) {
+        console.error('Verify Context Error:', err);
+        res.status(500).json({ success: false, message: err.message });
     } finally {
         client.release();
     }
