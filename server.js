@@ -1386,8 +1386,9 @@ function verifyRequestJwt(req) {
     }
 }
 
-// 4. ตรวจสอบ 6 มิติสดจากฐานข้อมูล (เป็นใคร / Active ไหม / หมู่บ้านไหน / ใครแนะนำ / ตำแหน่งอนุมัติแล้ว / ได้สิทธิ์อะไร)
-// 4. ตรวจสอบ 6 มิติสดจากฐานข้อมูล (เป็นใคร / Active ไหม / หมู่บ้านไหน / ใครแนะนำ / ตำแหน่งอนุมัติแล้ว / มีมิเตอร์น้ำไหม / ได้สิทธิ์อะไร)
+
+
+// 4. ตรวจสอบ 6 มิติ + โมดูลที่หมู่บ้านนี้เปิดใช้งานจริง (รองรับ 80,000 หมู่บ้าน)
 async function resolveUserSecurityContext(client, accountId) {
     if (!accountId || !isValidUuidV3(accountId)) {
         return { ok: false, code: 401, reason: 'ไม่พบข้อมูลยืนยันตัวตน กรุณาเข้าสู่ระบบใหม่' };
@@ -1447,9 +1448,36 @@ async function resolveUserSecurityContext(client, accountId) {
         }
     }
 
+    // ตรวจว่าหมู่บ้านนี้มีระบบประปาหมู่บ้านเปิดใช้งานอยู่จริงหรือไม่ (แยกตาม village_id 100%)
+    let villageHasWaterSystem = false;
+    if (u.village_id) {
+        const wcRes = await client.query(`
+            SELECT 1 FROM community_committees
+            WHERE village_id = $1::uuid
+              AND COALESCE(is_active, true) = true
+              AND (
+                  committee_type_code = 'WATER'
+                  OR committee_name LIKE '%ประปา%'
+                  OR committee_name LIKE '%ปะปา%'
+              )
+            LIMIT 1
+        `, [u.village_id]).catch(() => ({ rows: [] }));
+
+        if (wcRes.rows.length > 0) {
+            villageHasWaterSystem = true;
+        } else {
+            const wmVillageRes = await client.query(`
+                SELECT 1 FROM water_meters
+                WHERE village_id::text = $1::text AND is_active = true
+                LIMIT 1
+            `, [u.village_id]).catch(() => ({ rows: [] }));
+            villageHasWaterSystem = wmVillageRes.rows.length > 0;
+        }
+    }
+
     // ตรวจว่าบ้านของบุคคลนี้มีการติดตั้งมิเตอร์น้ำประปาหมู่บ้าน (Active) อยู่จริงหรือไม่
     let hasWaterMeter = false;
-    if (cleanCid.length === 13 && u.village_id) {
+    if (villageHasWaterSystem && cleanCid.length === 13 && u.village_id) {
         const wmRes = await client.query(`
             SELECT 1
             FROM water_meters wm
@@ -1527,7 +1555,6 @@ async function resolveUserSecurityContext(client, accountId) {
     if (isSuperAdmin) roleTemplateSet.add('SUPER_ADMIN');
     if (isHeadman) roleTemplateSet.add('VILLAGE_HEADMAN');
 
-    // รองรับบัญชีเดิมที่มี role = Admin Villages แต่ยังไม่ได้เพิ่มลงตาราง user_positions
     const roleUpper = String(u.role || 'CITIZEN').toUpperCase();
     if (roleUpper === 'HEADMAN') roleTemplateSet.add('VILLAGE_HEADMAN');
     if (roleUpper.includes('ADMIN') && !isSuperAdmin) roleTemplateSet.add('VILLAGE_ADMIN');
@@ -1535,25 +1562,23 @@ async function resolveUserSecurityContext(client, accountId) {
     const roleTemplates = Array.from(roleTemplateSet);
     const has = (...codes) => isSuperAdmin || codes.some((c) => roleTemplateSet.has(c));
 
-    // กำหนดสิทธิ์การใช้งานระดับระบบจากแม่แบบสิทธิ์มาตรฐาน (ใช้เหมือนกันทั้ง 80,000 หมู่บ้าน)
+    // กำหนดสิทธิ์การใช้งาน: โมดูลประปาจะใช้งานได้เฉพาะหมู่บ้านที่เปิดระบบประปาแล้วเท่านั้น
     const canOperate = isAccountActive && isHouseholdActive && (isSuperAdmin || Boolean(u.village_id));
+    const canUseWaterModule = canOperate && (isSuperAdmin || villageHasWaterSystem);
+
     const permissions = {
         can_manage_village_core: canOperate && has('VILLAGE_HEADMAN', 'VILLAGE_ADMIN'),
         can_approve_committees: canOperate && has('VILLAGE_HEADMAN'),
-        can_manage_water_users: canOperate && has('VILLAGE_HEADMAN', 'VILLAGE_ADMIN', 'WATER_PRESIDENT', 'WATER_TREASURER'),
-        // ถอด WATER_READER ออก -> คนจดมิเตอร์ไม่เห็นและเข้า /water-users ไม่ได้
-        can_view_water_users: canOperate && has('VILLAGE_HEADMAN', 'VILLAGE_ADMIN', 'WATER_PRESIDENT', 'WATER_TREASURER'),
-        can_record_water_bills: canOperate && has('VILLAGE_HEADMAN', 'VILLAGE_ADMIN', 'WATER_PRESIDENT', 'WATER_TREASURER', 'WATER_READER'),
-        can_manage_water_settings: canOperate && has('VILLAGE_HEADMAN', 'WATER_PRESIDENT', 'WATER_TREASURER'),
-        can_approve_water_rates: canOperate && has('VILLAGE_HEADMAN', 'WATER_PRESIDENT'),
-        // เห็นและเข้าหน้า /my-water-bills ได้เฉพาะบ้านที่มีมิเตอร์น้ำจริง (หรือ Super Admin)
-        can_view_my_water_bills: canOperate && (isSuperAdmin || hasWaterMeter),
-        // สิทธิ์แจ้งโอน/รับชำระค่าน้ำ (ให้ทั้งบ้านที่มีมิเตอร์และเจ้าหน้าที่ประปา)
-        can_pay_water_bill: canOperate && (isSuperAdmin || hasWaterMeter || has('VILLAGE_HEADMAN', 'VILLAGE_ADMIN', 'WATER_PRESIDENT', 'WATER_TREASURER', 'WATER_READER')),
+        can_manage_water_users: canUseWaterModule && has('VILLAGE_HEADMAN', 'VILLAGE_ADMIN', 'WATER_PRESIDENT', 'WATER_TREASURER'),
+        can_view_water_users: canUseWaterModule && has('VILLAGE_HEADMAN', 'VILLAGE_ADMIN', 'WATER_PRESIDENT', 'WATER_TREASURER'),
+        can_record_water_bills: canUseWaterModule && has('VILLAGE_HEADMAN', 'VILLAGE_ADMIN', 'WATER_PRESIDENT', 'WATER_TREASURER', 'WATER_READER'),
+        can_manage_water_settings: canUseWaterModule && has('VILLAGE_HEADMAN', 'WATER_PRESIDENT', 'WATER_TREASURER'),
+        can_approve_water_rates: canUseWaterModule && has('VILLAGE_HEADMAN', 'WATER_PRESIDENT'),
+        can_view_my_water_bills: canUseWaterModule && (isSuperAdmin || hasWaterMeter),
+        can_pay_water_bill: canUseWaterModule && (isSuperAdmin || hasWaterMeter || has('VILLAGE_HEADMAN', 'VILLAGE_ADMIN', 'WATER_PRESIDENT', 'WATER_TREASURER', 'WATER_READER')),
         can_manage_places: canOperate && (has('VILLAGE_HEADMAN', 'VILLAGE_ADMIN', 'PLACE_GOV_HEAD', 'PLACE_BIZ_OWNER') || ['BIZ_SHOP', 'BIZ_HOTEL'].includes(u.tier_code))
     };
 
-    // ชื่อตำแหน่งหลักที่จะแสดงใน Sidebar / Profile
     let displayPositionName = 'ประชาชนทั่วไป';
     if (isSuperAdmin) displayPositionName = 'Super Admin';
     else if (isHeadman) displayPositionName = 'ผู้ใหญ่บ้าน';
@@ -1592,6 +1617,9 @@ async function resolveUserSecurityContext(client, accountId) {
             is_active: isAccountActive && isHouseholdActive,
             account_status: isAccountActive ? 'ACTIVE' : 'INACTIVE',
             household_status: householdStatus,
+            village_modules: {
+                water: villageHasWaterSystem
+            },
             has_water_meter: hasWaterMeter,
             is_super_admin: isSuperAdmin,
             is_headman: isHeadman,
