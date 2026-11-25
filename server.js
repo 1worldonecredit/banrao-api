@@ -39,7 +39,7 @@ app.use(cors({
         return callback(null, true);
     },
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization'], // <-- เพิ่มบรรทัดนี้ครับ
+    allowedHeaders: ['Content-Type', 'Authorization', 'x-account-id'], // <-- เพิ่มบรรทัดนี้ครับ
     credentials: true
 }));
 
