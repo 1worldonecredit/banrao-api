@@ -7919,7 +7919,8 @@ app.delete('/api/v3/committees/:committeeId', async (req, res) => {
         client.release();
     }
 });
-// 6. ดึงรายชื่อบุคคลในผัง (ปลอดภัย 100% ไม่พังเรื่องชื่อคอลัมน์ dob / created_at)
+
+// 6. ดึงรายชื่อบุคคลในผัง (เชื่อมรูปโปรไฟล์จริง + สถานะบัญชีแอป รองรับทั้งข้อมูลเก่าและใหม่ 100%)
 app.get('/api/v3/committees/:committeeId/leaders', async (req, res) => {
     const { committeeId } = req.params;
     const villageId = req.query.village_id && isValidUuidV3(req.query.village_id) ? req.query.village_id : null;
@@ -7931,9 +7932,9 @@ app.get('/api/v3/committees/:committeeId/leaders', async (req, res) => {
                 up.committee_id,
                 up.village_id,
                 up.parent_id,
-                up.account_id,
-                up.member_id,
-                up.citizen_id,
+                COALESCE(ua.account_id, up.account_id) AS account_id,
+                COALESCE(up.member_id, hm.member_id::text) AS member_id,
+                COALESCE(NULLIF(up.citizen_id, ''), prof.citizen_id, hm.citizen_id::text) AS citizen_id,
                 up.position_id,
                 COALESCE(NULLIF(up.custom_position_title, ''), sp.position_name, 'ตำแหน่งใหม่') AS role_name,
                 COALESCE(up.role_template_code, sp.role_template_code, 'COMMITTEE_GENERAL') AS role_template_code,
@@ -7953,23 +7954,18 @@ app.get('/api/v3/committees/:committeeId/leaders', async (req, res) => {
                 (ua.account_id IS NOT NULL) AS has_app_account,
                 ua.role AS current_account_role,
                 ua.is_active AS account_is_active,
-                COALESCE(media.image_url, '/profile-img.jpg') AS user_image,
+                COALESCE(
+                    NULLIF(media.image_url, ''),
+                    NULLIF(hm.m_json->>'image_url', ''),
+                    NULLIF(hm.m_json->>'photo_url', ''),
+                    NULLIF(hm.m_json->>'profile_image', ''),
+                    '/profile-img.jpg'
+                ) AS user_image,
                 COALESCE(ap_prof.first_name || ' ' || ap_prof.last_name, '') AS approver_name
             FROM user_positions up
             LEFT JOIN sys_positions sp ON up.position_id = sp.position_id
             LEFT JOIN sys_role_templates rt ON COALESCE(up.role_template_code, sp.role_template_code) = rt.role_template_code
-            LEFT JOIN user_accounts ua ON up.account_id = ua.account_id
-            LEFT JOIN LATERAL (
-                SELECT p.profile_id, p.first_name, p.last_name, p.dob, p.citizen_id
-                FROM user_profiles p
-                WHERE (ua.profile_id IS NOT NULL AND p.profile_id = ua.profile_id)
-                   OR (up.account_id IS NOT NULL AND p.profile_id = up.account_id)
-                   OR (
-                        COALESCE(up.citizen_id, '') <> ''
-                        AND REGEXP_REPLACE(COALESCE(p.citizen_id, ''), '[^0-9]', '', 'g') = REGEXP_REPLACE(up.citizen_id, '[^0-9]', '', 'g')
-                   )
-                LIMIT 1
-            ) prof ON true
+            -- 1. หาในทะเบียนลูกบ้าน (household_members) ก่อน เพื่อดึง citizen_id ของข้อมูลเดิม
             LEFT JOIN LATERAL (
                 SELECT m.member_id, m.first_name, m.last_name, m.citizen_id, to_jsonb(m) AS m_json
                 FROM household_members m
@@ -7981,6 +7977,29 @@ app.get('/api/v3/committees/:committeeId/leaders', async (req, res) => {
                    )
                 LIMIT 1
             ) hm ON true
+            -- 2. เช็กกรณี up.account_id เป็น user_accounts.account_id โดยตรง
+            LEFT JOIN user_accounts ua_direct ON up.account_id = ua_direct.account_id
+            -- 3. หา user_profiles จาก ua_direct / profile_id / citizen_id ของทั้ง up และ hm
+            LEFT JOIN LATERAL (
+                SELECT p.profile_id, p.first_name, p.last_name, p.dob, p.citizen_id
+                FROM user_profiles p
+                WHERE (ua_direct.profile_id IS NOT NULL AND p.profile_id = ua_direct.profile_id)
+                   OR (up.account_id IS NOT NULL AND p.profile_id = up.account_id)
+                   OR (
+                        COALESCE(NULLIF(up.citizen_id, ''), hm.citizen_id::text, '') <> ''
+                        AND REGEXP_REPLACE(COALESCE(p.citizen_id, ''), '[^0-9]', '', 'g') = REGEXP_REPLACE(COALESCE(NULLIF(up.citizen_id, ''), hm.citizen_id::text, ''), '[^0-9]', '', 'g')
+                   )
+                LIMIT 1
+            ) prof ON true
+            -- 4. หาบัญชี Login จริง (user_accounts) เพื่อดึงสถานะและสิทธิ์
+            LEFT JOIN LATERAL (
+                SELECT a.account_id, a.role, a.is_active
+                FROM user_accounts a
+                WHERE (ua_direct.account_id IS NOT NULL AND a.account_id = ua_direct.account_id)
+                   OR (prof.profile_id IS NOT NULL AND a.profile_id = prof.profile_id)
+                LIMIT 1
+            ) ua ON true
+            -- 5. ดึงรูปโปรไฟล์จริงจาก citizen_profiles_media
             LEFT JOIN LATERAL (
                 SELECT cpm.image_url
                 FROM citizen_profiles_media cpm
