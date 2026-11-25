@@ -6906,24 +6906,20 @@ app.get('/api/water/settings/:villageId', async (req, res) => {
         res.status(500).json({ success: false, message: err.message });
     }
 });
-
-// 7. บันทึกการตั้งค่าเรทค่าน้ำ ค่าจ้างคนจดมิเตอร์ รอบวันเก็บ ประธานกรรมการ และบัญชีรับเงิน
+// 7. บันทึกการตั้งค่าทั่วไป (รอบวันเก็บ / หัวสลิป / บัญชีรับเงิน — ไม่แก้ราคาตรงนี้ ต้องผ่านรหัสประธาน)
 app.put('/api/water/settings/:villageId', async (req, res) => {
     const { villageId } = req.params;
     const {
-        unit_rate, meter_fee, reader_fee, reading_day, due_day, due_next_month,
+        reading_day, due_day, due_next_month,
         bank_name, account_name, account_number, promptpay_id, president_name, updated_by
     } = req.body;
     try {
         const result = await pgPool.query(`
             INSERT INTO water_settings (
-                village_id, unit_rate, meter_fee, reader_fee, reading_day, due_day, due_next_month,
+                village_id, reading_day, due_day, due_next_month,
                 bank_name, account_name, account_number, promptpay_id, president_name, updated_by, updated_at
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, CURRENT_TIMESTAMP)
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, CURRENT_TIMESTAMP)
             ON CONFLICT (village_id) DO UPDATE SET
-                unit_rate = EXCLUDED.unit_rate,
-                meter_fee = EXCLUDED.meter_fee,
-                reader_fee = EXCLUDED.reader_fee,
                 reading_day = EXCLUDED.reading_day,
                 due_day = EXCLUDED.due_day,
                 due_next_month = EXCLUDED.due_next_month,
@@ -6937,9 +6933,6 @@ app.put('/api/water/settings/:villageId', async (req, res) => {
             RETURNING *
         `, [
             String(villageId),
-            Number(unit_rate ?? 7),
-            Number(meter_fee ?? 10),
-            Number(reader_fee ?? 5),
             Math.min(31, Math.max(1, Number(reading_day ?? 25))),
             Math.min(31, Math.max(1, Number(due_day ?? 5))),
             due_next_month !== undefined ? Boolean(due_next_month) : true,
@@ -6953,13 +6946,241 @@ app.put('/api/water/settings/:villageId', async (req, res) => {
         const villageInfo = await getVillageSlipHeader(villageId, result.rows[0]);
         res.json({
             success: true,
-            message: 'บันทึกการตั้งค่าค่าน้ำและข้อมูลหัวสลิปเรียบร้อยแล้ว',
+            message: 'บันทึกการตั้งค่ารอบเก็บเงินและบัญชีรับเงินเรียบร้อยแล้ว',
             data: result.rows[0],
             village_info: villageInfo
         });
     } catch (err) {
         console.error('Save Water Settings Error:', err);
         res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// =========================================================================
+// ระบบตั้งราคาค่าน้ำ / ค่ารักษามิเตอร์ / ค่าเก็บ (ต้องใช้รหัสอนุมัติของประธานกรรมการทุกครั้ง)
+// =========================================================================
+const hashWaterApprovalPin = (pin) => {
+    const cryptoMod = require('crypto');
+    return cryptoMod.createHash('sha256').update(`banrao_water_pin::${String(pin || '').trim()}`).digest('hex');
+};
+
+// ตรวจสอบรหัสอนุมัติของประธาน (รองรับทั้งรหัสอนุมัติประธานที่ตั้งไว้ และรหัสผ่านบัญชีของประธานกรรมการ)
+async function verifyWaterPresidentCode(client, villageId, inputCode, savedSettings) {
+    const cleanCode = String(inputCode || '').trim();
+    if (!cleanCode) return false;
+
+    // 1. ตรวจกับรหัสอนุมัติประธาน (president_pin_hash) ใน water_settings
+    if (savedSettings?.president_pin_hash) {
+        if (hashWaterApprovalPin(cleanCode) === savedSettings.president_pin_hash) {
+            return true;
+        }
+    }
+
+    // 2. ตรวจสำรองกับรหัสผ่านบัญชี (user_accounts) ของประธานกรรมการในผังน้ำประปา
+    try {
+        const pRes = await client.query(`
+            SELECT ua.password_hash, to_jsonb(ua) AS ua_json
+            FROM user_positions upos
+            JOIN community_committees cc ON upos.committee_id::text = cc.committee_id::text
+            LEFT JOIN sys_positions sp ON upos.position_id = sp.position_id
+            LEFT JOIN household_members hm ON upos.account_id::text = hm.member_id::text
+            LEFT JOIN user_profiles up ON (
+                REGEXP_REPLACE(
+                    COALESCE(to_jsonb(up)->>'national_id', to_jsonb(up)->>'citizen_id', to_jsonb(up)->>'id_card', ''),
+                    '[^0-9]', '', 'g'
+                ) = REGEXP_REPLACE(COALESCE(hm.citizen_id::text, ''), '[^0-9]', '', 'g')
+                AND COALESCE(hm.citizen_id::text, '') <> ''
+            )
+            LEFT JOIN user_accounts ua ON (
+                ua.account_id::text = upos.account_id::text
+                OR ua.profile_id = up.profile_id
+            )
+            WHERE cc.village_id::text = $1::text
+              AND (cc.committee_name LIKE '%น้ำ%' OR cc.committee_name LIKE '%ประปา%' OR cc.committee_name LIKE '%ปะปา%')
+              AND sp.position_name LIKE '%ประธาน%'
+              AND ua.account_id IS NOT NULL
+            LIMIT 1
+        `, [String(villageId)]);
+
+        if (pRes.rows.length > 0) {
+            const row = pRes.rows[0];
+            const uaJson = row.ua_json || {};
+            if (uaJson.pin_code && String(uaJson.pin_code) === cleanCode) return true;
+            if (row.password_hash && typeof bcrypt !== 'undefined') {
+                const isMatch = await bcrypt.compare(cleanCode, row.password_hash).catch(() => false);
+                if (isMatch) return true;
+            }
+        }
+    } catch (e) {
+        console.error('Verify president account password fallback error:', e.message);
+    }
+
+    return false;
+}
+
+// 12. ดึงข้อมูลราคาปัจจุบัน สถานะรหัสอนุมัติประธาน และประวัติการปรับราคา
+app.get('/api/water/rates/:villageId', async (req, res) => {
+    const { villageId } = req.params;
+    try {
+        const setRes = await pgPool.query(
+            `SELECT * FROM water_settings WHERE village_id = $1 LIMIT 1`,
+            [String(villageId)]
+        );
+        const settings = setRes.rows[0] || {
+            village_id: String(villageId),
+            unit_rate: 7,
+            meter_fee: 10,
+            reader_fee: 5,
+            president_name: '',
+            president_pin_hash: ''
+        };
+        const villageInfo = await getVillageSlipHeader(villageId, settings);
+        const logsRes = await pgPool.query(`
+            SELECT * FROM water_rate_change_logs
+            WHERE village_id = $1
+            ORDER BY created_at DESC
+            LIMIT 30
+        `, [String(villageId)]);
+
+        res.json({
+            success: true,
+            data: {
+                unit_rate: Number(settings.unit_rate ?? 7),
+                meter_fee: Number(settings.meter_fee ?? 10),
+                reader_fee: Number(settings.reader_fee ?? 5),
+                has_president_pin: Boolean(settings.president_pin_hash),
+                president_name: settings.president_name || villageInfo.president_name || '',
+                village_title: villageInfo.village_title
+            },
+            logs: logsRes.rows
+        });
+    } catch (err) {
+        console.error('Get Water Rates Error:', err);
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// 13. ตั้ง / เปลี่ยนรหัสอนุมัติของประธานกรรมการ
+app.post('/api/water/rates/:villageId/setup-pin', async (req, res) => {
+    const { villageId } = req.params;
+    const { old_pin, new_pin, updated_by } = req.body;
+
+    if (!new_pin || String(new_pin).trim().length < 4) {
+        return res.status(400).json({ success: false, message: 'กรุณากำหนดรหัสอนุมัติอย่างน้อย 4 ตัวอักษร/ตัวเลข' });
+    }
+
+    const client = await pgPool.connect();
+    try {
+        const setRes = await client.query(
+            `SELECT * FROM water_settings WHERE village_id = $1 LIMIT 1`,
+            [String(villageId)]
+        );
+        const existing = setRes.rows[0];
+
+        // หากเคยตั้งรหัสไว้แล้ว ต้องยืนยันรหัสเดิมก่อนเปลี่ยน
+        if (existing?.president_pin_hash) {
+            const ok = await verifyWaterPresidentCode(client, villageId, old_pin, existing);
+            if (!ok) {
+                return res.status(403).json({ success: false, message: 'รหัสอนุมัติเดิมของประธานไม่ถูกต้อง' });
+            }
+        }
+
+        const hashed = hashWaterApprovalPin(new_pin);
+        await client.query(`
+            INSERT INTO water_settings (village_id, president_pin_hash, updated_by, updated_at)
+            VALUES ($1, $2, $3, CURRENT_TIMESTAMP)
+            ON CONFLICT (village_id) DO UPDATE SET
+                president_pin_hash = EXCLUDED.president_pin_hash,
+                updated_by = EXCLUDED.updated_by,
+                updated_at = CURRENT_TIMESTAMP
+        `, [String(villageId), hashed, updated_by || 'PRESIDENT']);
+
+        res.json({ success: true, message: 'บันทึกรหัสอนุมัติของประธานกรรมการเรียบร้อยแล้ว' });
+    } catch (err) {
+        console.error('Setup President PIN Error:', err);
+        res.status(500).json({ success: false, message: err.message });
+    } finally {
+        client.release();
+    }
+});
+
+// 14. ปรับราคาค่าน้ำ / ค่ารักษามิเตอร์ / ค่าเก็บ (ต้องยืนยันรหัสของประธานทุกครั้ง + เก็บประวัติ)
+app.put('/api/water/rates/:villageId', async (req, res) => {
+    const { villageId } = req.params;
+    const { unit_rate, meter_fee, reader_fee, approval_code, reason, changed_by } = req.body;
+
+    if (!approval_code || !String(approval_code).trim()) {
+        return res.status(400).json({ success: false, message: 'กรุณากรอกรหัสอนุมัติของประธานกรรมการ' });
+    }
+
+    const client = await pgPool.connect();
+    try {
+        await client.query('BEGIN');
+
+        const setRes = await client.query(
+            `SELECT * FROM water_settings WHERE village_id = $1 LIMIT 1`,
+            [String(villageId)]
+        );
+        const existing = setRes.rows[0] || { unit_rate: 7, meter_fee: 10, reader_fee: 5, president_pin_hash: '' };
+
+        const isApproved = await verifyWaterPresidentCode(client, villageId, approval_code, existing);
+        if (!isApproved) {
+            await client.query('ROLLBACK');
+            return res.status(403).json({
+                success: false,
+                message: 'รหัสอนุมัติของประธานกรรมการไม่ถูกต้อง (ไม่อนุญาตให้เปลี่ยนแปลงราคา)'
+            });
+        }
+
+        const villageInfo = await getVillageSlipHeader(villageId, existing);
+        const presidentName = existing.president_name || villageInfo.president_name || 'ประธานกรรมการ';
+
+        const newUnit = Number(unit_rate ?? existing.unit_rate ?? 7);
+        const newMeter = Number(meter_fee ?? existing.meter_fee ?? 10);
+        const newReader = Number(reader_fee ?? existing.reader_fee ?? 5);
+
+        const updatedRes = await client.query(`
+            INSERT INTO water_settings (
+                village_id, unit_rate, meter_fee, reader_fee, updated_by, updated_at
+            ) VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP)
+            ON CONFLICT (village_id) DO UPDATE SET
+                unit_rate = EXCLUDED.unit_rate,
+                meter_fee = EXCLUDED.meter_fee,
+                reader_fee = EXCLUDED.reader_fee,
+                updated_by = EXCLUDED.updated_by,
+                updated_at = CURRENT_TIMESTAMP
+            RETURNING *
+        `, [String(villageId), newUnit, newMeter, newReader, changed_by || presidentName]);
+
+        await client.query(`
+            INSERT INTO water_rate_change_logs (
+                village_id, old_unit_rate, new_unit_rate,
+                old_meter_fee, new_meter_fee,
+                old_reader_fee, new_reader_fee,
+                approved_by_president, changed_by, reason
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        `, [
+            String(villageId),
+            Number(existing.unit_rate ?? 7), newUnit,
+            Number(existing.meter_fee ?? 10), newMeter,
+            Number(existing.reader_fee ?? 5), newReader,
+            presidentName,
+            changed_by || 'ADMIN',
+            reason || 'ปรับอัตราค่าน้ำประปาหมู่บ้าน'
+        ]);
+
+        await client.query('COMMIT');
+        res.json({
+            success: true,
+            message: 'ประธานกรรมการอนุมัติการปรับราคาค่าน้ำเรียบร้อยแล้ว',
+            data: updatedRes.rows[0]
+        });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error('Update Water Rates Error:', err);
+        res.status(500).json({ success: false, message: err.message });
+    } finally {
+        client.release();
     }
 });
 
