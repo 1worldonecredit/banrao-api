@@ -7681,7 +7681,8 @@ async function recalcMeterPaymentStatus(client, meterId) {
     return meterPayStatus;
 }
 
-// 8. ดึงรายการจดมิเตอร์และบิลประจำเดือนของหมู่บ้าน (แยกบิลใช้งานจริง vs บิลที่ยกเลิก + ส่ง Snapshot ครบ)
+
+// 8. ดึงรายการจดมิเตอร์และบิลประจำเดือนของหมู่บ้าน (ดึงเบอร์โทรจาก user_accounts/user_profiles + ชื่อผู้ใช้น้ำครบ 100%)
 app.get('/api/water/bills/:villageId', async (req, res) => {
     const { villageId } = req.params;
     const billingMonth = req.query.month || new Date().toISOString().slice(0, 7);
@@ -7700,7 +7701,6 @@ app.get('/api/water/bills/:villageId', async (req, res) => {
             ? await getVillageSlipHeader(villageId, settings)
             : { village_title: 'หมู่บ้านประปาชุมชน', village_full_address: '', president_name: settings.president_name || '' };
 
-        // ดึงมิเตอร์ที่ Active + บิลรอบเดือนนี้ (เฉพาะที่ไม่ถูกยกเลิก)
         const metersRes = await pgPool.query(`
             SELECT
                 wm.meter_id,
@@ -7714,6 +7714,8 @@ app.get('/api/water/bills/:villageId', async (req, res) => {
                 hm.first_name,
                 hm.last_name,
                 to_jsonb(hm) AS hm_json,
+                to_jsonb(up) AS up_json,
+                ua.username_phone AS account_phone,
                 v.village_no,
                 v.village_name,
                 t.tambon_name_th,
@@ -7762,7 +7764,17 @@ app.get('/api/water/bills/:villageId', async (req, res) => {
             LEFT JOIN sys_tambons t ON v.tambon_id = t.tambon_id
             LEFT JOIN sys_amphures am ON t.amphure_id = am.amphure_id
             LEFT JOIN sys_provinces pr ON am.province_id = pr.province_id
-            LEFT JOIN user_profiles up ON REGEXP_REPLACE(COALESCE(up.citizen_id, ''), '[^0-9]', '', 'g') = REGEXP_REPLACE(COALESCE(hm.citizen_id::text, ''), '[^0-9]', '', 'g')
+            LEFT JOIN LATERAL (
+                SELECT p.* FROM user_profiles p
+                WHERE COALESCE(hm.citizen_id::text, '') <> ''
+                  AND REGEXP_REPLACE(COALESCE(p.citizen_id, ''), '[^0-9]', '', 'g') = REGEXP_REPLACE(COALESCE(hm.citizen_id::text, ''), '[^0-9]', '', 'g')
+                LIMIT 1
+            ) up ON true
+            LEFT JOIN LATERAL (
+                SELECT a.username_phone FROM user_accounts a
+                WHERE a.profile_id = up.profile_id
+                LIMIT 1
+            ) ua ON true
             LEFT JOIN LATERAL (
                 SELECT cpm.image_url FROM citizen_profiles_media cpm
                 WHERE cpm.profile_id = up.profile_id AND cpm.is_active = true
@@ -7777,7 +7789,6 @@ app.get('/api/water/bills/:villageId', async (req, res) => {
             ORDER BY COALESCE(to_jsonb(h)->>'house_no', to_jsonb(h)->>'house_number', ''), wm.meter_id ASC
         `, [String(villageId), billingMonth]);
 
-        // ดึงบิลค้างชำระเดือนก่อนๆ (เฉพาะที่ไม่ถูกยกเลิก)
         const arrearsRes = await pgPool.query(`
             SELECT bill_id, bill_no, meter_id, billing_month, total_amount
             FROM water_bills
@@ -7794,7 +7805,6 @@ app.get('/api/water/bills/:villageId', async (req, res) => {
             arrearsByMeter[a.meter_id].push(a);
         }
 
-        // ดึงบิลที่ถูกยกเลิก (Voided) ในรอบเดือนนี้เพื่อแสดงในรายงานตรวจสอบบัญชี
         const voidedRes = await pgPool.query(`
             SELECT
                 wb.bill_id, wb.bill_no, wb.receipt_no, wb.billing_month, wb.total_amount,
@@ -7834,12 +7844,22 @@ app.get('/api/water/bills/:villageId', async (req, res) => {
             const hj = r.h_json || {};
             const hmj = r.hm_json || {};
             const wmj = r.wm_json || {};
+            const upj = r.up_json || {};
             const houseNo = r.snapshot_house_no || hj.house_no || hj.house_number || hj.address_no || '-';
             const vName = r.village_name
                 ? (r.village_name.startsWith('บ้าน') ? r.village_name : `บ้าน${r.village_name}`)
                 : '';
-            const fullName = r.snapshot_customer_name || `${r.first_name || ''} ${r.last_name || ''}`.trim() || '-';
+            const fullName =
+                (r.snapshot_customer_name || '').trim() ||
+                `${r.first_name || ''} ${r.last_name || ''}`.trim() ||
+                `${upj.first_name || ''} ${upj.last_name || ''}`.trim() ||
+                '-';
             const fullAddress = `บ้านเลขที่ ${houseNo} หมู่ ${r.village_no || '-'} ${vName} ต.${r.tambon_name_th || '-'} อ.${r.amphure_name_th || '-'} จ.${r.province_name_th || '-'}`.trim();
+            const resolvedPhone =
+                hmj.phone || hmj.phone_number || hmj.tel ||
+                wmj.phone || wmj.contact_phone || wmj.phone_number ||
+                upj.phone || upj.phone_number || upj.tel ||
+                r.account_phone || '';
 
             const arrearsList = arrearsByMeter[r.meter_id] || [];
             const arrearsTotal = arrearsList.reduce((s, a) => s + Number(a.total_amount || 0), 0);
@@ -7867,7 +7887,7 @@ app.get('/api/water/bills/:villageId', async (req, res) => {
                 house_no: houseNo,
                 full_name: fullName,
                 full_address: fullAddress,
-                phone: hmj.phone || hmj.phone_number || hmj.tel || '',
+                phone: resolvedPhone,
                 latitude: wmj.latitude ?? wmj.lat ?? null,
                 longitude: wmj.longitude ?? wmj.lng ?? null,
                 arrears_list: arrearsList,
@@ -7889,6 +7909,8 @@ app.get('/api/water/bills/:villageId', async (req, res) => {
         res.status(500).json({ success: false, message: err.message });
     }
 });
+
+
 // 9. บันทึกการจดมิเตอร์ -> ออก "ใบแจ้งหนี้" (หรือ "ใบเสร็จรับเงิน" ทันทีถ้าจ่ายสด/QR) + เก็บ Snapshot (แก้พารามิเตอร์ไม่ซ้ำ 100%)
 app.post('/api/water/bills', async (req, res) => {
     const {
