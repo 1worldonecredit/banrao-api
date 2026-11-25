@@ -7919,12 +7919,10 @@ app.delete('/api/v3/committees/:committeeId', async (req, res) => {
         client.release();
     }
 });
-
-
-// 6. ดึงรายชื่อบุคคลในผัง (แสดงสถานะ PENDING_APPROVAL / ACTIVE + ชุดสิทธิ์ + ชื่อผู้อนุมัติ)
+// 6. ดึงรายชื่อบุคคลในผัง (ปลอดภัย 100% ไม่พังเรื่องชื่อคอลัมน์ dob / created_at)
 app.get('/api/v3/committees/:committeeId/leaders', async (req, res) => {
     const { committeeId } = req.params;
-    const villageId = req.query.village_id || null;
+    const villageId = req.query.village_id && isValidUuidV3(req.query.village_id) ? req.query.village_id : null;
     try {
         const result = await pgPool.query(`
             SELECT
@@ -7951,7 +7949,7 @@ app.get('/api/v3/committees/:committeeId/leaders', async (req, res) => {
                 up.approval_note,
                 COALESCE(prof.first_name, hm.first_name, '') AS first_name,
                 COALESCE(prof.last_name, hm.last_name, '') AS last_name,
-                COALESCE(prof.dob, hm.dob) AS dob,
+                COALESCE(prof.dob::text, hm.m_json->>'dob', hm.m_json->>'birth_date', hm.m_json->>'date_of_birth') AS dob,
                 (ua.account_id IS NOT NULL) AS has_app_account,
                 ua.role AS current_account_role,
                 ua.is_active AS account_is_active,
@@ -7973,7 +7971,7 @@ app.get('/api/v3/committees/:committeeId/leaders', async (req, res) => {
                 LIMIT 1
             ) prof ON true
             LEFT JOIN LATERAL (
-                SELECT m.member_id, m.first_name, m.last_name, m.dob, m.citizen_id
+                SELECT m.member_id, m.first_name, m.last_name, m.citizen_id, to_jsonb(m) AS m_json
                 FROM household_members m
                 WHERE (up.member_id IS NOT NULL AND m.member_id::text = up.member_id::text)
                    OR (up.account_id IS NOT NULL AND m.member_id::text = up.account_id::text)
@@ -7987,7 +7985,6 @@ app.get('/api/v3/committees/:committeeId/leaders', async (req, res) => {
                 SELECT cpm.image_url
                 FROM citizen_profiles_media cpm
                 WHERE cpm.profile_id = prof.profile_id AND cpm.is_active = true
-                ORDER BY cpm.created_at DESC
                 LIMIT 1
             ) media ON true
             LEFT JOIN user_accounts ap_ua ON up.approved_by = ap_ua.account_id
@@ -7997,7 +7994,7 @@ app.get('/api/v3/committees/:committeeId/leaders', async (req, res) => {
               AND up.status IN ('PENDING_APPROVAL', 'ACTIVE')
               AND ($2::text IS NULL OR up.village_id IS NULL OR up.village_id::text = $2::text)
             ORDER BY up.id ASC
-        `, [committeeId, villageId]);
+        `, [Number(committeeId), villageId]);
 
         res.json({ success: true, data: result.rows });
     } catch (err) {
@@ -8015,13 +8012,12 @@ app.get('/api/v3/search-citizen/:villageId/:citizenId', async (req, res) => {
     }
 
     try {
-        // ค้นหาจากทะเบียนลูกบ้านในหมู่บ้านนี้ก่อน (household_members + households)
         const hmRes = await pgPool.query(`
             SELECT
                 hm.member_id::text AS member_id,
                 hm.first_name,
                 hm.last_name,
-                hm.dob,
+                COALESCE(up.dob::text, to_jsonb(hm)->>'dob', to_jsonb(hm)->>'birth_date', to_jsonb(hm)->>'date_of_birth') AS dob,
                 hm.citizen_id,
                 hm.status AS member_status,
                 v.village_name,
@@ -8044,7 +8040,7 @@ app.get('/api/v3/search-citizen/:villageId/:citizenId', async (req, res) => {
             LEFT JOIN LATERAL (
                 SELECT image_url FROM citizen_profiles_media
                 WHERE profile_id = up.profile_id AND is_active = true
-                ORDER BY created_at DESC LIMIT 1
+                LIMIT 1
             ) cpm ON true
             WHERE h.village_id = $1::uuid
               AND hm.status = 'ACTIVE'
@@ -8065,7 +8061,6 @@ app.get('/api/v3/search-citizen/:villageId/:citizenId', async (req, res) => {
             });
         }
 
-        // กรณีสมัครแอปอยู่ในหมู่บ้านนี้แล้ว แต่ยังไม่ได้เพิ่มลงทะเบียนบ้าน
         const accRes = await pgPool.query(`
             SELECT
                 ua.account_id AS user_account_id,
@@ -8090,7 +8085,7 @@ app.get('/api/v3/search-citizen/:villageId/:citizenId', async (req, res) => {
             LEFT JOIN LATERAL (
                 SELECT image_url FROM citizen_profiles_media
                 WHERE profile_id = up.profile_id AND is_active = true
-                ORDER BY created_at DESC LIMIT 1
+                LIMIT 1
             ) cpm ON true
             WHERE ua.village_id = $1::uuid
               AND ua.is_active = true
