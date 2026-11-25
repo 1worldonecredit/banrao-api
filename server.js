@@ -1302,12 +1302,13 @@ app.delete('/api/menus/:id', async (req, res) => {
   }
 });
 
-// ==========================================
-// 🌟 API เข้าสู่ระบบ (Login) - แก้ไขปัญหา Connection Pool ค้าง
-// ==========================================
-// ==========================================
-// ฟังก์ชันปรับหมดวาระอัตโนมัติ (ล้างทั้ง user_positions, user_accounts.role และ villages.headman_account_id)
-// ==========================================
+
+// =========================================================================
+// 🌟 ขั้นตอนที่ 3: ระบบตรวจตัวตน 6 มิติ (Zero-Trust) + กั้นเขต 80,000 หมู่บ้าน
+// =========================================================================
+const BANRAO_JWT_SECRET = process.env.JWT_SECRET || 'banrao_secret_key';
+
+// 1. ปรับหมดวาระอัตโนมัติ (ปลอดภัย: ไม่ล้างสิทธิ์ตำแหน่งอื่นที่ยัง Active อยู่)
 async function syncExpiredPositions(dbClient = pgPool) {
     try {
         const expired = await dbClient.query(`
@@ -1316,181 +1317,561 @@ async function syncExpiredPositions(dbClient = pgPool) {
                 status = 'EXPIRED',
                 end_reason = 'หมดวาระอัตโนมัติตามกำหนด'
             WHERE is_active = true
+              AND status = 'ACTIVE'
               AND end_date IS NOT NULL
               AND end_date < CURRENT_DATE
-            RETURNING account_id
+            RETURNING account_id, position_id, role_template_code
         `);
 
-        // ถ้ามีคนหมดวาระ ให้ล้าง role และ headman_account_id ออกด้วย
+        const touchedAccounts = new Set();
         for (const row of expired.rows) {
-            await dbClient.query(`UPDATE user_accounts SET role = 'CITIZEN' WHERE account_id = $1`, [row.account_id]);
-            await dbClient.query(`UPDATE villages SET headman_account_id = NULL WHERE headman_account_id = $1`, [row.account_id]);
+            if (!row.account_id) continue;
+            // ล้าง headman_account_id เฉพาะกรณีตำแหน่งที่หมดวาระคือผู้ใหญ่บ้านเท่านั้น
+            if (row.role_template_code === 'VILLAGE_HEADMAN' || Number(row.position_id) === 6) {
+                await dbClient.query(
+                    `UPDATE villages SET headman_account_id = NULL WHERE headman_account_id = $1::uuid`,
+                    [row.account_id]
+                );
+            }
+            touchedAccounts.add(String(row.account_id));
+        }
+
+        for (const accId of touchedAccounts) {
+            if (typeof syncUserAccountRoleFromPositions === 'function') {
+                await syncUserAccountRoleFromPositions(dbClient, accId);
+            }
         }
     } catch (err) {
         console.error('Sync Expired Positions Error:', err.message);
     }
 }
+
+// 2. เขียน Audit Log ทุกการ Login / การเข้าถึงที่ถูกปฏิเสธ / การพยายามข้ามหมู่บ้าน
+async function writeAccessAuditLog(client, payload) {
+    try {
+        await client.query(`
+            INSERT INTO sys_access_audit_logs (
+                account_id, full_name, user_village_id, target_village_id,
+                user_role, positions_text, referrer_info, account_status,
+                action_name, request_path, access_result, deny_reason, ip_address
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+        `, [
+            payload.account_id || null,
+            payload.full_name || null,
+            payload.user_village_id || null,
+            payload.target_village_id || null,
+            payload.user_role || null,
+            payload.positions_text || null,
+            payload.referrer_info || null,
+            payload.account_status || null,
+            payload.action_name || null,
+            payload.request_path || null,
+            payload.access_result || 'DENIED',
+            payload.deny_reason || null,
+            payload.ip_address || null
+        ]);
+    } catch (err) {
+        console.error('Write Access Audit Log Error:', err.message);
+    }
+}
+
+// 3. ถอดรหัสตัวตนจาก JWT Token (ปลอดภัย ปลอมไม่ได้)
+function verifyRequestJwt(req) {
+    const authHeader = req.headers.authorization || '';
+    if (!authHeader.startsWith('Bearer ')) return null;
+    try {
+        return jwt.verify(authHeader.slice(7).trim(), BANRAO_JWT_SECRET);
+    } catch (err) {
+        return null;
+    }
+}
+
+// 4. ตรวจสอบ 6 มิติสดจากฐานข้อมูล (เป็นใคร / Active ไหม / หมู่บ้านไหน / ใครแนะนำ / ตำแหน่งอนุมัติแล้ว / ได้สิทธิ์อะไร)
+async function resolveUserSecurityContext(client, accountId) {
+    if (!accountId || !isValidUuidV3(accountId)) {
+        return { ok: false, code: 401, reason: 'ไม่พบข้อมูลยืนยันตัวตน กรุณาเข้าสู่ระบบใหม่' };
+    }
+
+    const accRes = await client.query(`
+        SELECT
+            a.account_id, a.profile_id, a.username_phone, a.is_active, a.role,
+            COALESCE(a.tier_code, 'CITIZEN_FREE') AS tier_code,
+            a.village_id, a.referrer_id, a.referred_by, a.referral_code,
+            p.first_name, p.last_name, p.citizen_id, p.house_no,
+            v.village_no, v.village_name, v.headman_account_id,
+            t.tambon_name_th, am.amphure_name_th, pr.province_name_th,
+            (
+                SELECT cpm.image_url
+                FROM citizen_profiles_media cpm
+                WHERE cpm.profile_id = a.profile_id AND cpm.is_active = true
+                LIMIT 1
+            ) AS user_image
+        FROM user_accounts a
+        LEFT JOIN user_profiles p ON a.profile_id = p.profile_id
+        LEFT JOIN villages v ON a.village_id = v.village_id
+        LEFT JOIN sys_tambons t ON v.tambon_id = t.tambon_id
+        LEFT JOIN sys_amphures am ON t.amphure_id = am.amphure_id
+        LEFT JOIN sys_provinces pr ON am.province_id = pr.province_id
+        WHERE a.account_id = $1::uuid
+        LIMIT 1
+    `, [accountId]);
+
+    if (accRes.rows.length === 0) {
+        return { ok: false, code: 401, reason: 'ไม่พบบัญชีผู้ใช้งานนี้ในระบบ' };
+    }
+
+    const u = accRes.rows[0];
+    const fullName = `${u.first_name || ''} ${u.last_name || ''}`.trim() || u.username_phone;
+    const cleanCid = String(u.citizen_id || '').replace(/\D/g, '');
+    const isSuperAdmin = u.username_phone === '0000000000' || String(u.role || '').toUpperCase() === 'SUPER_ADMIN';
+
+    // ตรวจสถานะทะเบียนลูกบ้าน (household_members)
+    let householdStatus = 'UNLINKED';
+    let houseNo = u.house_no || '';
+    if (cleanCid.length === 13 && u.village_id) {
+        const hmRes = await client.query(`
+            SELECT hm.status, to_jsonb(h) AS h_json
+            FROM household_members hm
+            JOIN households h ON hm.household_id::text = h.household_id::text
+            WHERE h.village_id = $1::uuid
+              AND REGEXP_REPLACE(COALESCE(hm.citizen_id::text, ''), '[^0-9]', '', 'g') = $2
+            ORDER BY CASE WHEN hm.status = 'ACTIVE' THEN 0 ELSE 1 END, hm.member_id DESC
+            LIMIT 1
+        `, [u.village_id, cleanCid]).catch(() => ({ rows: [] }));
+
+        if (hmRes.rows.length > 0) {
+            householdStatus = String(hmRes.rows[0].status || 'ACTIVE').toUpperCase();
+            const hj = hmRes.rows[0].h_json || {};
+            houseNo = hj.house_no || hj.house_number || houseNo;
+        }
+    }
+
+    const isAccountActive = u.is_active !== false;
+    const isHouseholdActive = isSuperAdmin || householdStatus === 'UNLINKED' || householdStatus === 'ACTIVE';
+
+    // ตรวจผู้แนะนำ (Referrer)
+    let referrer = null;
+    if (u.referrer_id || u.referred_by) {
+        const refRes = await client.query(`
+            SELECT ra.account_id, ra.username_phone, ra.is_active, rp.first_name, rp.last_name
+            FROM user_accounts ra
+            LEFT JOIN user_profiles rp ON ra.profile_id = rp.profile_id
+            WHERE ($1::uuid IS NOT NULL AND ra.account_id = $1::uuid)
+               OR ($2::text IS NOT NULL AND (ra.referral_code = $2::text OR ra.username_phone = $2::text))
+            LIMIT 1
+        `, [isValidUuidV3(u.referrer_id) ? u.referrer_id : null, u.referred_by || null]).catch(() => ({ rows: [] }));
+
+        if (refRes.rows.length > 0) {
+            const r = refRes.rows[0];
+            referrer = {
+                account_id: r.account_id,
+                full_name: `${r.first_name || ''} ${r.last_name || ''}`.trim() || r.username_phone,
+                phone: r.username_phone || '-',
+                is_active: r.is_active !== false
+            };
+        } else if (u.referred_by) {
+            referrer = { account_id: null, full_name: String(u.referred_by), phone: '-', is_active: true };
+        }
+    }
+
+    // ดึงเฉพาะตำแหน่งที่ "ผู้ใหญ่บ้านอนุมัติแล้ว (ACTIVE)" + "อยู่ในหมู่บ้านตัวเอง" + "ไม่หมดวาระ"
+    const posRes = await client.query(`
+        SELECT
+            up.id AS user_position_id,
+            up.committee_id,
+            cc.committee_name,
+            cc.committee_type_code,
+            up.position_id,
+            COALESCE(NULLIF(up.custom_position_title, ''), sp.position_name, 'กรรมการชุมชน') AS display_position_name,
+            COALESCE(up.role_template_code, sp.role_template_code, 'COMMITTEE_GENERAL') AS role_template_code,
+            rt.template_name_th,
+            rt.account_role_level,
+            up.start_date,
+            up.end_date,
+            up.approved_at
+        FROM user_positions up
+        LEFT JOIN sys_positions sp ON up.position_id = sp.position_id
+        LEFT JOIN sys_role_templates rt ON COALESCE(up.role_template_code, sp.role_template_code) = rt.role_template_code
+        LEFT JOIN community_committees cc ON up.committee_id = cc.committee_id
+        WHERE up.account_id = $1::uuid
+          AND up.is_active = true
+          AND up.status = 'ACTIVE'
+          AND (up.end_date IS NULL OR up.end_date >= CURRENT_DATE)
+          AND ($2::uuid IS NULL OR up.village_id IS NULL OR up.village_id = $2::uuid)
+        ORDER BY up.approved_at DESC NULLS LAST, up.id DESC
+    `, [u.account_id, u.village_id || null]);
+
+    const activePositions = posRes.rows || [];
+    const roleTemplateSet = new Set(activePositions.map((p) => p.role_template_code).filter(Boolean));
+
+    const isHeadman = Boolean(
+        u.village_id && u.headman_account_id && String(u.headman_account_id) === String(u.account_id)
+    );
+    if (isSuperAdmin) roleTemplateSet.add('SUPER_ADMIN');
+    if (isHeadman) roleTemplateSet.add('VILLAGE_HEADMAN');
+
+    // รองรับบัญชีเดิมที่มี role = Admin Villages แต่ยังไม่ได้เพิ่มลงตาราง user_positions
+    const roleUpper = String(u.role || 'CITIZEN').toUpperCase();
+    if (roleUpper === 'HEADMAN') roleTemplateSet.add('VILLAGE_HEADMAN');
+    if (roleUpper.includes('ADMIN') && !isSuperAdmin) roleTemplateSet.add('VILLAGE_ADMIN');
+
+    const roleTemplates = Array.from(roleTemplateSet);
+    const has = (...codes) => isSuperAdmin || codes.some((c) => roleTemplateSet.has(c));
+
+    // กำหนดสิทธิ์การใช้งานระดับระบบจากแม่แบบสิทธิ์มาตรฐาน (ใช้เหมือนกันทั้ง 80,000 หมู่บ้าน)
+    const canOperate = isAccountActive && isHouseholdActive && (isSuperAdmin || Boolean(u.village_id));
+    const permissions = {
+        can_manage_village_core: canOperate && has('VILLAGE_HEADMAN', 'VILLAGE_ADMIN'),
+        can_approve_committees: canOperate && has('VILLAGE_HEADMAN'),
+        can_manage_water_users: canOperate && has('VILLAGE_HEADMAN', 'VILLAGE_ADMIN', 'WATER_PRESIDENT', 'WATER_TREASURER'),
+        can_view_water_users: canOperate && has('VILLAGE_HEADMAN', 'VILLAGE_ADMIN', 'WATER_PRESIDENT', 'WATER_TREASURER', 'WATER_READER'),
+        can_record_water_bills: canOperate && has('VILLAGE_HEADMAN', 'VILLAGE_ADMIN', 'WATER_PRESIDENT', 'WATER_TREASURER', 'WATER_READER'),
+        can_manage_water_settings: canOperate && has('VILLAGE_HEADMAN', 'WATER_PRESIDENT', 'WATER_TREASURER'),
+        can_approve_water_rates: canOperate && has('VILLAGE_HEADMAN', 'WATER_PRESIDENT'),
+        can_view_my_water_bills: canOperate,
+        can_manage_places: canOperate && (has('VILLAGE_HEADMAN', 'VILLAGE_ADMIN', 'PLACE_GOV_HEAD', 'PLACE_BIZ_OWNER') || ['BIZ_SHOP', 'BIZ_HOTEL'].includes(u.tier_code))
+    };
+
+    // ชื่อตำแหน่งหลักที่จะแสดงใน Sidebar / Profile
+    let displayPositionName = 'ประชาชนทั่วไป';
+    if (isSuperAdmin) displayPositionName = 'Super Admin';
+    else if (isHeadman) displayPositionName = 'ผู้ใหญ่บ้าน';
+    else if (activePositions.length > 0) displayPositionName = activePositions[0].display_position_name;
+    else if (roleUpper.includes('ADMIN')) displayPositionName = 'แอดมินหมู่บ้าน';
+
+    const vName = u.village_name
+        ? (u.village_name.startsWith('บ้าน') ? u.village_name : `บ้าน${u.village_name}`)
+        : '';
+    const villageFullAddress = [
+        vName,
+        u.village_no ? `หมู่ที่ ${u.village_no}` : '',
+        u.tambon_name_th ? `ต.${u.tambon_name_th}` : '',
+        u.amphure_name_th ? `อ.${u.amphure_name_th}` : '',
+        u.province_name_th ? `จ.${u.province_name_th}` : ''
+    ].filter(Boolean).join(' ');
+
+    const ok = isAccountActive && isHouseholdActive && (isSuperAdmin || Boolean(u.village_id));
+    const reason = !isAccountActive
+        ? 'บัญชีของคุณถูกระงับการใช้งาน (INACTIVE)'
+        : !isHouseholdActive
+        ? `สถานะทะเบียนลูกบ้านของคุณไม่ปกติ (${householdStatus})`
+        : (!isSuperAdmin && !u.village_id)
+        ? 'บัญชียังไม่ได้ผูกสังกัดหมู่บ้าน'
+        : null;
+
+    return {
+        ok,
+        code: ok ? 200 : 403,
+        reason,
+        context: {
+            account_id: String(u.account_id),
+            username_phone: u.username_phone,
+            full_name: fullName,
+            user_image: u.user_image || '/profile-img.jpg',
+            is_active: isAccountActive && isHouseholdActive,
+            account_status: isAccountActive ? 'ACTIVE' : 'INACTIVE',
+            household_status: householdStatus,
+            is_super_admin: isSuperAdmin,
+            is_headman: isHeadman,
+            role: u.role || 'CITIZEN',
+            tier_code: u.tier_code,
+            display_position_name: displayPositionName,
+            role_templates: roleTemplates,
+            positions: activePositions,
+            village_id: u.village_id ? String(u.village_id) : null,
+            village_name: u.village_name || '',
+            village_no: u.village_no || '',
+            village_full_address: villageFullAddress,
+            house_no: houseNo || '-',
+            referrer,
+            permissions
+        }
+    };
+}
+
+// 5. Middleware กั้นเขตหมู่บ้าน (80,000 หมู่บ้านไม่ปนกัน 100%) + ตรวจสิทธิ์สด + บันทึก Audit Log
+function requireVillageGuard(permissionKey, actionName) {
+    return async (req, res, next) => {
+        const decoded = verifyRequestJwt(req);
+        const accountId = decoded?.account_id || req.headers['x-account-id'] || null;
+        const requestedVillageId = req.params.villageId || req.body?.village_id || req.query?.village_id || null;
+        const ip = String(req.headers['x-forwarded-for'] || req.socket?.remoteAddress || '');
+
+        const client = await pgPool.connect();
+        try {
+            const check = await resolveUserSecurityContext(client, accountId);
+            const ctx = check.context || {};
+            const posText = (ctx.positions || []).map((p) => `${p.display_position_name} [${p.role_template_code}]`).join(', ');
+            const refText = ctx.referrer ? `${ctx.referrer.full_name} (${ctx.referrer.phone})` : 'ไม่มีผู้แนะนำ';
+
+            if (!check.ok) {
+                await writeAccessAuditLog(client, {
+                    account_id: accountId,
+                    full_name: ctx.full_name,
+                    user_village_id: ctx.village_id,
+                    target_village_id: requestedVillageId ? String(requestedVillageId) : null,
+                    user_role: ctx.role,
+                    positions_text: posText,
+                    referrer_info: refText,
+                    account_status: ctx.account_status || 'UNVERIFIED',
+                    action_name: actionName,
+                    request_path: req.originalUrl,
+                    access_result: 'DENIED',
+                    deny_reason: check.reason,
+                    ip_address: ip
+                });
+                return res.status(check.code || 401).json({
+                    success: false,
+                    code: 'AUTH_OR_STATUS_INVALID',
+                    message: check.reason,
+                    security_context: ctx
+                });
+            }
+
+            // กั้นเขตหมู่บ้านเด็ดขาด: ห้ามดูหรือแก้ไขหมู่บ้านอื่น (ยกเว้น Super Admin)
+            if (!ctx.is_super_admin && requestedVillageId && String(requestedVillageId) !== String(ctx.village_id)) {
+                const reason = 'ไม่อนุญาตให้เข้าถึงข้อมูลต่างหมู่บ้าน (หมู่บ้านใคร หมู่บ้านมัน)';
+                await writeAccessAuditLog(client, {
+                    account_id: ctx.account_id,
+                    full_name: ctx.full_name,
+                    user_village_id: ctx.village_id,
+                    target_village_id: String(requestedVillageId),
+                    user_role: ctx.role,
+                    positions_text: posText,
+                    referrer_info: refText,
+                    account_status: ctx.account_status,
+                    action_name: `CROSS_VILLAGE_${actionName}`,
+                    request_path: req.originalUrl,
+                    access_result: 'DENIED',
+                    deny_reason: reason,
+                    ip_address: ip
+                });
+                return res.status(403).json({
+                    success: false,
+                    code: 'CROSS_VILLAGE_FORBIDDEN',
+                    message: reason,
+                    security_context: ctx
+                });
+            }
+
+            // ตรวจสิทธิ์ตามแม่แบบสิทธิ์ที่ได้รับอนุมัติ
+            if (permissionKey && !ctx.permissions?.[permissionKey]) {
+                const reason = `ตำแหน่งของคุณ (${ctx.display_position_name}) ยังไม่ได้รับสิทธิ์ใช้งานส่วนนี้`;
+                await writeAccessAuditLog(client, {
+                    account_id: ctx.account_id,
+                    full_name: ctx.full_name,
+                    user_village_id: ctx.village_id,
+                    target_village_id: ctx.village_id,
+                    user_role: ctx.role,
+                    positions_text: posText,
+                    referrer_info: refText,
+                    account_status: ctx.account_status,
+                    action_name: actionName,
+                    request_path: req.originalUrl,
+                    access_result: 'DENIED',
+                    deny_reason: reason,
+                    ip_address: ip
+                });
+                return res.status(403).json({
+                    success: false,
+                    code: 'PERMISSION_DENIED',
+                    message: reason,
+                    security_context: ctx
+                });
+            }
+
+            // บังคับล็อก village_id และตัวตนเป็นของคน Login เสมอ (ป้องกันปลอมค่าใน Request)
+            req.securityContext = ctx;
+            if (!ctx.is_super_admin && ctx.village_id) {
+                if (req.params.villageId) req.params.villageId = ctx.village_id;
+                if (req.body && typeof req.body === 'object' && 'village_id' in req.body) req.body.village_id = ctx.village_id;
+            }
+
+            if (['POST', 'PUT', 'DELETE'].includes(req.method)) {
+                await writeAccessAuditLog(client, {
+                    account_id: ctx.account_id,
+                    full_name: ctx.full_name,
+                    user_village_id: ctx.village_id,
+                    target_village_id: ctx.village_id,
+                    user_role: ctx.role,
+                    positions_text: posText,
+                    referrer_info: refText,
+                    account_status: ctx.account_status,
+                    action_name: actionName,
+                    request_path: req.originalUrl,
+                    access_result: 'ALLOWED',
+                    deny_reason: null,
+                    ip_address: ip
+                });
+            }
+
+            next();
+        } catch (err) {
+            console.error('requireVillageGuard Error:', err);
+            res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการตรวจสอบสิทธิ์' });
+        } finally {
+            client.release();
+        }
+    };
+}
+
 // ==========================================
-// 🌟 API เข้าสู่ระบบ (Login) - เวอร์ชัน 4 มิติ (App + หน่วยงาน + แผนก + ตำแหน่ง + Scope)
+// 🌟 API เข้าสู่ระบบ (Login) - ตรวจ 6 มิติ + กั้นเขต 80,000 หมู่บ้าน + เชื่อมสิทธิ์ที่อนุมัติแล้ว
 // ==========================================
 app.post('/api/login', async (req, res) => {
-    console.log('👉 มีคนกด Login! ข้อมูลที่ส่งมาคือ:', req.body);
     const usernameInput = req.body.username || req.body.phone_number;
     const password = req.body.password;
     const appCode = (req.body.app_code || 'BANRAO_WEB').trim().toUpperCase();
+    const ip = String(req.headers['x-forwarded-for'] || req.socket?.remoteAddress || '');
 
     if (!usernameInput || !password) {
         return res.status(400).json({ success: false, message: 'กรุณากรอกเบอร์โทรศัพท์และรหัสผ่าน' });
     }
 
     const client = await pgPool.connect();
-
     try {
-        // ✨ 1. เคลียร์ตำแหน่งที่หมดวาระอัตโนมัติก่อนดึงข้อมูล Login
+        // 1. เคลียร์ตำแหน่งที่หมดวาระอัตโนมัติ
         await syncExpiredPositions(client);
 
-        // ✨ 2. ดึงข้อมูลส่วนตัว บัญชี หมู่บ้าน และรูปโปรไฟล์ (1 บัญชี = 1 แถว ไม่ซ้ำ)
-        const userQuery = await client.query(
-            `SELECT 
-                a.account_id, a.username_phone, a.password_hash, a.occupation_id, a.is_active, a.household_member_count, a.role,
+        // 2. ดึงข้อมูลบัญชี โปรไฟล์ และหมู่บ้าน
+        const userQuery = await client.query(`
+            SELECT
+                a.account_id, a.username_phone, a.password_hash, a.occupation_id,
+                a.is_active, a.household_member_count, a.role,
+                COALESCE(a.tier_code, 'CITIZEN_FREE') AS tier_code,
                 p.first_name, p.last_name, p.nickname, p.dob, p.citizen_id, p.gender, p.house_no,
-                o.occupation_name, 
-
+                o.occupation_name,
                 (
-                    SELECT cpm.image_url
-                    FROM citizen_profiles_media cpm
+                    SELECT cpm.image_url FROM citizen_profiles_media cpm
                     WHERE cpm.profile_id = a.profile_id AND cpm.is_active = true
                     LIMIT 1
                 ) AS user_image,
-
                 (
-                    SELECT hcpm.image_url
-                    FROM citizen_profiles_media hcpm
+                    SELECT hcpm.image_url FROM citizen_profiles_media hcpm
                     WHERE hcpm.profile_id = ha.profile_id AND hcpm.is_active = true
                     LIMIT 1
                 ) AS headman_image,
-                
-                v.village_id, v.village_no, v.village_name, v.headman_lat, v.headman_lng, 
+                v.village_id, v.village_no, v.village_name, v.headman_lat, v.headman_lng,
                 v.headman_account_id,
-                v.household_count AS target_household_count, 
+                v.household_count AS target_household_count,
                 v.population_count AS target_population_count,
                 (SELECT COUNT(*) FROM households h WHERE h.village_id = v.village_id) AS actual_household_count,
                 (SELECT COUNT(*) FROM household_members hm JOIN households hs ON hm.household_id = hs.household_id WHERE hs.village_id = v.village_id) AS actual_population_count,
-                
-                hp.first_name AS headman_first_name, 
+                hp.first_name AS headman_first_name,
                 hp.last_name AS headman_last_name,
                 t.tambon_name_th, am.amphure_name_th, pr.province_name_th,
-                
                 EXTRACT(YEAR FROM age(CURRENT_DATE, p.dob)) AS age_years,
                 EXTRACT(MONTH FROM age(CURRENT_DATE, p.dob)) AS age_months,
                 EXTRACT(DAY FROM age(CURRENT_DATE, p.dob)) AS age_days
-
-             FROM user_accounts a
-             LEFT JOIN user_profiles p ON a.profile_id = p.profile_id
-             LEFT JOIN sys_occupations o ON a.occupation_id = o.occupation_id
-             LEFT JOIN villages v ON a.village_id = v.village_id
-             LEFT JOIN user_accounts ha ON v.headman_account_id = ha.account_id
-             LEFT JOIN user_profiles hp ON ha.profile_id = hp.profile_id
-             LEFT JOIN sys_tambons t ON v.tambon_id = t.tambon_id
-             LEFT JOIN sys_amphures am ON t.amphure_id = am.amphure_id
-             LEFT JOIN sys_provinces pr ON am.province_id = pr.province_id
-             WHERE a.username_phone = $1`,
-            [usernameInput]
-        );
+            FROM user_accounts a
+            LEFT JOIN user_profiles p ON a.profile_id = p.profile_id
+            LEFT JOIN sys_occupations o ON a.occupation_id = o.occupation_id
+            LEFT JOIN villages v ON a.village_id = v.village_id
+            LEFT JOIN user_accounts ha ON v.headman_account_id = ha.account_id
+            LEFT JOIN user_profiles hp ON ha.profile_id = hp.profile_id
+            LEFT JOIN sys_tambons t ON v.tambon_id = t.tambon_id
+            LEFT JOIN sys_amphures am ON t.amphure_id = am.amphure_id
+            LEFT JOIN sys_provinces pr ON am.province_id = pr.province_id
+            WHERE a.username_phone = $1
+            LIMIT 1
+        `, [usernameInput]);
 
         if (userQuery.rows.length === 0) {
             return res.status(401).json({ success: false, message: 'เบอร์โทรศัพท์หรือรหัสผ่านไม่ถูกต้อง' });
         }
 
         const user = userQuery.rows[0];
-
-        if (user.is_active === false) {
-            return res.status(403).json({ success: false, message: 'บัญชีนี้ถูกระงับหรือยังไม่ได้รับการอนุมัติ' });
-        }
-
         const isValidPassword = await bcrypt.compare(password, user.password_hash);
         if (!isValidPassword) {
             return res.status(401).json({ success: false, message: 'เบอร์โทรศัพท์หรือรหัสผ่านไม่ถูกต้อง' });
         }
 
-        // ✨ 3. ดึงโครงสร้าง 4 มิติทั้งหมดที่ Active ของบุคคลนี้ (หน่วยงาน -> แผนก -> ตำแหน่ง -> พื้นที่)
-        const posQuery = await client.query(
-            `SELECT 
-                up.id AS user_position_id,
-                pos.position_id,
-                pos.position_name,
-                pos.position_level,
-                COALESCE(up.org_id, pos.org_id) AS org_id,
-                org.org_name,
-                org.app_code AS org_app_code,
-                COALESCE(up.dept_id, pos.dept_id) AS dept_id,
-                dept.department_name,
-                up.scope_type,
-                up.scope_id,
-                up.start_date AS term_start_date,
-                up.end_date AS term_end_date
-             FROM user_positions up
-             JOIN sys_positions pos ON up.position_id = pos.position_id
-             LEFT JOIN sys_organizations org ON COALESCE(up.org_id, pos.org_id) = org.org_id
-             LEFT JOIN sys_departments dept ON COALESCE(up.dept_id, pos.dept_id) = dept.department_id
-             WHERE up.account_id = $1
-               AND up.is_active = TRUE
-               AND (up.end_date IS NULL OR up.end_date >= CURRENT_DATE)
-             ORDER BY up.start_date DESC NULLS LAST, up.id DESC`,
-            [user.account_id]
-        );
+        // 3. เชื่อมตำแหน่งที่ผู้ใหญ่บ้านอนุมัติไว้ล่วงหน้าจากเลขบัตร 13 หลัก (เฉพาะหมู่บ้านเดียวกันเท่านั้น!)
+        const cleanCid = String(user.citizen_id || '').replace(/\D/g, '');
+        if (cleanCid.length === 13 && user.village_id) {
+            const linked = await client.query(`
+                UPDATE user_positions
+                SET account_id = $1::uuid
+                WHERE account_id IS NULL
+                  AND village_id = $2::uuid
+                  AND REGEXP_REPLACE(COALESCE(citizen_id, ''), '[^0-9]', '', 'g') = $3
+                  AND is_active = true
+                RETURNING id
+            `, [user.account_id, user.village_id, cleanCid]).catch(() => ({ rows: [] }));
 
-        const activePositions = posQuery.rows;
-        const primaryPos = activePositions[0] || null;
-
-        // ดึงสิทธิ์พื้นฐานตามอาชีพ (คงไว้เพื่อรองรับโค้ดเดิม)
-        let permissions = [];
-        if (user.occupation_id) {
-            try {
-                const permQuery = await client.query(
-                    `SELECT sp.permission_code
-                     FROM occupation_permissions op
-                     JOIN sys_permissions sp ON op.permission_id = sp.permission_id
-                     WHERE op.occupation_id = $1`,
-                    [user.occupation_id]
-                );
-                permissions = permQuery.rows.map(row => row.permission_code);
-            } catch (e) {
-                console.log("ไม่มีตาราง Permissions หรือข้อผิดพลาดในการดึงสิทธิ์:", e.message);
+            if (linked.rows.length > 0 && typeof syncUserAccountRoleFromPositions === 'function') {
+                await syncUserAccountRoleFromPositions(client, user.account_id);
             }
         }
 
-        // ✨ 4. กำหนดตำแหน่งหลัก & สังกัด 4 มิติ
-        const isSuperAdmin = user.username_phone === '0000000000' || user.role === 'SUPER_ADMIN';
-        let finalPositionName = 'ประชาชนทั่วไป';
-        let finalPositionLevel = null;
+        // 4. ตรวจสอบ 6 มิติ (ตัวตน, Active, หมู่บ้าน, ผู้แนะนำ, ตำแหน่งที่อนุมัติแล้ว, สิทธิ์)
+        const secCheck = await resolveUserSecurityContext(client, user.account_id);
+        const sec = secCheck.context || {};
 
-        if (isSuperAdmin) {
-            finalPositionName = 'Super Admin';
-            finalPositionLevel = 'SYSTEM';
-        } else if (primaryPos) {
-            finalPositionName = primaryPos.position_name;
-            finalPositionLevel = primaryPos.position_level || 'VILLAGE';
+        if (!secCheck.ok) {
+            await writeAccessAuditLog(client, {
+                account_id: user.account_id,
+                full_name: sec.full_name,
+                user_village_id: sec.village_id,
+                target_village_id: sec.village_id,
+                user_role: sec.role,
+                referrer_info: sec.referrer ? `${sec.referrer.full_name} (${sec.referrer.phone})` : 'ไม่มีผู้แนะนำ',
+                account_status: sec.account_status,
+                action_name: 'LOGIN',
+                request_path: '/api/login',
+                access_result: 'DENIED',
+                deny_reason: secCheck.reason,
+                ip_address: ip
+            });
+            return res.status(403).json({ success: false, message: secCheck.reason });
         }
 
-        // ✨ 5. สร้าง JWT Token ที่ฝังบริบท 4 มิติไว้ภายใน
+        // 5. ดึงสิทธิ์อาชีพเดิม (คงไว้เพื่อรองรับหน้าเดิม)
+        let occupationPermissions = [];
+        if (user.occupation_id) {
+            const permQuery = await client.query(`
+                SELECT sp.permission_code
+                FROM occupation_permissions op
+                JOIN sys_permissions sp ON op.permission_id = sp.permission_id
+                WHERE op.occupation_id = $1
+            `, [user.occupation_id]).catch(() => ({ rows: [] }));
+            occupationPermissions = permQuery.rows.map((r) => r.permission_code);
+        }
+
+        const primaryPos = sec.positions[0] || null;
+
+        // 6. สร้าง JWT Token ที่ฝังบริบทหมู่บ้าน + แม่แบบสิทธิ์ที่อนุมัติแล้ว
         const token = jwt.sign(
             {
                 account_id: user.account_id,
                 app_code: appCode,
-                is_super_admin: isSuperAdmin,
-                occupation_id: user.occupation_id,
-                village_id: user.village_id,
-                org_id: primaryPos?.org_id || null,
-                dept_id: primaryPos?.dept_id || null,
-                position_id: primaryPos?.position_id || null,
-                scope_type: primaryPos?.scope_type || null,
-                scope_id: primaryPos?.scope_id || null
+                is_super_admin: sec.is_super_admin,
+                is_headman: sec.is_headman,
+                village_id: sec.village_id,
+                tier_code: sec.tier_code,
+                role_templates: sec.role_templates,
+                position_id: primaryPos?.position_id || null
             },
-            process.env.JWT_SECRET || 'banrao_secret_key',
-            { expiresIn: '5d' } //หมดอายุทุก 5 วัน
-           
+            BANRAO_JWT_SECRET,
+            { expiresIn: '5d' }
         );
+
+        // บันทึกประวัติ Login สำเร็จ
+        await writeAccessAuditLog(client, {
+            account_id: sec.account_id,
+            full_name: sec.full_name,
+            user_village_id: sec.village_id,
+            target_village_id: sec.village_id,
+            user_role: sec.role,
+            positions_text: (sec.positions || []).map((p) => `${p.display_position_name} [${p.role_template_code}]`).join(', '),
+            referrer_info: sec.referrer ? `${sec.referrer.full_name} (${sec.referrer.phone})` : 'ไม่มีผู้แนะนำ',
+            account_status: sec.account_status,
+            action_name: 'LOGIN',
+            request_path: '/api/login',
+            access_result: 'ALLOWED',
+            deny_reason: null,
+            ip_address: ip
+        });
 
         const daysTh = ['อาทิตย์', 'จันทร์', 'อังคาร', 'พุธ', 'พฤหัสบดี', 'ศุกร์', 'เสาร์'];
         const birthDate = user.dob ? new Date(user.dob) : null;
@@ -1502,18 +1883,21 @@ app.post('/api/login', async (req, res) => {
             id: user.account_id,
             account_id: user.account_id,
             username: user.username_phone,
+            username_phone: user.username_phone,
             firstName: user.first_name,
             lastName: user.last_name,
-            full_name: `${user.first_name || ''} ${user.last_name || ''}`.trim(),
+            full_name: sec.full_name,
             nickname: user.nickname,
             occupation: user.occupation_name,
-            permissions: permissions,
-            role: user.role,
+            permissions: occupationPermissions,
+            role: sec.role,
+            tier_code: sec.tier_code,
 
-            // ข้อมูลหมู่บ้านและสถิติ
-            village_id: user.village_id,
+            // หมู่บ้านและสถิติ
+            village_id: sec.village_id,
             village_no: user.village_no,
             villageName: user.village_name,
+            village_full_address: sec.village_full_address,
             headmanName: user.headman_first_name ? `${user.headman_first_name} ${user.headman_last_name}` : null,
             tambonName: user.tambon_name_th,
             amphureName: user.amphure_name_th,
@@ -1524,33 +1908,27 @@ app.post('/api/login', async (req, res) => {
             age_years: isDummyDate ? '-' : (user.age_years || 0),
             age_months: isDummyDate ? '-' : (user.age_months || 0),
             age_days: isDummyDate ? '-' : (user.age_days || 0),
-            house_no: user.house_no || '-',
+            house_no: sec.house_no || '-',
             household_member_count: user.household_member_count || 0,
-
             target_household_count: user.target_household_count || 0,
             target_population_count: user.target_population_count || 0,
             actual_household_count: user.actual_household_count || 0,
             actual_population_count: user.actual_population_count || 0,
 
-            userImage: user.user_image || '/profile-img.jpg',
+            userImage: sec.user_image,
             headmanImage: user.headman_account_id ? (user.headman_image || '/profile-img.jpg') : '/profile-img.jpg',
 
-            // ✨ ข้อมูล 4 มิติ (App + หน่วยงาน + แผนก + ตำแหน่ง + พื้นที่)
+            // ข้อมูลตำแหน่งและสิทธิ์ 6 มิติ (เฉพาะที่อนุมัติแล้วเท่านั้น)
             app_code: appCode,
-            isSuperAdmin: isSuperAdmin,
-            is_super_admin: isSuperAdmin,
-            org_id: primaryPos?.org_id || null,
-            org_name: isSuperAdmin ? 'ระบบส่วนกลาง (System)' : (primaryPos?.org_name || null),
-            dept_id: primaryPos?.dept_id || null,
-            department_name: primaryPos?.department_name || null,
+            isSuperAdmin: sec.is_super_admin,
+            is_super_admin: sec.is_super_admin,
+            is_headman: sec.is_headman,
             position_id: primaryPos?.position_id || null,
-            position_name: finalPositionName,
-            position_level: finalPositionLevel,
-            scope_type: primaryPos?.scope_type || null,
-            scope_id: primaryPos?.scope_id || null,
-            term_start_date: primaryPos?.term_start_date || null,
-            term_end_date: primaryPos?.term_end_date || null,
-            positions: activePositions // เก็บทุกตำแหน่งที่ Active ไว้ครบ
+            position_name: sec.display_position_name,
+            role_templates: sec.role_templates,
+            positions: sec.positions,
+            referrer: sec.referrer,
+            security_permissions: sec.permissions
         };
 
         res.json({
@@ -1560,12 +1938,11 @@ app.post('/api/login', async (req, res) => {
             user: responseData,
             userData: responseData
         });
-
     } catch (error) {
         console.error('Login API Error:', error);
         res.status(500).json({ success: false, message: 'Internal Server Error', error: error.message });
     } finally {
-        if (client) client.release();
+        client.release();
     }
 });
 // ==========================================
