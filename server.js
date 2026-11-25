@@ -1387,6 +1387,7 @@ function verifyRequestJwt(req) {
 }
 
 // 4. ตรวจสอบ 6 มิติสดจากฐานข้อมูล (เป็นใคร / Active ไหม / หมู่บ้านไหน / ใครแนะนำ / ตำแหน่งอนุมัติแล้ว / ได้สิทธิ์อะไร)
+// 4. ตรวจสอบ 6 มิติสดจากฐานข้อมูล (เป็นใคร / Active ไหม / หมู่บ้านไหน / ใครแนะนำ / ตำแหน่งอนุมัติแล้ว / มีมิเตอร์น้ำไหม / ได้สิทธิ์อะไร)
 async function resolveUserSecurityContext(client, accountId) {
     if (!accountId || !isValidUuidV3(accountId)) {
         return { ok: false, code: 401, reason: 'ไม่พบข้อมูลยืนยันตัวตน กรุณาเข้าสู่ระบบใหม่' };
@@ -1444,6 +1445,22 @@ async function resolveUserSecurityContext(client, accountId) {
             const hj = hmRes.rows[0].h_json || {};
             houseNo = hj.house_no || hj.house_number || houseNo;
         }
+    }
+
+    // ตรวจว่าบ้านของบุคคลนี้มีการติดตั้งมิเตอร์น้ำประปาหมู่บ้าน (Active) อยู่จริงหรือไม่
+    let hasWaterMeter = false;
+    if (cleanCid.length === 13 && u.village_id) {
+        const wmRes = await client.query(`
+            SELECT 1
+            FROM water_meters wm
+            JOIN household_members hm ON wm.household_id::text = hm.household_id::text
+            WHERE wm.village_id::text = $1::text
+              AND wm.is_active = true
+              AND hm.status = 'ACTIVE'
+              AND REGEXP_REPLACE(COALESCE(hm.citizen_id::text, ''), '[^0-9]', '', 'g') = $2
+            LIMIT 1
+        `, [u.village_id, cleanCid]).catch(() => ({ rows: [] }));
+        hasWaterMeter = wmRes.rows.length > 0;
     }
 
     const isAccountActive = u.is_active !== false;
@@ -1524,11 +1541,15 @@ async function resolveUserSecurityContext(client, accountId) {
         can_manage_village_core: canOperate && has('VILLAGE_HEADMAN', 'VILLAGE_ADMIN'),
         can_approve_committees: canOperate && has('VILLAGE_HEADMAN'),
         can_manage_water_users: canOperate && has('VILLAGE_HEADMAN', 'VILLAGE_ADMIN', 'WATER_PRESIDENT', 'WATER_TREASURER'),
-        can_view_water_users: canOperate && has('VILLAGE_HEADMAN', 'VILLAGE_ADMIN', 'WATER_PRESIDENT', 'WATER_TREASURER', 'WATER_READER'),
+        // ถอด WATER_READER ออก -> คนจดมิเตอร์ไม่เห็นและเข้า /water-users ไม่ได้
+        can_view_water_users: canOperate && has('VILLAGE_HEADMAN', 'VILLAGE_ADMIN', 'WATER_PRESIDENT', 'WATER_TREASURER'),
         can_record_water_bills: canOperate && has('VILLAGE_HEADMAN', 'VILLAGE_ADMIN', 'WATER_PRESIDENT', 'WATER_TREASURER', 'WATER_READER'),
         can_manage_water_settings: canOperate && has('VILLAGE_HEADMAN', 'WATER_PRESIDENT', 'WATER_TREASURER'),
         can_approve_water_rates: canOperate && has('VILLAGE_HEADMAN', 'WATER_PRESIDENT'),
-        can_view_my_water_bills: canOperate,
+        // เห็นและเข้าหน้า /my-water-bills ได้เฉพาะบ้านที่มีมิเตอร์น้ำจริง (หรือ Super Admin)
+        can_view_my_water_bills: canOperate && (isSuperAdmin || hasWaterMeter),
+        // สิทธิ์แจ้งโอน/รับชำระค่าน้ำ (ให้ทั้งบ้านที่มีมิเตอร์และเจ้าหน้าที่ประปา)
+        can_pay_water_bill: canOperate && (isSuperAdmin || hasWaterMeter || has('VILLAGE_HEADMAN', 'VILLAGE_ADMIN', 'WATER_PRESIDENT', 'WATER_TREASURER', 'WATER_READER')),
         can_manage_places: canOperate && (has('VILLAGE_HEADMAN', 'VILLAGE_ADMIN', 'PLACE_GOV_HEAD', 'PLACE_BIZ_OWNER') || ['BIZ_SHOP', 'BIZ_HOTEL'].includes(u.tier_code))
     };
 
@@ -1571,6 +1592,7 @@ async function resolveUserSecurityContext(client, accountId) {
             is_active: isAccountActive && isHouseholdActive,
             account_status: isAccountActive ? 'ACTIVE' : 'INACTIVE',
             household_status: householdStatus,
+            has_water_meter: hasWaterMeter,
             is_super_admin: isSuperAdmin,
             is_headman: isHeadman,
             role: u.role || 'CITIZEN',
@@ -1588,7 +1610,6 @@ async function resolveUserSecurityContext(client, accountId) {
         }
     };
 }
-
 // 5. Middleware กั้นเขตหมู่บ้าน (80,000 หมู่บ้านไม่ปนกัน 100%) + ตรวจสิทธิ์สด + บันทึก Audit Log
 function requireVillageGuard(permissionKey, actionName) {
     return async (req, res, next) => {
@@ -1945,12 +1966,10 @@ app.post('/api/login', async (req, res) => {
         client.release();
     }
 });
-
 // ==========================================
-// 🌟 API ดึงเมนู Sidebar แบบ Dynamic ตามสิทธิ์จริงที่ได้รับอนุมัติ + คืนค่าตัวตน 6 มิติ
+// 🌟 API ดึงเมนู Sidebar แบบ Dynamic ตามสิทธิ์จริงที่ได้รับอนุมัติ + ซ่อนบิลน้ำถ้าบ้านไม่มีมิเตอร์
 // ==========================================
 app.get('/api/sidebar-menus/:accountId', async (req, res) => {
-    // บังคับยึดตัวตนจาก JWT Token ก่อนเสมอ (ป้องกันปลอม accountId ใน URL)
     const decoded = verifyRequestJwt(req);
     const targetAccountId = decoded?.account_id || req.params.accountId;
 
@@ -1972,7 +1991,6 @@ app.get('/api/sidebar-menus/:accountId', async (req, res) => {
         let menuRows = [];
 
         if (ctx.is_super_admin) {
-            // Super Admin เห็นทุกเมนูของแอป BANRAO_WEB
             const mRes = await client.query(`
                 SELECT
                     m.menu_id, m.group_id, COALESCE(g.group_name, 'เมนูระบบ') AS group_name,
@@ -1989,7 +2007,6 @@ app.get('/api/sidebar-menus/:accountId', async (req, res) => {
             `);
             menuRows = mRes.rows;
         } else {
-            // ประชาชน / กรรมการ / ผู้ใหญ่บ้าน: รวมสิทธิ์จาก tier_code + role_template_code ที่อนุมัติแล้วเท่านั้น
             const mRes = await client.query(`
                 SELECT
                     m.menu_id,
@@ -2021,12 +2038,17 @@ app.get('/api/sidebar-menus/:accountId', async (req, res) => {
             menuRows = mRes.rows;
         }
 
-        // จัดกลุ่มเมนูส่งให้ Sidebar.jsx ในรูปแบบเดิม 100% + สร้าง permissionsMap
         const groupMap = new Map();
         const permissionsMap = {};
 
         for (const r of menuRows) {
             if (!r.route_path) continue;
+
+            // ซ่อนเมนู "บิลล์ค่าน้ำ" อัตโนมัติ หากบ้านของบุคคลนี้ไม่ได้ติดตั้งมิเตอร์น้ำ
+            if (!ctx.is_super_admin && r.route_path === '/my-water-bills' && !ctx.has_water_meter) {
+                continue;
+            }
+
             if (!groupMap.has(r.group_id)) {
                 groupMap.set(r.group_id, {
                     group_id: r.group_id,
