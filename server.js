@@ -59,6 +59,99 @@ const pgPool = new Pool({
     }
 });
 
+
+// =========================================================================
+// 🚀 ระบบ Presigned URL กลางสำหรับอัปโหลดตรงเข้า Cloudflare R2 (น้ำประปา + App Chat)
+// =========================================================================
+const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
+const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
+
+let r2ClientInstance = null;
+function getR2Client() {
+    if (r2ClientInstance) return r2ClientInstance;
+    const accountId = process.env.CF_ACCOUNT_ID;
+    const accessKeyId = process.env.R2_ACCESS_KEY_ID;
+    const secretAccessKey = process.env.R2_SECRET_ACCESS_KEY;
+
+    if (!accountId || !accessKeyId || !secretAccessKey) {
+        throw new Error('ยังไม่ได้ตั้งค่า CF_ACCOUNT_ID / R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY ใน Railway');
+    }
+
+    r2ClientInstance = new S3Client({
+        region: 'auto',
+        endpoint: `https://${accountId}.r2.cloudflarestorage.com`,
+        credentials: { accessKeyId, secretAccessKey },
+        // สำคัญมาก: ป้องกัน AWS SDK รุ่นใหม่แนบ Checksum Header จนติด CORS บน Cloudflare R2
+        requestChecksumCalculation: 'WHEN_REQUIRED',
+        responseChecksumValidation: 'WHEN_REQUIRED'
+    });
+    return r2ClientInstance;
+}
+
+const ALLOWED_R2_FOLDERS = new Set([
+    'water/meters',
+    'water/bills',
+    'water/slips',
+    'chat/images',
+    'chat/files',
+    'chat/voice'
+]);
+
+app.post('/api/media/presign', async (req, res) => {
+    try {
+        const decoded = verifyRequestJwt(req);
+        const actorId = decoded?.account_id || req.headers['x-account-id'];
+        if (!actorId) {
+            return res.status(401).json({ success: false, message: 'กรุณาเข้าสู่ระบบก่อนอัปโหลดไฟล์' });
+        }
+
+        const bucket = process.env.R2_BUCKET_NAME;
+        const publicBaseUrl = String(process.env.R2_PUBLIC_URL || '').replace(/\/+$/, '');
+        if (!bucket || !publicBaseUrl) {
+            return res.status(500).json({ success: false, message: 'ยังไม่ได้ตั้งค่า R2_BUCKET_NAME หรือ R2_PUBLIC_URL' });
+        }
+
+        const folder = ALLOWED_R2_FOLDERS.has(req.body?.folder) ? req.body.folder : 'water/bills';
+        const contentType = String(req.body?.contentType || 'image/jpeg').trim();
+        const extMap = {
+            'image/jpeg': 'jpg',
+            'image/jpg': 'jpg',
+            'image/png': 'png',
+            'image/webp': 'webp',
+            'audio/webm': 'webm',
+            'audio/mp4': 'm4a',
+            'application/pdf': 'pdf'
+        };
+        const ext = extMap[contentType.toLowerCase()] || 'jpg';
+        const now = new Date();
+        const ym = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+        const rand = Math.random().toString(36).slice(2, 8);
+        const prefix = String(req.body?.prefix || 'file').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 30) || 'file';
+
+        // จัดโครงสร้างโฟลเดอร์แยกตามเดือน เช่น water/bills/2026-11/meter-1764...jpg
+        const objectKey = `${folder}/${ym}/${prefix}-${Date.now()}-${rand}.${ext}`;
+
+        const client = getR2Client();
+        const command = new PutObjectCommand({
+            Bucket: bucket,
+            Key: objectKey,
+            ContentType: contentType
+        });
+
+        const uploadUrl = await getSignedUrl(client, command, { expiresIn: 300 });
+        const publicUrl = `${publicBaseUrl}/${objectKey}`;
+
+        res.json({
+            success: true,
+            uploadUrl,
+            publicUrl,
+            key: objectKey
+        });
+    } catch (err) {
+        console.error('R2 Presign Error:', err);
+        res.status(500).json({ success: false, message: 'สร้างลิงก์อัปโหลด R2 ไม่สำเร็จ: ' + err.message });
+    }
+});
 // ==========================================
 // API: บันทึกข้อมูลหมู่บ้านแบบ Batch (อัปเดตชื่อตารางเป็น villages)
 // ==========================================
