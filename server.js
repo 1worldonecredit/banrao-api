@@ -9720,15 +9720,34 @@ app.get('/api/villages/:villageId/registration-readiness', async (req, res) => {
         const uaJson = row.ua_json || {};
         const upJson = row.up_json || {};
 
-        // เช็กข้อ 1: รูปโปรไฟล์ผู้ใหญ่บ้าน
-        const avatarUrl =
+        // เช็กข้อ 1: รูปโปรไฟล์ผู้ใหญ่บ้าน (รองรับ user_image, avatar_url, profile_image และตารางสื่อโปรไฟล์)
+        let avatarUrl =
+            upJson.user_image ||
             upJson.avatar_url ||
             upJson.profile_image ||
             upJson.photo_url ||
             upJson.image_url ||
+            uaJson.user_image ||
             uaJson.avatar_url ||
             '';
-        const step1Done = Boolean(String(avatarUrl).trim());
+
+        if (!String(avatarUrl).trim() && (upJson.profile_id || row.headman_acc_id)) {
+            try {
+                const mediaRes = await client.query(`
+                    SELECT media_url
+                    FROM citizen_profiles_media
+                    WHERE profile_id::text = COALESCE($1::text, '')
+                    ORDER BY created_at DESC NULLS LAST
+                    LIMIT 1
+                `, [upJson.profile_id || null]);
+                if (mediaRes.rows[0]?.media_url) {
+                    avatarUrl = mediaRes.rows[0].media_url;
+                }
+            } catch (_) {}
+        }
+
+        const cleanAvatar = String(avatarUrl || '').trim();
+        const step1Done = Boolean(cleanAvatar && !cleanAvatar.endsWith('/profile-img.jpg'));
 
         // เช็กข้อ 2: จำนวนครัวเรือน และจำนวนประชากรในหมู่บ้าน
         const targetHouseholds = Number(
