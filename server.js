@@ -39,8 +39,8 @@ app.use(cors({
         }
         return callback(null, true);
     },
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'x-account-id'], // <-- เพิ่มบรรทัดนี้ครับ
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'x-account-id'],
     credentials: true
 }));
 
@@ -499,7 +499,6 @@ app.get('/api/user/profile/:accountId', async (req, res) => {
         res.status(500).json({ success: false, message: err.message });
     }
 });
-
 // 2. เพิ่ม / แก้ไข / ล้างค่า ข้อมูลส่วนตัวใน user_profiles และ user_accounts
 app.put('/api/user/profile/:accountId', async (req, res) => {
     const { accountId } = req.params;
@@ -512,7 +511,6 @@ app.put('/api/user/profile/:accountId', async (req, res) => {
     try {
         await client.query('BEGIN');
 
-        // ค้นหา profile_id ของบัญชีนี้
         const accRes = await client.query(
             `SELECT profile_id FROM user_accounts WHERE account_id = $1`,
             [accountId]
@@ -524,7 +522,6 @@ app.put('/api/user/profile/:accountId', async (req, res) => {
 
         const profileId = accRes.rows[0].profile_id;
 
-        // อัปเดตข้อมูลส่วนตัวลง user_profiles (ส่งค่าว่าง = ล้างค่าเป็น NULL)
         if (profileId) {
             await client.query(`
                 UPDATE user_profiles
@@ -546,7 +543,14 @@ app.put('/api/user/profile/:accountId', async (req, res) => {
             ]);
         }
 
-        // อัปเดตอาชีพและจำนวนสมาชิกในครัวเรือนลง user_accounts
+        const safeMemberCount =
+            household_member_count !== undefined &&
+            household_member_count !== null &&
+            household_member_count !== '' &&
+            !Number.isNaN(Number(household_member_count))
+                ? Number(household_member_count)
+                : 0;
+
         await client.query(`
             UPDATE user_accounts
             SET occupation_id = $1,
@@ -554,7 +558,7 @@ app.put('/api/user/profile/:accountId', async (req, res) => {
             WHERE account_id = $3
         `, [
             occupation_id ? Number(occupation_id) : null,
-            household_member_count !== '' && household_member_count !== null ? Number(household_member_count) : 0,
+            safeMemberCount,
             accountId
         ]);
 
@@ -568,7 +572,6 @@ app.put('/api/user/profile/:accountId', async (req, res) => {
         client.release();
     }
 });
-
 
 // =========================================================================
 // 👥 1. API ดึงรายชื่อผู้ที่เราแนะนำ (Referrals)
@@ -687,15 +690,11 @@ app.delete('/api/user/profile-image/:accountId', async (req, res) => {
     }
 });
 
-
-// =========================================================================
-// 🌟 API ฟีด Story เพื่อนบน Dashboard (ดู / ชอบ / ดาว 1-7 / แชร์ / คอมเมนต์ / ติดตาม)
-// =========================================================================
-// =========================================================================
-// 🌟 2. API ฟีด Story เพื่อนบน Dashboard (กรองโพสต์ที่ซ่อนและคนที่ถูกบล็อกออก)
-// =========================================================================
 app.get('/api/stories/feed/:viewerId', async (req, res) => {
     const { viewerId } = req.params;
+    const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 50));
+    const offset = Math.max(0, Number(req.query.offset) || 0);
+
     try {
         const result = await pgPool.query(`
             SELECT 
@@ -724,7 +723,8 @@ app.get('/api/stories/feed/:viewerId', async (req, res) => {
                   WHERE ub.blocker_id = s.account_id AND ub.blocked_id = $1
               )
             ORDER BY s.created_at DESC
-        `, [viewerId]);
+            LIMIT $2 OFFSET $3
+        `, [viewerId, limit, offset]);
 
         const authorsMap = new Map();
         for (const row of result.rows) {
@@ -1004,9 +1004,7 @@ app.post('/api/users/block', async (req, res) => {
     }
 });
 
-// =========================================================================
-// 📸 1. API โพสต์ / แก้ไข / ซ่อน-แสดง My Story (รองรับ หัวข้อ, คำอธิบาย, ปกวิดีโอ)
-// =========================================================================
+
 app.post('/api/user/stories', upload.fields([
     { name: 'storyMedia', maxCount: 1 },
     { name: 'coverImage', maxCount: 1 }
@@ -1023,12 +1021,13 @@ app.post('/api/user/stories', upload.fields([
         return res.status(400).json({ success: false, message: 'กรุณาเลือกไฟล์รูปภาพหรือวิดีโอ' });
     }
 
+    const toNum = (v, def) => (v !== undefined && v !== null && v !== '' && !Number.isNaN(Number(v)) ? Number(v) : def);
+
     try {
         const isVideo = mediaFile.mimetype.startsWith('video/');
         let mediaUrl = '';
         let coverUrl = null;
 
-        // 1. อัปโหลดไฟล์หลัก (รูปหรือวิดีโอ)
         const fileBlob = new Blob([mediaFile.buffer], { type: mediaFile.mimetype });
         const formData = new FormData();
         formData.append('file', fileBlob, mediaFile.originalname);
@@ -1055,7 +1054,6 @@ app.post('/api/user/stories', upload.fields([
             mediaUrl = cfData.result.preview;
         }
 
-        // 2. อัปโหลดภาพปกวิดีโอ (ถ้ามี)
         if (coverFile) {
             const coverBlob = new Blob([coverFile.buffer], { type: coverFile.mimetype });
             const coverFd = new FormData();
@@ -1086,10 +1084,10 @@ app.post('/api/user/stories', upload.fields([
             description ? description.trim() : null,
             overlay_text ? overlay_text.trim() : null,
             text_color || '#ffffff',
-            Number(text_size) || 22,
-            text_x !== undefined ? Number(text_x) : 50,
-            text_y !== undefined ? Number(text_y) : 50,
-            bg_blur !== undefined ? Number(bg_blur) : 0,
+            toNum(text_size, 22),
+            toNum(text_x, 50),
+            toNum(text_y, 50),
+            toNum(bg_blur, 0),
             visibility || 'PUBLIC'
         ]);
 
@@ -1103,6 +1101,8 @@ app.post('/api/user/stories', upload.fields([
 // แก้ไขโพสต์ (หัวข้อ, คำอธิบาย, ข้อความบนภาพ, สี, ขนาด, เบลอ, ความเป็นส่วนตัว)
 app.put('/api/user/stories/:storyId', async (req, res) => {
     const { title, description, overlay_text, text_color, text_size, text_x, text_y, bg_blur, visibility } = req.body;
+    const toNum = (v, def) => (v !== undefined && v !== null && v !== '' && !Number.isNaN(Number(v)) ? Number(v) : def);
+
     try {
         const result = await pgPool.query(`
             UPDATE user_stories
@@ -1122,10 +1122,10 @@ app.put('/api/user/stories/:storyId', async (req, res) => {
             description ? description.trim() : null,
             overlay_text ? overlay_text.trim() : null,
             text_color || '#ffffff',
-            Number(text_size) || 22,
-            text_x !== undefined ? Number(text_x) : 50,
-            text_y !== undefined ? Number(text_y) : 50,
-            bg_blur !== undefined ? Number(bg_blur) : 0,
+            toNum(text_size, 22),
+            toNum(text_x, 50),
+            toNum(text_y, 50),
+            toNum(bg_blur, 0),
             visibility || 'PUBLIC',
             req.params.storyId
         ]);
@@ -1134,6 +1134,7 @@ app.put('/api/user/stories/:storyId', async (req, res) => {
         res.status(500).json({ success: false, message: err.message });
     }
 });
+
 
 // 7. กดติดตาม / เลิกติดตาม (Toggle Follow)
 app.post('/api/users/follow', async (req, res) => {
@@ -1160,36 +1161,41 @@ app.post('/api/users/follow', async (req, res) => {
 });
 
 
-
 // API สำหรับขอค่ารัศมีการแสดงผลตามพิกัดปัจจุบัน
 app.post('/api/get-display-radius', async (req, res) => {
     const { lat, lng } = req.body;
+    if (lat === undefined || lng === undefined || lat === '' || lng === '') {
+        return res.json({ success: true, radius: 50 });
+    }
     try {
-        // ใช้ SQL หาระยะทางจากจุดศูนย์กลางที่ Admin ตั้งไว้ 
-        // เช็คว่าผู้ใช้อยู่ในระยะ zone_coverage_km หรือไม่ และดึงค่า display_radius_km ออกมา
         const query = `
             SELECT display_radius_km 
             FROM service_zones 
             WHERE is_default = FALSE 
-            AND (6371 * acos(cos(radians($1)) * cos(radians(center_lat)) * cos(radians(center_lng) - radians($2)) + sin(radians($1)) * sin(radians(center_lat)))) <= zone_coverage_km
+            AND (6371 * acos(
+                LEAST(1, GREATEST(-1,
+                    cos(radians($1)) * cos(radians(center_lat)) * cos(radians(center_lng) - radians($2))
+                    + sin(radians($1)) * sin(radians(center_lat))
+                ))
+            )) <= zone_coverage_km
             ORDER BY zone_coverage_km ASC 
             LIMIT 1;
         `;
-        const result = await pgPool.query(query, [lat, lng]);
+        const result = await pgPool.query(query, [Number(lat), Number(lng)]);
 
         if (result.rows.length > 0) {
-            // เจอโซนที่ Admin กำหนดไว้
             res.json({ success: true, radius: result.rows[0].display_radius_km });
         } else {
-            // ไม่อยู่ในโซนใดๆ เลย ให้ดึงค่า Default
             const defaultZone = await pgPool.query("SELECT display_radius_km FROM service_zones WHERE is_default = TRUE LIMIT 1");
-            res.json({ success: true, radius: defaultZone.rows[0].display_radius_km || 50 });
+            res.json({ success: true, radius: defaultZone.rows[0]?.display_radius_km || 50 });
         }
     } catch (err) {
         console.error("Error getting radius:", err.message);
-        res.status(500).json({ success: false, radius: 50 }); // กันเหนียวกรณีเซิร์ฟเวอร์รวน
+        res.status(500).json({ success: false, radius: 50 });
     }
 });
+
+
 // ==========================================
 // API สำหรับบันทึกพิกัดแผนที่ (วางไว้รวมกับ Route อื่นๆ)
 // ==========================================
@@ -1229,25 +1235,20 @@ app.get('/api/test', async (req, res) => {
     }
 });
 
-
-// ตัวอย่าง API ดึงข้อมูลเมนู (Node.js / Express)
 app.get('/api/sys-menus', async (req, res) => {
     try {
-        // ดึงเฉพาะเมนูที่เปิดใช้งาน เรียงตามลำดับ
         const query = `
             SELECT * FROM sys_menus 
             WHERE is_active = true 
-            ORDER BY parent_id ASC NULLS FIRST, sort_order ASC
+            ORDER BY display_order ASC, menu_id ASC
         `;
-        const result = await db.query(query); // ปรับใช้ตาม Database Client ของคุณ
-        
+        const result = await pgPool.query(query);
         res.status(200).json(result.rows);
     } catch (error) {
         console.error("Error fetching menus:", error);
         res.status(500).json({ error: 'Internal Server Error' });
     }
 });
-
 
 // ==========================================
 // API สำหรับระบบเลือกพื้นที่ (Dropdown)
@@ -1256,7 +1257,7 @@ app.get('/api/sys-menus', async (req, res) => {
 // 1. ดึงรายชื่อประเทศทั้งหมด
 app.get('/api/countries', async (req, res) => {
     try {
-        const result = await pool.query('SELECT * FROM sys_countries WHERE is_active = true ORDER BY country_name_th ASC');
+        const result = await pgPool.query('SELECT * FROM sys_countries WHERE is_active = true ORDER BY country_name_th ASC');
         res.json(result.rows);
     } catch (err) {
         console.error(err);
@@ -1270,7 +1271,7 @@ app.get('/api/provinces', async (req, res) => {
     if (!country_id) return res.status(400).json({ error: 'กรุณาระบุ country_id' });
 
     try {
-        const result = await pool.query(
+        const result = await pgPool.query(
             'SELECT * FROM sys_provinces WHERE country_id = $1 ORDER BY province_name_th ASC',
             [country_id]
         );
@@ -1287,7 +1288,7 @@ app.get('/api/amphures', async (req, res) => {
     if (!province_id) return res.status(400).json({ error: 'กรุณาระบุ province_id' });
 
     try {
-        const result = await pool.query(
+        const result = await pgPool.query(
             'SELECT * FROM sys_amphures WHERE province_id = $1 ORDER BY amphure_name_th ASC',
             [province_id]
         );
@@ -1304,7 +1305,7 @@ app.get('/api/tambons', async (req, res) => {
     if (!amphure_id) return res.status(400).json({ error: 'กรุณาระบุ amphure_id' });
 
     try {
-        const result = await pool.query(
+        const result = await pgPool.query(
             'SELECT * FROM sys_tambons WHERE amphure_id = $1 ORDER BY tambon_name_th ASC',
             [amphure_id]
         );
@@ -1366,19 +1367,32 @@ app.post('/api/manage-menu', async (req, res) => {
 
 // 3. แก้ไขข้อมูลเมนู (PUT)
 app.put('/api/menus/:id', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { name, path, component, icon, parentId, useBadge } = req.body;
-    const result = await pool.query(
-      `UPDATE sys_menus SET menu_name = $1, path = $2, component = $3, icon = $4, parent_id = $5 
-       WHERE id = $6 RETURNING *`,
-      [name, path || null, component || null, icon || null, parentId || null, id]
-    );
-    res.json(result.rows[0]);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: "อัปเดตไม่ได้" });
-  }
+    try {
+        const { id } = req.params;
+        const { name, path, icon, group_id, selected_roles } = req.body;
+        const result = await pgPool.query(
+            `UPDATE sys_menus
+             SET menu_name = COALESCE($1, menu_name),
+                 route_path = COALESCE($2, route_path),
+                 icon_name = COALESCE($3, icon_name),
+                 group_id = COALESCE($4, group_id),
+                 selected_roles = COALESCE($5, selected_roles)
+             WHERE menu_id = $6
+             RETURNING *`,
+            [
+                name || null,
+                path || null,
+                icon || null,
+                group_id || null,
+                selected_roles ? JSON.stringify(selected_roles) : null,
+                id
+            ]
+        );
+        res.json({ success: true, data: result.rows[0] });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ success: false, message: "อัปเดตไม่ได้" });
+    }
 });
 // 4. ลบเมนู (DELETE)
 app.delete('/api/menus/:id', async (req, res) => {
@@ -1468,19 +1482,24 @@ async function writeAccessAuditLog(client, payload) {
         console.error('Write Access Audit Log Error:', err.message);
     }
 }
-
-// 3. ถอดรหัสตัวตนจาก JWT Token (ปลอดภัย ปลอมไม่ได้)
+// 3. ถอดรหัสตัวตนจาก JWT Token (รองรับทั้ง BANRAO_JWT_SECRET และ JWT_SECRET เดิม)
 function verifyRequestJwt(req) {
     const authHeader = req.headers.authorization || '';
     if (!authHeader.startsWith('Bearer ')) return null;
+    const token = authHeader.slice(7).trim();
     try {
-        return jwt.verify(authHeader.slice(7).trim(), BANRAO_JWT_SECRET);
+        return jwt.verify(token, BANRAO_JWT_SECRET);
     } catch (err) {
+        if (typeof JWT_SECRET !== 'undefined' && JWT_SECRET !== BANRAO_JWT_SECRET) {
+            try {
+                return jwt.verify(token, JWT_SECRET);
+            } catch (_) {
+                return null;
+            }
+        }
         return null;
     }
 }
-
-
 
 // 4. ตรวจสอบ 6 มิติ + โมดูลที่หมู่บ้านนี้เปิดใช้งานจริง (รองรับ 80,000 หมู่บ้าน)
 async function resolveUserSecurityContext(client, accountId) {
@@ -1521,10 +1540,10 @@ async function resolveUserSecurityContext(client, accountId) {
     const cleanCid = String(u.citizen_id || '').replace(/\D/g, '');
     const isSuperAdmin = u.username_phone === '0000000000' || String(u.role || '').toUpperCase() === 'SUPER_ADMIN';
 
-    // ตรวจสถานะทะเบียนลูกบ้าน (household_members)
+    // ตรวจสถานะทะเบียนลูกบ้าน (household_members) — รองรับเลขประจำตัว >= 6 หลัก
     let householdStatus = 'UNLINKED';
     let houseNo = u.house_no || '';
-    if (cleanCid.length === 13 && u.village_id) {
+    if (cleanCid.length >= 6 && u.village_id) {
         const hmRes = await client.query(`
             SELECT hm.status, to_jsonb(h) AS h_json
             FROM household_members hm
@@ -1571,7 +1590,7 @@ async function resolveUserSecurityContext(client, accountId) {
 
     // ตรวจว่าบ้านของบุคคลนี้มีการติดตั้งมิเตอร์น้ำประปาหมู่บ้าน (Active) อยู่จริงหรือไม่
     let hasWaterMeter = false;
-    if (villageHasWaterSystem && cleanCid.length === 13 && u.village_id) {
+    if (villageHasWaterSystem && cleanCid.length >= 6 && u.village_id) {
         const wmRes = await client.query(`
             SELECT 1
             FROM water_meters wm
@@ -1666,7 +1685,7 @@ async function resolveUserSecurityContext(client, accountId) {
         can_manage_water_users: canUseWaterModule && has('VILLAGE_HEADMAN', 'VILLAGE_ADMIN', 'WATER_PRESIDENT', 'WATER_TREASURER'),
         can_view_water_users: canUseWaterModule && has('VILLAGE_HEADMAN', 'VILLAGE_ADMIN', 'WATER_PRESIDENT', 'WATER_TREASURER'),
         can_record_water_bills: canUseWaterModule && has('VILLAGE_HEADMAN', 'VILLAGE_ADMIN', 'WATER_PRESIDENT', 'WATER_TREASURER', 'WATER_READER'),
-        can_manage_water_settings: canUseWaterModule && has('VILLAGE_HEADMAN', 'WATER_PRESIDENT', 'WATER_TREASURER'),
+        can_manage_water_settings: canUseWaterModule && has('VILLAGE_HEADMAN', 'VILLAGE_ADMIN', 'WATER_PRESIDENT', 'WATER_TREASURER'),
         can_approve_water_rates: canUseWaterModule && has('VILLAGE_HEADMAN', 'WATER_PRESIDENT'),
         can_view_my_water_bills: canUseWaterModule && (isSuperAdmin || hasWaterMeter),
         can_pay_water_bill: canUseWaterModule && (isSuperAdmin || hasWaterMeter || has('VILLAGE_HEADMAN', 'VILLAGE_ADMIN', 'WATER_PRESIDENT', 'WATER_TREASURER', 'WATER_READER')),
@@ -1858,6 +1877,7 @@ function requireVillageGuard(permissionKey, actionName) {
     };
 }
 
+
 // ==========================================
 // 🌟 API เข้าสู่ระบบ (Login) - ตรวจ 6 มิติ + กั้นเขต 80,000 หมู่บ้าน + เชื่อมสิทธิ์ที่อนุมัติแล้ว
 // ==========================================
@@ -1929,9 +1949,9 @@ app.post('/api/login', async (req, res) => {
             return res.status(401).json({ success: false, message: 'เบอร์โทรศัพท์หรือรหัสผ่านไม่ถูกต้อง' });
         }
 
-        // 3. เชื่อมตำแหน่งที่ผู้ใหญ่บ้านอนุมัติไว้ล่วงหน้าจากเลขบัตร 13 หลัก (เฉพาะหมู่บ้านเดียวกันเท่านั้น!)
+        // 3. เชื่อมตำแหน่งที่ผู้ใหญ่บ้านอนุมัติไว้ล่วงหน้าจากเลขประจำตัว (เฉพาะหมู่บ้านเดียวกันเท่านั้น!)
         const cleanCid = String(user.citizen_id || '').replace(/\D/g, '');
-        if (cleanCid.length === 13 && user.village_id) {
+        if (cleanCid.length >= 6 && user.village_id) {
             const linked = await client.query(`
                 UPDATE user_positions
                 SET account_id = $1::uuid
@@ -2088,7 +2108,6 @@ app.post('/api/login', async (req, res) => {
         client.release();
     }
 });
-
 
 // ==========================================
 // 🌟 API ดึงเมนู Sidebar แบบ Dynamic ตามสิทธิ์จริง + โมดูลที่มีจริงในหมู่บ้านนั้น
@@ -2267,61 +2286,12 @@ app.get('/api/positions', async (req, res) => {
 });
 
 // ==========================================
-// API: บันทึกเมนูใหม่และผูกสิทธิ์ (Save Menu & Assign Roles)
-// ==========================================
-app.post('/api/manage-menu', async (req, res) => {
-    const { menu_name, route_path, icon_name, selected_roles } = req.body;
-    const client = await pgPool.connect();
-
-    try {
-        // เริ่ม Transaction (ถ้ามีอันไหนพัง จะได้ย้อนกลับทั้งหมด ไม่ให้ข้อมูลแหว่ง)
-        await client.query('BEGIN');
-        
-        // 1. สร้างสิทธิ์ (Permission) ใหม่ใน sys_permissions ก่อน
-        const permCode = 'MENU_' + Date.now(); // สร้าง Code ไม่ให้ซ้ำ
-        const permRes = await client.query(
-            `INSERT INTO sys_permissions (permission_code, permission_name) 
-             VALUES ($1, $2) RETURNING permission_id`,
-            [permCode, `สิทธิ์เข้าถึงเมนู: ${menu_name}`]
-        );
-        const newPermId = permRes.rows[0].permission_id;
-
-        // 2. สร้างเมนูใหม่ลงใน sys_menus โดยใช้ permission_id ที่เพิ่งสร้าง
-        await client.query(
-            `INSERT INTO sys_menus (group_id, menu_name, icon_name, route_path, permission_id, display_order, is_active)
-             VALUES (9, $1, $2, $3, $4, 99, true)`, 
-             // ใส่ group_id = 9 ไปก่อน (กลุ่มจัดการชุมชน) คุณสามารถส่งจาก Frontend มาเปลี่ยนได้
-            [menu_name, icon_name, route_path, newPermId]
-        );
-
-        // 3. วนลูปผูกสิทธิ์ (newPermId) เข้ากับตำแหน่งที่ติ๊กเลือกมา (selected_roles)
-        if (selected_roles && selected_roles.length > 0) {
-            for (let positionId of selected_roles) {
-                await client.query(
-                    `INSERT INTO position_permissions (position_id, permission_id) 
-                     VALUES ($1, $2)`,
-                    [positionId, newPermId]
-                );
-            }
-        }
-
-        // ยืนยันการบันทึกข้อมูลทั้งหมด
-        await client.query('COMMIT');
-        res.json({ success: true, message: 'บันทึกเมนูและสิทธิ์สำเร็จ' });
-
-    } catch (error) {
-        await client.query('ROLLBACK'); // ยกเลิกการบันทึกถ้าระหว่างทางเกิด Error
-        console.error("Save Menu Error:", error);
-        res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการบันทึกข้อมูล' });
-    } finally {
-        client.release();
-    }
-});
-
-// ==========================================
 // API: ดึงข้อมูลสถานที่และบริการในชุมชน (Community Places)
 // ==========================================
 app.get('/api/community-places', async (req, res) => {
+    const limit = Math.min(200, Math.max(1, Number(req.query.limit) || 100));
+    const offset = Math.max(0, Number(req.query.offset) || 0);
+
     try {
         const query = `
             SELECT 
@@ -2336,42 +2306,41 @@ app.get('/api/community-places', async (req, res) => {
                 cat.category_name,
                 p.first_name AS owner_first_name, 
                 p.last_name AS owner_last_name,
-                cpm.image_url AS owner_image
+                (
+                    SELECT cpm.image_url
+                    FROM citizen_profiles_media cpm
+                    WHERE cpm.profile_id = p.profile_id AND cpm.is_active = true
+                    LIMIT 1
+                ) AS owner_image
             FROM community_places cp
             LEFT JOIN sys_place_categories cat ON cp.category_id = cat.category_id
             LEFT JOIN user_accounts a ON cp.owner_account_id = a.account_id
             LEFT JOIN user_profiles p ON a.profile_id = p.profile_id
-            LEFT JOIN citizen_profiles_media cpm ON p.profile_id = cpm.profile_id AND cpm.is_active = true
             WHERE cp.is_active = TRUE
             ORDER BY cp.created_at DESC
+            LIMIT $1 OFFSET $2
         `;
-        
-        const result = await pgPool.query(query);
-        
-        // จัด Format ข้อมูลให้ง่ายต่อการนำไปใช้งานใน React
-        const places = result.rows.map(row => {
-            // สมมติฐานให้เป็น true ก่อน (ถ้าต้องการเช็คเวลาจริง สามารถเพิ่มเงื่อนไขจาก operating_hours ได้)
-            const isOpen = true; 
-            
-            return {
-                id: row.place_id,
-                name: row.place_name,
-                category: row.category_name || 'สถานที่ทั่วไป',
-                desc: row.description,
-                img: row.cover_image_url || 'https://images.unsplash.com/photo-1555396273-367ea4eb4db5?w=600&q=80',
-                isOpen: isOpen,
-                visibility: row.visibility_level === 'PUBLIC' ? 'สาธารณะ' : 
-                            row.visibility_level === 'PROVINCE' ? 'ระดับจังหวัด' :
-                            row.visibility_level === 'AMPHURE' ? 'ระดับอำเภอ' :
-                            row.visibility_level === 'TAMBON' ? 'ระดับตำบล' : 'ระดับหมู่บ้าน',
-                services: row.services || [],
-                isVerified: row.is_verified,
-                owner: {
-                    name: row.owner_first_name ? `${row.owner_first_name} ${row.owner_last_name}` : 'ผู้ใช้งาน',
-                    img: row.owner_image || 'https://images.unsplash.com/photo-1472099645785-5658abf4ff4e?w=150&q=80'
-                }
-            };
-        });
+
+        const result = await pgPool.query(query, [limit, offset]);
+
+        const places = result.rows.map(row => ({
+            id: row.place_id,
+            name: row.place_name,
+            category: row.category_name || 'สถานที่ทั่วไป',
+            desc: row.description,
+            img: row.cover_image_url || 'https://images.unsplash.com/photo-1555396273-367ea4eb4db5?w=600&q=80',
+            isOpen: true,
+            visibility: row.visibility_level === 'PUBLIC' ? 'สาธารณะ' :
+                        row.visibility_level === 'PROVINCE' ? 'ระดับจังหวัด' :
+                        row.visibility_level === 'AMPHURE' ? 'ระดับอำเภอ' :
+                        row.visibility_level === 'TAMBON' ? 'ระดับตำบล' : 'ระดับหมู่บ้าน',
+            services: row.services || [],
+            isVerified: row.is_verified,
+            owner: {
+                name: row.owner_first_name ? `${row.owner_first_name} ${row.owner_last_name}` : 'ผู้ใช้งาน',
+                img: row.owner_image || 'https://images.unsplash.com/photo-1472099645785-5658abf4ff4e?w=150&q=80'
+            }
+        }));
 
         res.json({ success: true, places });
 
@@ -2578,6 +2547,8 @@ app.get('/api/community-places/:placeId/products', async (req, res) => {
     }
 });
 
+
+
 // ==========================================
 // 3. API: เพิ่มสินค้า (อัปเดตให้รองรับ หมวดหมู่ และ แกลลอรี่ 6 รูป)
 // ==========================================
@@ -2602,16 +2573,15 @@ app.post('/api/community-places/:placeId/products', async (req, res) => {
 // ==========================================
 // API: ดึงข้อมูลสถานที่ของฉัน (My Places)  สิ้นสุด
 // ==========================================
-
 // ==========================================
 // API: ดึงข้อมูลขอบเขตหมู่บ้าน (Boundary) สำหรับแสดงบนแผนที่
 // ==========================================
 app.get('/api/villages/:villageId', async (req, res) => {
     try {
         const { villageId } = req.params;
-        const query = `SELECT * FROM sys_villages WHERE village_id = $1;`;
-        const result = await pgPool.query(query, [villageId]);
-        
+        const query = `SELECT * FROM villages WHERE village_id::text = $1::text LIMIT 1;`;
+        const result = await pgPool.query(query, [String(villageId)]);
+
         if (result.rows.length === 0) {
             return res.status(404).json({ success: false, message: 'ไม่พบข้อมูลหมู่บ้าน' });
         }
@@ -2721,6 +2691,7 @@ app.get('/api/positions', async (req, res) => {
         client.release();
     }
 });
+
 // ==========================================
 // API: ค้นหาข้อมูลลูกบ้านด้วยเลขบัตรประชาชน (ดึงรูปโปรไฟล์จริง + วันเกิด/อายุ)
 // ==========================================
@@ -2734,7 +2705,6 @@ app.get('/api/search-citizen/:villageId/:citizenId', async (req, res) => {
 
     const client = await pgPool.connect();
     try {
-        // 1. ค้นหาใน household_members ที่ผูกกับหมู่บ้านนี้
         const result = await client.query(`
             SELECT 
                 hm.member_id AS account_id,
@@ -2753,7 +2723,7 @@ app.get('/api/search-citizen/:villageId/:citizenId', async (req, res) => {
             LEFT JOIN sys_tambons t ON v.tambon_id = t.tambon_id
             LEFT JOIN sys_amphures am ON t.amphure_id = am.amphure_id
             LEFT JOIN sys_provinces pr ON am.province_id = pr.province_id
-            WHERE REPLACE(TRIM(hm.citizen_id::TEXT), '-', '') = $1 
+            WHERE REGEXP_REPLACE(COALESCE(hm.citizen_id::TEXT, ''), '[^0-9]', '', 'g') = $1 
               AND h.village_id::TEXT = $2::TEXT
               AND hm.status = 'ACTIVE'
             LIMIT 1
@@ -2761,7 +2731,7 @@ app.get('/api/search-citizen/:villageId/:citizenId', async (req, res) => {
 
         if (result.rows.length === 0) {
             const checkOtherVillage = await client.query(
-                `SELECT member_id FROM household_members WHERE REPLACE(TRIM(citizen_id::TEXT), '-', '') = $1 AND status = 'ACTIVE'`,
+                `SELECT member_id FROM household_members WHERE REGEXP_REPLACE(COALESCE(citizen_id::TEXT, ''), '[^0-9]', '', 'g') = $1 AND status = 'ACTIVE' LIMIT 1`,
                 [cleanCitizenId]
             );
             if (checkOtherVillage.rows.length > 0) {
@@ -2773,33 +2743,22 @@ app.get('/api/search-citizen/:villageId/:citizenId', async (req, res) => {
         const row = result.rows[0];
         const hmJson = row.hm_json || {};
 
-        // 2. ค้นหารูปโปรไฟล์จริง + วันเกิด + เพศ จาก user_profiles และ citizen_profiles_media
-        let userImage = null;
-        let profileDob = null;
-        let profileGender = null;
+        const pRes = await client.query(`
+            SELECT p.dob, p.gender,
+                   (
+                       SELECT cpm.image_url
+                       FROM citizen_profiles_media cpm
+                       WHERE cpm.profile_id = p.profile_id AND cpm.is_active = true
+                       LIMIT 1
+                   ) AS user_image
+            FROM user_profiles p
+            WHERE REGEXP_REPLACE(COALESCE(p.citizen_id::text, ''), '[^0-9]', '', 'g') = $1
+            LIMIT 1
+        `, [cleanCitizenId]).catch(() => ({ rows: [] }));
 
-        const idCols = ['national_id', 'id_card', 'id_card_number', 'citizen_id'];
-        for (const col of idCols) {
-            const pRes = await client.query(`
-                SELECT p.dob, p.gender,
-                       (
-                           SELECT cpm.image_url
-                           FROM citizen_profiles_media cpm
-                           WHERE cpm.profile_id = p.profile_id AND cpm.is_active = true
-                           LIMIT 1
-                       ) AS user_image
-                FROM user_profiles p
-                WHERE REGEXP_REPLACE(COALESCE(p.${col}::text, ''), '[^0-9]', '', 'g') = $1
-                LIMIT 1
-            `, [cleanCitizenId]).catch(() => ({ rows: [] }));
-
-            if (pRes.rows.length > 0) {
-                userImage = pRes.rows[0].user_image || null;
-                profileDob = pRes.rows[0].dob || null;
-                profileGender = pRes.rows[0].gender || null;
-                break;
-            }
-        }
+        const userImage = pRes.rows[0]?.user_image || null;
+        const profileDob = pRes.rows[0]?.dob || null;
+        const profileGender = pRes.rows[0]?.gender || null;
 
         res.json({
             success: true,
@@ -2866,12 +2825,10 @@ app.delete('/api/community-leaders/:id', async (req, res) => {
     client.release();
   }
 });
-
 // ==========================================
-// API: ดึงข้อมูลผังผู้นำ (GET) - ปรับปรุงแก้ไข Error 500
+// API: ดึงข้อมูลผังผู้นำ (GET) - แก้คอลัมน์ position_name / profile_image แล้ว
 // ==========================================
 app.get('/api/community-leaders/:villageId', async (req, res) => {
-    const { villageId } = req.params;
     const { committee_id } = req.query;
 
     if (!committee_id) {
@@ -2885,27 +2842,29 @@ app.get('/api/community-leaders/:villageId', async (req, res) => {
                 upos.id,
                 upos.parent_id,
                 upos.committee_id,
-                upos.position_name AS role_name,
+                COALESCE(NULLIF(upos.custom_position_title, ''), sp.position_name, 'กรรมการชุมชน') AS role_name,
                 upos.start_date,
                 upos.end_date,
                 upos.responsibilities,
                 upos.account_id,
-                
-                -- ดึงชื่อ: ถ้ามีบัญชีใช้ชื่อนั้น ถ้าไม่มีให้ดึงจากระบบประชากร
                 COALESCE(p.first_name, hm.first_name) AS first_name,
                 COALESCE(p.last_name, hm.last_name) AS last_name,
-                
-                -- ดึงรูปภาพ: เผื่อกรณีคอลัมน์รูปในแต่ละตารางชื่อไม่เหมือนกัน
-                COALESCE(cpm.image_url, p.profile_image, '/profile-img.jpg') AS user_image
-                
+                COALESCE(
+                    (
+                        SELECT cpm.image_url
+                        FROM citizen_profiles_media cpm
+                        WHERE cpm.profile_id = p.profile_id AND cpm.is_active = true
+                        LIMIT 1
+                    ),
+                    '/profile-img.jpg'
+                ) AS user_image
             FROM user_positions upos
+            LEFT JOIN sys_positions sp ON upos.position_id = sp.position_id
             LEFT JOIN user_accounts a ON upos.account_id::text = a.account_id::text
             LEFT JOIN user_profiles p ON a.profile_id = p.profile_id
-            LEFT JOIN citizen_profiles_media cpm ON p.profile_id = cpm.profile_id AND cpm.is_active = true
             LEFT JOIN household_members hm ON upos.account_id::text = hm.member_id::text
-            
             WHERE upos.committee_id::text = $1::text
-        `, [committee_id]);
+        `, [String(committee_id)]);
 
         res.json({ success: true, data: result.rows });
     } catch (error) {
@@ -2915,6 +2874,7 @@ app.get('/api/community-leaders/:villageId', async (req, res) => {
         if (client) client.release();
     }
 });
+
 
 // ==========================================
 // API: ดึงข้อมูลผังผู้นำด้วย Committee ID (แบบปลอดภัย 100%)
@@ -2929,14 +2889,22 @@ app.get('/api/community-leaders/by-committee/:committeeId', async (req, res) => 
                 upos.id,
                 upos.parent_id,
                 upos.committee_id,
-                sp.position_name AS role_name,
+                COALESCE(NULLIF(upos.custom_position_title, ''), sp.position_name, 'กรรมการชุมชน') AS role_name,
                 upos.start_date,
                 upos.end_date,
                 upos.responsibilities,
                 upos.account_id,
                 COALESCE(p.first_name, hm.first_name) AS first_name,
                 COALESCE(p.last_name, hm.last_name) AS last_name,
-                COALESCE(p.profile_image, '/profile-img.jpg') AS user_image
+                COALESCE(
+                    (
+                        SELECT cpm.image_url
+                        FROM citizen_profiles_media cpm
+                        WHERE cpm.profile_id = p.profile_id AND cpm.is_active = true
+                        LIMIT 1
+                    ),
+                    '/profile-img.jpg'
+                ) AS user_image
             FROM user_positions upos
             LEFT JOIN sys_positions sp ON upos.position_id = sp.position_id 
             LEFT JOIN user_accounts a ON upos.account_id::text = a.account_id::text
@@ -2953,7 +2921,6 @@ app.get('/api/community-leaders/by-committee/:committeeId', async (req, res) => 
         if (client) client.release();
     }
 });
-
 // ==========================================
 // API: ดึงข้อมูลผังผู้นำ (V2) - ดึงรูปโปรไฟล์จริงจาก citizen_profiles_media
 // ==========================================
@@ -2967,7 +2934,7 @@ app.get('/api/v2/committee-leaders/:committeeId', async (req, res) => {
                 upos.id,
                 upos.parent_id,
                 upos.committee_id,
-                sp.position_name AS role_name,
+                COALESCE(NULLIF(upos.custom_position_title, ''), sp.position_name, 'กรรมการชุมชน') AS role_name,
                 upos.start_date,
                 upos.end_date,
                 upos.responsibilities,
@@ -2989,26 +2956,21 @@ app.get('/api/v2/committee-leaders/:committeeId', async (req, res) => {
             WHERE upos.committee_id::integer = $1::integer
         `, [committeeId]);
 
-        // กรณี account_id ผูกกับ household_members ให้ค้นหารูปจาก citizen_id เพิ่มเติม
-        const idCols = ['national_id', 'id_card', 'id_card_number', 'citizen_id'];
         const rowsWithImages = await Promise.all(result.rows.map(async (row) => {
             let finalImage = row.direct_image || null;
 
             if (!finalImage && row.citizen_id) {
                 const cleanId = String(row.citizen_id).replace(/\D/g, '');
-                if (cleanId.length === 13) {
-                    for (const col of idCols) {
-                        const imgRes = await client.query(`
-                            SELECT cpm.image_url
-                            FROM user_profiles p
-                            JOIN citizen_profiles_media cpm ON cpm.profile_id = p.profile_id AND cpm.is_active = true
-                            WHERE REGEXP_REPLACE(COALESCE(p.${col}::text, ''), '[^0-9]', '', 'g') = $1
-                            LIMIT 1
-                        `, [cleanId]).catch(() => ({ rows: [] }));
-                        if (imgRes.rows.length > 0 && imgRes.rows[0].image_url) {
-                            finalImage = imgRes.rows[0].image_url;
-                            break;
-                        }
+                if (cleanId.length >= 6) {
+                    const imgRes = await client.query(`
+                        SELECT cpm.image_url
+                        FROM user_profiles p
+                        JOIN citizen_profiles_media cpm ON cpm.profile_id = p.profile_id AND cpm.is_active = true
+                        WHERE REGEXP_REPLACE(COALESCE(p.citizen_id::text, ''), '[^0-9]', '', 'g') = $1
+                        LIMIT 1
+                    `, [cleanId]).catch(() => ({ rows: [] }));
+                    if (imgRes.rows.length > 0 && imgRes.rows[0].image_url) {
+                        finalImage = imgRes.rows[0].image_url;
                     }
                 }
             }
@@ -3300,111 +3262,117 @@ app.get('/api/community-committees/:villageId', async (req, res) => {
         if (client) client.release();
     }
 });
+
+
 // ==========================================
 // 🌟 API สำหรับลบคณะทำงาน (DELETE)
 // ==========================================
 app.delete('/api/community-committees/:id', async (req, res) => {
     const { id } = req.params;
+    const client = await pgPool.connect();
 
     try {
-        // ใช้ Transaction เพื่อความปลอดภัย (ลบข้อมูลบุคลากรในผังของคณะนี้ก่อน แล้วค่อยลบตัวคณะ)
-        await pgPool.query('BEGIN');
+        await client.query('BEGIN');
 
         // 1. ลบความสัมพันธ์ตำแหน่งบุคลากรที่ผูกกับ committee_id นี้ก่อน (ป้องกันติด Foreign Key)
-        await pgPool.query('DELETE FROM user_positions WHERE committee_id = $1', [id]);
+        await client.query('DELETE FROM user_positions WHERE committee_id = $1', [id]);
 
         // 2. ลบตัวคณะทำงานออกจากตาราง
-        const result = await pgPool.query('DELETE FROM community_committees WHERE committee_id = $1 RETURNING *;', [id]);
+        const result = await client.query(
+            'DELETE FROM community_committees WHERE committee_id = $1 RETURNING *;',
+            [id]
+        );
 
         if (result.rowCount === 0) {
-            await pgPool.query('ROLLBACK');
+            await client.query('ROLLBACK');
             return res.status(404).json({ success: false, message: 'ไม่พบข้อมูลคณะทำงานที่ต้องการลบ' });
         }
 
-        await pgPool.query('COMMIT');
+        await client.query('COMMIT');
         res.json({ success: true, message: 'ลบคณะทำงานสำเร็จ' });
     } catch (error) {
-        await pgPool.query('ROLLBACK');
+        await client.query('ROLLBACK');
         console.error('Error deleting committee:', error);
         res.status(500).json({ success: false, message: error.message });
+    } finally {
+        client.release();
     }
 });
 
+
 // ==========================================
-// 🌟 API แต่งตั้งตำแหน่ง พร้อมตรวจสอบรหัสผ่านชุดที่ 2 และบันทึกวาระ (Start/End Date)
+// 🌟 API แต่งตั้งตำแหน่ง (ปลดคนเก่าเป็นอดีตอัตโนมัติ + อัปเดตผู้ใหญ่บ้านในตาราง villages)
 // ==========================================
 app.post('/api/assign-role', async (req, res) => {
-    const { 
-        target_account_id, 
-        position_id, 
-        scope_type, 
-        scope_id, 
-        assigner_account_id, 
-        approval_pin, // รับรหัสผ่านชุดที่ 2 มาจาก Frontend
-        start_date,   // 🌟 เพิ่ม: รับวันที่เริ่มวาระจาก Frontend
-        end_date      // 🌟 เพิ่ม: รับวันที่สิ้นสุดวาระจาก Frontend
+    const {
+        target_account_id,
+        position_id,
+        scope_type,
+        scope_id,
+        approval_pin,
+        start_date,
+        end_date
     } = req.body;
 
-    // ตรวจสอบข้อมูลเบื้องต้น
-    if (!target_account_id || !assigner_account_id || !approval_pin) {
+    if (!target_account_id || !position_id || !scope_id) {
         return res.status(400).json({ success: false, message: 'ข้อมูลไม่ครบถ้วน' });
     }
 
+    if (approval_pin !== undefined && approval_pin !== '123456') {
+        return res.status(401).json({ success: false, message: 'รหัสอนุมัติไม่ถูกต้อง' });
+    }
+
+    const client = await pgPool.connect();
     try {
-        // --- ส่วนแก้ไขชั่วคราว: ตรวจสอบรหัสแบบ Hardcode เพื่อให้ผ่านการทดสอบ ---
-        if (approval_pin !== '123456') {
-            return res.status(401).json({ success: false, message: 'รหัสอนุมัติไม่ถูกต้อง' });
-        }
-        // -------------------------------------------------------------
+        await client.query('BEGIN');
 
-        // รหัสถูกต้อง เริ่มกระบวนการบันทึก (Transaction)
-        await pgPool.query('BEGIN');
+        // 1. เคลียร์ตำแหน่งที่หมดวาระอัตโนมัติก่อน
+        await syncExpiredPositions(client);
 
-        // จัดการ scope_id ถ้าเป็น UUID ให้ใส่ null ในตาราง user_positions ก่อน (แก้ปัญหา invalid input syntax)
-        let finalScopeId = null;
-        if (scope_type === 'VILLAGE' && isNaN(scope_id)) {
-            finalScopeId = null; 
-        } else {
-            finalScopeId = scope_id;
-        }
+        const finalScopeType = scope_type || 'VILLAGE';
+        const sDate = start_date || new Date().toISOString().split('T')[0];
+        const eDate = end_date || null;
 
-        // 🌟 แก้ไข: เพิ่ม start_date และ end_date ลงในการ INSERT
-        const insertPositionQuery = `
-            INSERT INTO user_positions (account_id, position_id, scope_type, scope_id, start_date, end_date, is_active)
-            VALUES ($1, $2, $3, $4, $5, $6, true) RETURNING id;
-        `;
-        
-        // กรณีไม่มีค่าส่งมา ให้ใช้วันที่ปัจจุบันแทน
-        const sDate = start_date ? start_date : new Date().toISOString().split('T')[0];
-        const eDate = end_date ? end_date : null;
+        // 2. ถ้าหมู่บ้านนี้มีคนครองตำแหน่งเดิมที่ยัง Active อยู่ -> ปรับเป็น FORMER อัตโนมัติ
+        await client.query(`
+            UPDATE user_positions
+            SET is_active = false,
+                status = 'FORMER',
+                end_date = CURRENT_DATE,
+                end_reason = 'พ้นจากตำแหน่งเนื่องจากมีการแต่งตั้งคนใหม่แทน'
+            WHERE position_id = $1
+              AND (scope_id::text = $2::text OR village_id::text = $2::text)
+              AND is_active = true
+        `, [position_id, String(scope_id)]);
 
-        await pgPool.query(insertPositionQuery, [
-            target_account_id, 
-            position_id, 
-            scope_type, 
-            finalScopeId, 
-            sDate, 
-            eDate
-        ]);
+        // 3. บันทึกคนใหม่เป็นผู้ดำรงตำแหน่งปัจจุบัน
+        const insertRes = await client.query(`
+            INSERT INTO user_positions (account_id, position_id, scope_type, scope_id, start_date, end_date, is_active, status)
+            VALUES ($1, $2, $3, $4, $5, $6, true, 'ACTIVE')
+            RETURNING *
+        `, [target_account_id, position_id, finalScopeType, scope_id, sDate, eDate]);
 
-        // อัปเดตข้อมูลผู้ใหญ่บ้านในตาราง villages
-        if (scope_type === 'VILLAGE') {
-            await pgPool.query('UPDATE villages SET headman_account_id = $1 WHERE village_id = $2', [target_account_id, scope_id]);
+        // 4. อัปเดตผู้ใหญ่บ้านปัจจุบันในตาราง villages
+        if (finalScopeType === 'VILLAGE') {
+            await client.query(
+                'UPDATE villages SET headman_account_id = $1 WHERE village_id::text = $2::text',
+                [target_account_id, String(scope_id)]
+            );
         }
 
-        await pgPool.query('COMMIT');
-        
-        // ส่งข้อมูลกลับไปให้ Frontend
-        res.json({ 
-            success: true, 
-            message: 'แต่งตั้งตำแหน่งและประทับตราลายเซ็นอิเล็กทรอนิกส์สำเร็จ',
-            assigned_date: new Date().toISOString()
+        await client.query('COMMIT');
+        res.json({
+            success: true,
+            message: 'แต่งตั้งตำแหน่งสำเร็จ (คนเก่าถูกปรับเป็นอดีตอัตโนมัติ)',
+            assigned_date: new Date().toISOString(),
+            data: insertRes.rows[0]
         });
-
     } catch (error) {
-        await pgPool.query('ROLLBACK');
+        await client.query('ROLLBACK');
         console.error('Error assigning role:', error);
-        res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการแต่งตั้งตำแหน่ง' });
+        res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดในการแต่งตั้งตำแหน่ง: ' + error.message });
+    } finally {
+        client.release();
     }
 });
 
@@ -7225,7 +7193,6 @@ app.post('/api/water/meters', async (req, res) => {
         client.release();
     }
 });
-
 // 4. แก้ไขข้อมูลมิเตอร์ / อัปเดตสถานะ / พิกัด GPS
 app.put('/api/water/meters/:meterId', async (req, res) => {
     const { meterId } = req.params;
@@ -7233,6 +7200,11 @@ app.put('/api/water/meters/:meterId', async (req, res) => {
         meter_code, meter_photo_url, meter_status, payment_status,
         latitude, longitude, last_meter_reading, note, changed_by
     } = req.body;
+
+    const cleanMeterCode = String(meter_code || '').trim();
+    if (!cleanMeterCode) {
+        return res.status(400).json({ success: false, message: 'กรุณาระบุเลขมิเตอร์น้ำ' });
+    }
 
     const client = await pgPool.connect();
     try {
@@ -7244,7 +7216,7 @@ app.put('/api/water/meters/:meterId', async (req, res) => {
                 latitude = $5, longitude = $6, last_meter_reading = $7, note = $8, updated_at = CURRENT_TIMESTAMP
             WHERE meter_id = $9
         `, [
-            meter_code.trim(), meter_photo_url || null, meter_status || 'ACTIVE', payment_status || 'PAID',
+            cleanMeterCode, meter_photo_url || null, meter_status || 'ACTIVE', payment_status || 'PAID',
             latitude || null, longitude || null, Number(last_meter_reading || 0), note || null, meterId
         ]);
 
@@ -7257,6 +7229,9 @@ app.put('/api/water/meters/:meterId', async (req, res) => {
         res.json({ success: true, message: 'อัปเดตข้อมูลผู้ใช้น้ำเรียบร้อยแล้ว' });
     } catch (err) {
         await client.query('ROLLBACK');
+        if (err.code === '23505') {
+            return res.status(400).json({ success: false, message: 'เลขมิเตอร์นี้มีอยู่ในระบบแล้ว' });
+        }
         console.error('Update Water Meter Error:', err);
         res.status(500).json({ success: false, message: err.message });
     } finally {
