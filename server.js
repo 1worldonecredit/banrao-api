@@ -346,6 +346,60 @@ app.get('/api/users/referrer/:phone', async (req, res) => {
 });
 
 
+app.get('/api/referrers/resolve', async (req, res) => {
+    const rawRef = String(req.query.ref || '').trim();
+    if (!rawRef) {
+        return res.status(400).json({ success: false, message: 'ไม่พบรหัสผู้แนะนำ' });
+    }
+
+    const client = await pgPool.connect();
+    try {
+        const digitsOnly = rawRef.replace(/\D/g, '');
+        const r = await client.query(`
+            SELECT
+                ua.account_id,
+                ua.username_phone,
+                up.first_name,
+                up.last_name,
+                v.village_no,
+                v.village_name
+            FROM user_accounts ua
+            LEFT JOIN user_profiles up
+                ON up.profile_id::text = ua.profile_id::text
+            LEFT JOIN villages v
+                ON v.village_id::text = ua.village_id::text
+            WHERE ua.account_id::text = $1::text
+               OR COALESCE(ua.referral_code::text, '') = $1::text
+               OR ($2 <> '' AND regexp_replace(COALESCE(ua.username_phone::text, ''), '\\D', '', 'g') = $2)
+            LIMIT 1
+        `, [rawRef, digitsOnly]);
+
+        if (r.rows.length === 0) {
+            return res.status(404).json({ success: false, message: 'ไม่พบข้อมูลผู้แนะนำ' });
+        }
+
+        const row = r.rows[0];
+        const phone = String(row.username_phone || '').replace(/\D/g, '').slice(0, 10);
+
+        return res.json({
+            success: true,
+            referrer_phone: phone,
+            data: {
+                account_id: row.account_id,
+                first_name: row.first_name || '',
+                last_name: row.last_name || '',
+                village_no: row.village_no || '',
+                village_name: row.village_name || ''
+            }
+        });
+    } catch (err) {
+        console.error('Resolve Referrer Error:', err);
+        return res.status(500).json({ success: false, message: err.message });
+    } finally {
+        client.release();
+    }
+});
+
 // 1. ดึงจังหวัด (เปลี่ยนมาส่งคืน province_code ให้ Frontend)
 app.get('/api/sys-provinces', async (req, res) => {
     try {
