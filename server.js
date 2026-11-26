@@ -9678,6 +9678,248 @@ app.post('/api/v3/committee-leaders/revoke', async (req, res) => {
     }
 });
 
+
+// =========================================================================
+// 1. API ตรวจสอบความพร้อมของหมู่บ้าน 5 ข้อ (ครบ 100% จึงปลดล็อก Copy Link)
+//    - ข้อ 1: มีรูปโปรไฟล์ผู้ใหญ่บ้าน
+//    - ข้อ 2: กรอกจำนวนครัวเรือน และจำนวนประชากรในหมู่บ้านแล้ว
+//    - ข้อ 3: เพิ่มบ้านเลขที่ในหมู่บ้านครบตามเป้าหมาย
+//    - ข้อ 4: เพิ่มประชากรในบ้านเลขที่ครบตามเป้าหมาย
+//    - ข้อ 5: มีผู้ช่วยผู้ใหญ่บ้านครบ 2 คนในผังผู้นำชุมชน (ส่วนอื่นแล้วแต่หมู่บ้าน)
+// =========================================================================
+app.get('/api/villages/:villageId/registration-readiness', async (req, res) => {
+    const { villageId } = req.params;
+    const client = await pgPool.connect();
+
+    try {
+        // 1. ดึงข้อมูลหมู่บ้านและบัญชีผู้ใหญ่บ้าน
+        const vRes = await client.query(`
+            SELECT
+                v.*,
+                to_jsonb(v) AS v_json,
+                ua.account_id AS headman_acc_id,
+                ua.username_phone AS headman_phone,
+                to_jsonb(ua) AS ua_json,
+                to_jsonb(up) AS up_json
+            FROM villages v
+            LEFT JOIN user_accounts ua
+                ON ua.account_id = v.headman_account_id
+                OR (ua.village_id = v.village_id AND UPPER(COALESCE(ua.role, '')) = 'HEADMAN')
+            LEFT JOIN user_profiles up
+                ON up.profile_id = ua.profile_id
+            WHERE v.village_id::text = $1::text
+            ORDER BY (ua.account_id = v.headman_account_id) DESC NULLS LAST
+            LIMIT 1
+        `, [String(villageId)]);
+
+        if (vRes.rows.length === 0) {
+            return res.status(404).json({ success: false, message: 'ไม่พบข้อมูลหมู่บ้าน' });
+        }
+
+        const row = vRes.rows[0];
+        const vJson = row.v_json || {};
+        const uaJson = row.ua_json || {};
+        const upJson = row.up_json || {};
+
+        // เช็กข้อ 1: รูปโปรไฟล์ผู้ใหญ่บ้าน
+        const avatarUrl =
+            upJson.avatar_url ||
+            upJson.profile_image ||
+            upJson.photo_url ||
+            upJson.image_url ||
+            uaJson.avatar_url ||
+            '';
+        const step1Done = Boolean(String(avatarUrl).trim());
+
+        // เช็กข้อ 2: จำนวนครัวเรือน และจำนวนประชากรในหมู่บ้าน
+        const targetHouseholds = Number(
+            vJson.total_households ?? vJson.household_count ?? vJson.households_target ?? 0
+        ) || 0;
+        const targetPopulation = Number(
+            vJson.total_population ?? vJson.population_count ?? vJson.population_target ?? 0
+        ) || 0;
+        const step2Done = targetHouseholds > 0 && targetPopulation > 0;
+
+        // เช็กข้อ 3: บ้านเลขที่ในหมู่บ้าน
+        const hCountRes = await client.query(`
+            SELECT COUNT(*)::int AS cnt
+            FROM households
+            WHERE village_id::text = $1::text
+        `, [String(villageId)]);
+        const actualHouseholds = Number(hCountRes.rows[0]?.cnt || 0);
+        const step3Done = targetHouseholds > 0 && actualHouseholds >= targetHouseholds;
+
+        // เช็กข้อ 4: ประชากรในบ้านเลขที่ / หมู่บ้าน
+        let actualPopulation = 0;
+        try {
+            const mCountRes = await client.query(`
+                SELECT COUNT(*)::int AS cnt
+                FROM household_members hm
+                JOIN households h ON hm.household_id::text = h.household_id::text
+                WHERE h.village_id::text = $1::text
+                  AND COALESCE(UPPER(hm.status::text), 'ACTIVE') <> 'MOVED_OUT'
+            `, [String(villageId)]);
+            actualPopulation = Number(mCountRes.rows[0]?.cnt || 0);
+        } catch (_) {
+            const pCountRes = await client.query(`
+                SELECT COUNT(*)::int AS cnt
+                FROM user_accounts
+                WHERE village_id::text = $1::text
+            `, [String(villageId)]);
+            actualPopulation = Number(pCountRes.rows[0]?.cnt || 0);
+        }
+        const step4Done = targetPopulation > 0 && actualPopulation >= targetPopulation;
+
+        // เช็กข้อ 5: ผู้ช่วยผู้ใหญ่บ้านครบ 2 คนในผังผู้นำชุมชน
+        let assistantCount = 0;
+        try {
+            const aRes = await client.query(`
+                SELECT COUNT(*)::int AS cnt
+                FROM village_committees
+                WHERE village_id::text = $1::text
+                  AND (
+                      position_name ILIKE '%ผู้ช่วยผู้ใหญ่บ้าน%'
+                      OR committee_name ILIKE '%ผู้ช่วยผู้ใหญ่บ้าน%'
+                  )
+            `, [String(villageId)]);
+            assistantCount = Number(aRes.rows[0]?.cnt || 0);
+        } catch (_) {
+            const aRes2 = await client.query(`
+                SELECT COUNT(*)::int AS cnt
+                FROM community_committees
+                WHERE village_id::text = $1::text
+                  AND (
+                      position_name ILIKE '%ผู้ช่วยผู้ใหญ่บ้าน%'
+                      OR committee_name ILIKE '%ผู้ช่วยผู้ใหญ่บ้าน%'
+                  )
+            `, [String(villageId)]);
+            assistantCount = Number(aRes2.rows[0]?.cnt || 0);
+        }
+        const step5Done = assistantCount >= 2;
+
+        const checklist = [
+            {
+                step: 1,
+                key: 'profile_avatar',
+                label: 'เพิ่มรูปโปรไฟล์ผู้ใหญ่บ้าน',
+                completed: step1Done,
+                detail: step1Done ? 'มีรูปโปรไฟล์แล้ว' : 'ยังไม่ได้อัปโหลดรูปโปรไฟล์'
+            },
+            {
+                step: 2,
+                key: 'village_stats',
+                label: 'กรอกจำนวนครัวเรือนและจำนวนประชากรในหมู่บ้าน',
+                completed: step2Done,
+                detail: `ครัวเรือนเป้าหมาย ${targetHouseholds} | ประชากรเป้าหมาย ${targetPopulation}`
+            },
+            {
+                step: 3,
+                key: 'households_complete',
+                label: 'เพิ่มบ้านเลขที่ในหมู่บ้านให้ครบ',
+                completed: step3Done,
+                detail: `เพิ่มแล้ว ${actualHouseholds} / ${targetHouseholds} หลัง`
+            },
+            {
+                step: 4,
+                key: 'population_complete',
+                label: 'เพิ่มประชากรในบ้านเลขที่ให้ครบ',
+                completed: step4Done,
+                detail: `เพิ่มแล้ว ${actualPopulation} / ${targetPopulation} คน`
+            },
+            {
+                step: 5,
+                key: 'assistant_headmen',
+                label: 'เพิ่มผังผู้นำชุมชน (ผู้ช่วยผู้ใหญ่บ้านครบ 2 คน)',
+                completed: step5Done,
+                detail: `ผู้ช่วยผู้ใหญ่บ้าน ${Math.min(assistantCount, 2)} / 2 คน`
+            }
+        ];
+
+        const completedSteps = checklist.filter(c => c.completed).length;
+        const completionPercent = Math.round((completedSteps / checklist.length) * 100);
+        const isReadyToShare = completedSteps === checklist.length;
+
+        const refCode = row.headman_acc_id || row.headman_phone || '';
+        const shareLink = isReadyToShare
+            ? `https://banrao.life/register-village${refCode ? `?ref=${encodeURIComponent(refCode)}` : ''}`
+            : null;
+
+        res.json({
+            success: true,
+            village_id: row.village_id,
+            is_ready_to_share: isReadyToShare,
+            completed_steps: completedSteps,
+            total_steps: checklist.length,
+            completion_percent: completionPercent,
+            share_link: shareLink,
+            checklist
+        });
+    } catch (error) {
+        console.error('Readiness Check Error:', error);
+        res.status(500).json({ success: false, message: error.message });
+    } finally {
+        client.release();
+    }
+});
+
+
+// =========================================================================
+// 2. API เรียงลำดับสายผังผู้นำชุมชน + สถานะบัญชีสำหรับ Login
+//    - ลำดับที่ 1: ผู้ใหญ่บ้าน
+//    - ลำดับที่ 2: ผู้ช่วยผู้ใหญ่บ้านทั้ง 2 คน
+//    - ลำดับที่ 3+: ตำแหน่ง/คณะทำงานอื่นๆ ของหมู่บ้าน
+// =========================================================================
+app.get('/api/villages/:villageId/leaders-line', async (req, res) => {
+    const { villageId } = req.params;
+    const client = await pgPool.connect();
+
+    try {
+        const result = await client.query(`
+            SELECT
+                vc.*,
+                to_jsonb(vc) AS vc_json,
+                ua.account_id AS linked_account_id,
+                ua.username_phone,
+                ua.is_active AS account_active,
+                up.first_name,
+                up.last_name,
+                up.nickname,
+                CASE
+                    WHEN COALESCE(vc.position_name, '') ILIKE '%ผู้ใหญ่บ้าน%'
+                     AND COALESCE(vc.position_name, '') NOT ILIKE '%ผู้ช่วย%' THEN 1
+                    WHEN COALESCE(vc.position_name, '') ILIKE '%ผู้ช่วยผู้ใหญ่บ้าน%' THEN 2
+                    ELSE 3
+                END AS line_order
+            FROM village_committees vc
+            LEFT JOIN user_accounts ua
+                ON ua.account_id = vc.account_id
+                OR (
+                    vc.account_id IS NULL
+                    AND COALESCE(vc.phone_number, '') <> ''
+                    AND ua.username_phone = vc.phone_number
+                )
+            LEFT JOIN user_profiles up ON up.profile_id = ua.profile_id
+            WHERE vc.village_id::text = $1::text
+            ORDER BY line_order ASC, vc.assigned_at ASC NULLS LAST
+        `, [String(villageId)]);
+
+        const leaders = result.rows.map((r, idx) => {
+            const hasAccount = Boolean(r.linked_account_id);
+            const canLogin = Boolean(hasAccount && r.account_active !== false);
+            return {
+                line_no: idx + 1,
+                line_group: r.line_order === 1 ? 'HEADMAN' : (r.line_order === 2 ? 'ASSISTANT_HEADMAN' : 'OTHER_COMMITTEE'),
+                committee_id: r.committee_id,
+                village_id: r.village_id,
+                position_name: r.position_name,
+                committee_name: r.committee_name,
+                account_id: r.linked_account_id || null,
+                username_phone: r.username_phone || r.vc_json?.phone_number || null,
+                full_name: [r.first_name, r.last_name].filter(Boolean).join(' ') || r.vc_json?.full_name || null,
+                nickname: r.nickname || null,
+                has_account: hasAccount,
+
+
 app.listen(port, () => {
     console.log(`Server is running on port ${port}`);
 });
