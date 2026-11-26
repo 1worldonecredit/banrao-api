@@ -257,7 +257,6 @@ app.get('/api/dashboard/:userId', async (req, res) => {
         if (client) client.release();
     }
 });
-
 // ==========================================
 // API 1: ดึงรายชื่อหมู่บ้านตามชื่อตำบล (สำหรับ Dropdown)
 // ==========================================
@@ -266,23 +265,31 @@ app.get('/api/villages/by-tambon', async (req, res) => {
     if (!tambon_name) return res.json([]);
 
     try {
-        // ตัดคำว่า "ตำบล" หรือ "ต." ออก เพื่อนำไปค้นหาแบบ LIKE ได้แม่นยำขึ้น
         const cleanTambonName = tambon_name.replace('ตำบล', '').replace('ต.', '').trim();
-        
+
         const result = await pgPool.query(`
-            SELECT v.village_id, v.village_no, v.village_name 
+            SELECT
+                v.village_id,
+                v.village_no,
+                v.village_name,
+                v.headman_account_id,
+                v.registration_status,
+                v.registered_at,
+                (
+                    v.headman_account_id IS NOT NULL
+                    OR UPPER(COALESCE(v.registration_status, '')) = 'REGISTERED'
+                ) AS is_registered
             FROM villages v
             JOIN sys_tambons t ON v.tambon_id = t.tambon_id
             WHERE t.tambon_name_th LIKE $1
             ORDER BY v.village_no ASC
         `, [`%${cleanTambonName}%`]);
-        
+
         res.json(result.rows);
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
 });
-
 
 // ==========================================
 // API: ดึงรายชื่อหมู่บ้านตาม ID ตำบล (สำหรับแสดงตารางหน้า Master Data)
@@ -290,17 +297,27 @@ app.get('/api/villages/by-tambon', async (req, res) => {
 app.get('/api/villages/by-tambon-id/:tambonId', async (req, res) => {
     try {
         const { tambonId } = req.params;
-        // เรียงลำดับหมู่บ้านตามตัวอักษร
-        const result = await pgPool.query(
-            'SELECT village_id, village_no, village_name FROM villages WHERE tambon_id = $1 ORDER BY village_no ASC',
-            [tambonId]
-        );
+        const result = await pgPool.query(`
+            SELECT
+                village_id,
+                village_no,
+                village_name,
+                headman_account_id,
+                registration_status,
+                registered_at,
+                (
+                    headman_account_id IS NOT NULL
+                    OR UPPER(COALESCE(registration_status, '')) = 'REGISTERED'
+                ) AS is_registered
+            FROM villages
+            WHERE tambon_id = $1
+            ORDER BY village_no ASC
+        `, [tambonId]);
         res.json(result.rows);
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
 });
-
 
 
 // ==========================================
