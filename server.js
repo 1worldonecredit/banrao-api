@@ -9793,17 +9793,21 @@ app.get('/api/villages/:villageId/registration-readiness', async (req, res) => {
             }
         }
         const step4Done = targetPopulation > 0 && actualPopulation >= targetPopulation;
-
-        // ข้อ 5: ผู้ช่วยผู้ใหญ่บ้านครบ 2 คนในผังผู้นำชุมชน
+// เช็กข้อ 5: ผู้ช่วยผู้ใหญ่บ้าน / ผู้ช่วยในผังผู้นำชุมชนครบ 2 คน
         let assistantCount = 0;
         try {
             const aRes = await client.query(`
                 SELECT COUNT(*)::int AS cnt
-                FROM village_committees
-                WHERE village_id::text = $1::text
+                FROM village_committees vc
+                WHERE vc.village_id::text = $1::text
+                  AND COALESCE(UPPER(vc.status::text), 'ACTIVE') = 'ACTIVE'
                   AND (
-                      COALESCE(position_name::text, '') ILIKE '%ผู้ช่วยผู้ใหญ่บ้าน%'
-                      OR COALESCE(committee_name::text, '') ILIKE '%ผู้ช่วยผู้ใหญ่บ้าน%'
+                      COALESCE(to_jsonb(vc)->>'position_name', '') ILIKE '%ผู้ช่วย%'
+                      OR COALESCE(to_jsonb(vc)->>'custom_position_title', '') ILIKE '%ผู้ช่วย%'
+                      OR COALESCE(to_jsonb(vc)->>'role_name', '') ILIKE '%ผู้ช่วย%'
+                      OR COALESCE(to_jsonb(vc)->>'committee_name', '') ILIKE '%ผู้ช่วย%'
+                      OR UPPER(COALESCE(to_jsonb(vc)->>'role_template_code', '')) LIKE '%ASSISTANT%'
+                      OR UPPER(COALESCE(to_jsonb(vc)->>'role_template_code', '')) LIKE '%DEPUTY%'
                   )
             `, [String(villageId)]);
             assistantCount = Number(aRes.rows[0]?.cnt || 0);
@@ -9811,11 +9815,13 @@ app.get('/api/villages/:villageId/registration-readiness', async (req, res) => {
             try {
                 const aRes2 = await client.query(`
                     SELECT COUNT(*)::int AS cnt
-                    FROM community_committees
-                    WHERE village_id::text = $1::text
+                    FROM community_committees cc
+                    WHERE cc.village_id::text = $1::text
                       AND (
-                          COALESCE(position_name::text, '') ILIKE '%ผู้ช่วยผู้ใหญ่บ้าน%'
-                          OR COALESCE(committee_name::text, '') ILIKE '%ผู้ช่วยผู้ใหญ่บ้าน%'
+                          COALESCE(to_jsonb(cc)->>'position_name', '') ILIKE '%ผู้ช่วย%'
+                          OR COALESCE(to_jsonb(cc)->>'custom_position_title', '') ILIKE '%ผู้ช่วย%'
+                          OR COALESCE(to_jsonb(cc)->>'role_name', '') ILIKE '%ผู้ช่วย%'
+                          OR COALESCE(to_jsonb(cc)->>'committee_name', '') ILIKE '%ผู้ช่วย%'
                       )
                 `, [String(villageId)]);
                 assistantCount = Number(aRes2.rows[0]?.cnt || 0);
