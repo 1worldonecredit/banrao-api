@@ -9691,6 +9691,35 @@ app.get('/api/villages/:villageId/registration-readiness', async (req, res) => {
     const client = await pgPool.connect();
 
     try {
+        // 1. ดึงข้อมูลหมู่บ้านและบัญชีผู้ใหญ่บ้าน
+        const vRes = await client.query(`
+            SELECT
+                v.*,
+                to_jsonb(v) AS v_json,
+                ua.account_id AS headman_acc_id,
+                ua.username_phone AS headman_phone,
+                to_jsonb(ua) AS ua_json,
+                to_jsonb(up) AS up_json
+            FROM villages v
+            LEFT JOIN user_accounts ua
+                ON ua.account_id = v.headman_account_id
+                OR (ua.village_id = v.village_id AND UPPER(COALESCE(ua.role, '')) = 'HEADMAN')
+            LEFT JOIN user_profiles up
+                ON up.profile_id = ua.profile_id
+            WHERE v.village_id::text = $1::text
+            ORDER BY (ua.account_id = v.headman_account_id) DESC NULLS LAST
+            LIMIT 1
+        `, [String(villageId)]);
+
+        if (vRes.rows.length === 0) {
+            return res.status(404).json({ success: false, message: 'ไม่พบข้อมูลหมู่บ้าน' });
+        }
+
+        const row = vRes.rows[0];
+        const vJson = row.v_json || {};
+        const uaJson = row.ua_json || {};
+        const upJson = row.up_json || {};
+
         // เช็กข้อ 1: รูปโปรไฟล์ผู้ใหญ่บ้าน (รองรับ user_image, avatar_url, profile_image และตารางสื่อโปรไฟล์)
         let avatarUrl =
             upJson.user_image ||
