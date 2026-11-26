@@ -9680,18 +9680,43 @@ app.post('/api/v3/committee-leaders/revoke', async (req, res) => {
 
 // =========================================================================
 // 1. API ตรวจสอบความพร้อมของหมู่บ้าน 5 ข้อ (ครบ 100% จึงปลดล็อก Copy Link)
-//    - ข้อ 1: มีรูปโปรไฟล์ผู้ใหญ่บ้าน
-//    - ข้อ 2: กรอกจำนวนครัวเรือน และจำนวนประชากรในหมู่บ้านแล้ว
-//    - ข้อ 3: เพิ่มบ้านเลขที่ในหมู่บ้านครบตามเป้าหมาย
-//    - ข้อ 4: เพิ่มประชากรในบ้านเลขที่ครบตามเป้าหมาย
-//    - ข้อ 5: มีผู้ช่วยผู้ใหญ่บ้านครบ 2 คนในผังผู้นำชุมชน (ส่วนอื่นแล้วแต่หมู่บ้าน)
 // =========================================================================
 app.get('/api/villages/:villageId/registration-readiness', async (req, res) => {
     const { villageId } = req.params;
     const client = await pgPool.connect();
 
     try {
-       // เช็กข้อ 1: รูปโปรไฟล์ผู้ใหญ่บ้าน (ดึงจาก citizen_profiles_media โดยเลือก is_active = true และ uploaded_at ล่าสุด)
+        const vRes = await client.query(`
+            SELECT
+                v.*,
+                to_jsonb(v) AS v_json,
+                ua.account_id AS headman_acc_id,
+                ua.username_phone AS headman_phone,
+                ua.profile_id AS headman_profile_id,
+                to_jsonb(ua) AS ua_json,
+                to_jsonb(up) AS up_json
+            FROM villages v
+            LEFT JOIN user_accounts ua
+                ON ua.account_id::text = v.headman_account_id::text
+                OR (ua.village_id::text = v.village_id::text AND UPPER(COALESCE(ua.role::text, '')) = 'HEADMAN')
+            LEFT JOIN user_profiles up
+                ON up.profile_id::text = ua.profile_id::text
+            WHERE v.village_id::text = $1::text
+            ORDER BY (ua.account_id::text = v.headman_account_id::text) DESC NULLS LAST
+            LIMIT 1
+        `, [String(villageId)]);
+
+        if (vRes.rows.length === 0) {
+            return res.status(404).json({ success: false, message: 'ไม่พบข้อมูลหมู่บ้าน' });
+        }
+
+        const row = vRes.rows[0];
+        const vJson = row.v_json || {};
+        const uaJson = row.ua_json || {};
+        const upJson = row.up_json || {};
+        const targetProfileId = upJson.profile_id || row.headman_profile_id || null;
+
+        // ข้อ 1: รูปโปรไฟล์ผู้ใหญ่บ้าน
         let avatarUrl =
             upJson.image_url ||
             upJson.user_image ||
@@ -9703,15 +9728,15 @@ app.get('/api/villages/:villageId/registration-readiness', async (req, res) => {
             uaJson.avatar_url ||
             '';
 
-        if (!String(avatarUrl).trim()) {
+        if (!String(avatarUrl).trim() && targetProfileId) {
             try {
                 const mediaRes = await client.query(`
                     SELECT image_url
                     FROM citizen_profiles_media
-                    WHERE profile_id::text = COALESCE($1::text, '')
+                    WHERE profile_id::text = $1::text
                     ORDER BY COALESCE(is_active, false) DESC, uploaded_at DESC NULLS LAST
                     LIMIT 1
-                `, [upJson.profile_id || row.profile_id || null]);
+                `, [String(targetProfileId)]);
                 if (mediaRes.rows[0]?.image_url) {
                     avatarUrl = mediaRes.rows[0].image_url;
                 }
@@ -9721,7 +9746,7 @@ app.get('/api/villages/:villageId/registration-readiness', async (req, res) => {
         const cleanAvatar = String(avatarUrl || '').trim();
         const step1Done = Boolean(cleanAvatar && !cleanAvatar.endsWith('/profile-img.jpg'));
 
-        // เช็กข้อ 2: จำนวนครัวเรือน และจำนวนประชากรในหมู่บ้าน
+        // ข้อ 2: จำนวนครัวเรือน และจำนวนประชากรในหมู่บ้าน
         const targetHouseholds = Number(
             vJson.total_households ?? vJson.household_count ?? vJson.households_target ?? 0
         ) || 0;
@@ -9730,16 +9755,21 @@ app.get('/api/villages/:villageId/registration-readiness', async (req, res) => {
         ) || 0;
         const step2Done = targetHouseholds > 0 && targetPopulation > 0;
 
-        // เช็กข้อ 3: บ้านเลขที่ในหมู่บ้าน
-        const hCountRes = await client.query(`
-            SELECT COUNT(*)::int AS cnt
-            FROM households
-            WHERE village_id::text = $1::text
-        `, [String(villageId)]);
-        const actualHouseholds = Number(hCountRes.rows[0]?.cnt || 0);
+        // ข้อ 3: บ้านเลขที่ในหมู่บ้าน
+        let actualHouseholds = 0;
+        try {
+            const hCountRes = await client.query(`
+                SELECT COUNT(*)::int AS cnt
+                FROM households
+                WHERE village_id::text = $1::text
+            `, [String(villageId)]);
+            actualHouseholds = Number(hCountRes.rows[0]?.cnt || 0);
+        } catch (_) {
+            actualHouseholds = 0;
+        }
         const step3Done = targetHouseholds > 0 && actualHouseholds >= targetHouseholds;
 
-        // เช็กข้อ 4: ประชากรในบ้านเลขที่ / หมู่บ้าน
+        // ข้อ 4: ประชากรในบ้านเลขที่ / หมู่บ้าน
         let actualPopulation = 0;
         try {
             const mCountRes = await client.query(`
@@ -9751,16 +9781,20 @@ app.get('/api/villages/:villageId/registration-readiness', async (req, res) => {
             `, [String(villageId)]);
             actualPopulation = Number(mCountRes.rows[0]?.cnt || 0);
         } catch (_) {
-            const pCountRes = await client.query(`
-                SELECT COUNT(*)::int AS cnt
-                FROM user_accounts
-                WHERE village_id::text = $1::text
-            `, [String(villageId)]);
-            actualPopulation = Number(pCountRes.rows[0]?.cnt || 0);
+            try {
+                const pCountRes = await client.query(`
+                    SELECT COUNT(*)::int AS cnt
+                    FROM user_accounts
+                    WHERE village_id::text = $1::text
+                `, [String(villageId)]);
+                actualPopulation = Number(pCountRes.rows[0]?.cnt || 0);
+            } catch (_) {
+                actualPopulation = 0;
+            }
         }
         const step4Done = targetPopulation > 0 && actualPopulation >= targetPopulation;
 
-        // เช็กข้อ 5: ผู้ช่วยผู้ใหญ่บ้านครบ 2 คนในผังผู้นำชุมชน
+        // ข้อ 5: ผู้ช่วยผู้ใหญ่บ้านครบ 2 คนในผังผู้นำชุมชน
         let assistantCount = 0;
         try {
             const aRes = await client.query(`
@@ -9768,22 +9802,26 @@ app.get('/api/villages/:villageId/registration-readiness', async (req, res) => {
                 FROM village_committees
                 WHERE village_id::text = $1::text
                   AND (
-                      position_name ILIKE '%ผู้ช่วยผู้ใหญ่บ้าน%'
-                      OR committee_name ILIKE '%ผู้ช่วยผู้ใหญ่บ้าน%'
+                      COALESCE(position_name::text, '') ILIKE '%ผู้ช่วยผู้ใหญ่บ้าน%'
+                      OR COALESCE(committee_name::text, '') ILIKE '%ผู้ช่วยผู้ใหญ่บ้าน%'
                   )
             `, [String(villageId)]);
             assistantCount = Number(aRes.rows[0]?.cnt || 0);
         } catch (_) {
-            const aRes2 = await client.query(`
-                SELECT COUNT(*)::int AS cnt
-                FROM community_committees
-                WHERE village_id::text = $1::text
-                  AND (
-                      position_name ILIKE '%ผู้ช่วยผู้ใหญ่บ้าน%'
-                      OR committee_name ILIKE '%ผู้ช่วยผู้ใหญ่บ้าน%'
-                  )
-            `, [String(villageId)]);
-            assistantCount = Number(aRes2.rows[0]?.cnt || 0);
+            try {
+                const aRes2 = await client.query(`
+                    SELECT COUNT(*)::int AS cnt
+                    FROM community_committees
+                    WHERE village_id::text = $1::text
+                      AND (
+                          COALESCE(position_name::text, '') ILIKE '%ผู้ช่วยผู้ใหญ่บ้าน%'
+                          OR COALESCE(committee_name::text, '') ILIKE '%ผู้ช่วยผู้ใหญ่บ้าน%'
+                      )
+                `, [String(villageId)]);
+                assistantCount = Number(aRes2.rows[0]?.cnt || 0);
+            } catch (_) {
+                assistantCount = 0;
+            }
         }
         const step5Done = assistantCount >= 2;
 
@@ -9851,7 +9889,6 @@ app.get('/api/villages/:villageId/registration-readiness', async (req, res) => {
         client.release();
     }
 });
-
 
 // =========================================================================
 // 2. API เรียงลำดับสายผังผู้นำชุมชน + สถานะบัญชีสำหรับ Login
