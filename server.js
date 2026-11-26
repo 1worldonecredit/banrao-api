@@ -2202,6 +2202,11 @@ app.get('/api/sidebar-menus/:accountId', async (req, res) => {
                 continue;
             }
 
+            // 3. ซ่อนเมนู "ลงทะเบียนหมู่บ้าน" หากบัญชีนี้สังกัดหมู่บ้านที่ลงทะเบียนแล้ว (ยกเว้น Super Admin)
+            if (!ctx.is_super_admin && r.route_path === '/register-village' && ctx.village_id) {
+                continue;
+            }
+
             if (!groupMap.has(r.group_id)) {
                 groupMap.set(r.group_id, {
                     group_id: r.group_id,
@@ -3957,19 +3962,15 @@ app.put('/api/villages/:villageId/targets', async (req, res) => {
         res.status(500).json({ success: false, message: 'อัปเดตเป้าหมายล้มเหลว' });
     }
 });
-
 // ==========================================
-// 🌟 API สำหรับลงทะเบียนหมู่บ้านและผู้ใหญ่บ้าน (แก้ปัญหา village_id เป็น NULL)
-// ==========================================
-// ==========================================
-// 🌟 API สำหรับลงทะเบียนผู้ใหญ่บ้าน (แก้ไขให้ใช้ village_id จาก Frontend)
+// 🌟 API สำหรับลงทะเบียนผู้ใหญ่บ้าน (1 หมู่บ้าน ลงทะเบียนได้ 1 ครั้งเท่านั้น)
 // ==========================================
 app.post('/api/villages/register', async (req, res) => {
     const {
-        village_id, // 🌟 รับ village_id ที่มีอยู่แล้วจาก Frontend
+        village_id,
         latitude, longitude,
         citizen_id, first_name, last_name, nickname, phone_number, password,
-        gender, dob, // ✨ รับค่าเพศ และ วันเดือนปีเกิด (YYYY-MM-DD)
+        gender, dob,
         referrer_account_id
     } = req.body;
 
@@ -3979,7 +3980,29 @@ app.post('/api/villages/register', async (req, res) => {
 
     const client = await pgPool.connect();
     try {
-        await client.query('BEGIN'); 
+        await client.query('BEGIN');
+
+        // 🔒 0. ล็อกแถวหมู่บ้านและเช็กว่าลงทะเบียนไปแล้วหรือยัง (1 หมู่บ้าน 1 ครั้งเท่านั้น!)
+        const checkVillage = await client.query(
+            `SELECT village_id, village_no, village_name, headman_account_id
+             FROM villages
+             WHERE village_id = $1
+             FOR UPDATE`,
+            [village_id]
+        );
+        if (checkVillage.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ success: false, message: 'ไม่พบข้อมูลหมู่บ้านที่เลือกในระบบ' });
+        }
+        const vRow = checkVillage.rows[0];
+        if (vRow.headman_account_id) {
+            await client.query('ROLLBACK');
+            return res.status(409).json({
+                success: false,
+                code: 'VILLAGE_ALREADY_REGISTERED',
+                message: `หมู่ที่ ${vRow.village_no || '-'} ${vRow.village_name || ''} ลงทะเบียนในระบบแล้ว ไม่สามารถลงทะเบียนซ้ำได้`
+            });
+        }
 
         // 1. ตรวจสอบข้อมูลซ้ำ (เบอร์โทร และ บัตรประชาชน)
         const cleanCitizenId = citizen_id ? String(citizen_id).replace(/-/g, '').trim() : null;
@@ -3996,14 +4019,14 @@ app.post('/api/villages/register', async (req, res) => {
             }
         }
 
-        // 🌟 2. อัปเดตพิกัด (Lat/Lng) ลงในหมู่บ้านเดิมที่เลือกมา
+        // 2. อัปเดตพิกัด (Lat/Lng) ลงในหมู่บ้านเดิมที่เลือกมา
         await client.query(`
             UPDATE villages 
             SET headman_lat = $1, headman_lng = $2 
             WHERE village_id = $3
         `, [latitude, longitude, village_id]);
 
-        // ✨ 3. สร้าง Profile พร้อมบันทึก gender และ dob จริง
+        // 3. สร้าง Profile พร้อมบันทึก gender และ dob จริง
         const finalCitizenId = cleanCitizenId || `999${Math.floor(Math.random() * 10000000000).toString().padStart(10, '0')}`;
         const finalGender = gender && gender.trim() !== '' ? gender.trim() : null;
         const finalDob = dob && dob.trim() !== '' ? dob.trim() : '1900-01-01';
@@ -4026,11 +4049,17 @@ app.post('/api/villages/register', async (req, res) => {
             VALUES (gen_random_uuid(), $1, $2, true, '100000', $3, $4, 'HEADMAN', $5)
             RETURNING account_id;
         `;
-        const userResult = await client.query(insertUserQuery, [phone_number, hashedPassword, newProfileId, finalReferrerId, village_id]); 
+        const userResult = await client.query(insertUserQuery, [phone_number, hashedPassword, newProfileId, finalReferrerId, village_id]);
         const newAccountId = userResult.rows[0].account_id;
 
         // 5. อัปเดต headman_account_id กลับไปที่ตารางหมู่บ้าน
-        await client.query('UPDATE villages SET headman_account_id = $1 WHERE village_id = $2', [newAccountId, village_id]);
+        await client.query(`
+    UPDATE villages
+    SET headman_account_id = $1,
+        registration_status = 'REGISTERED',
+        registered_at = CURRENT_TIMESTAMP
+    WHERE village_id = $2
+`, [newAccountId, village_id]);
 
         // 6. สร้าง แท็บคณะทำงาน
         await client.query(`
