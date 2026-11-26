@@ -9793,40 +9793,67 @@ app.get('/api/villages/:villageId/registration-readiness', async (req, res) => {
             }
         }
         const step4Done = targetPopulation > 0 && actualPopulation >= targetPopulation;
+
+
 // เช็กข้อ 5: ผู้ช่วยผู้ใหญ่บ้าน / ผู้ช่วยในผังผู้นำชุมชนครบ 2 คน
+       // เช็กข้อ 5: ผู้ช่วยผู้ใหญ่บ้าน / ผู้ช่วยในผังผู้นำชุมชนครบ 2 คน (อิงตารางหลัก user_positions)
         let assistantCount = 0;
         try {
-            const aRes = await client.query(`
+            const posRes = await client.query(`
                 SELECT COUNT(*)::int AS cnt
-                FROM village_committees vc
-                WHERE vc.village_id::text = $1::text
-                  AND COALESCE(UPPER(vc.status::text), 'ACTIVE') = 'ACTIVE'
+                FROM user_positions upos
+                LEFT JOIN sys_positions sp
+                    ON sp.position_id::text = upos.position_id::text
+                WHERE COALESCE(upos.village_id::text, upos.scope_id::text) = $1::text
+                  AND COALESCE(upos.is_active, true) = true
+                  AND COALESCE(UPPER(upos.status::text), 'ACTIVE') IN ('ACTIVE', 'APPROVED')
                   AND (
-                      COALESCE(to_jsonb(vc)->>'position_name', '') ILIKE '%ผู้ช่วย%'
-                      OR COALESCE(to_jsonb(vc)->>'custom_position_title', '') ILIKE '%ผู้ช่วย%'
-                      OR COALESCE(to_jsonb(vc)->>'role_name', '') ILIKE '%ผู้ช่วย%'
-                      OR COALESCE(to_jsonb(vc)->>'committee_name', '') ILIKE '%ผู้ช่วย%'
-                      OR UPPER(COALESCE(to_jsonb(vc)->>'role_template_code', '')) LIKE '%ASSISTANT%'
-                      OR UPPER(COALESCE(to_jsonb(vc)->>'role_template_code', '')) LIKE '%DEPUTY%'
+                      COALESCE(to_jsonb(upos)->>'custom_position_title', '') ILIKE '%ผู้ช่วย%'
+                      OR COALESCE(to_jsonb(upos)->>'position_name', '') ILIKE '%ผู้ช่วย%'
+                      OR COALESCE(to_jsonb(upos)->>'responsibilities', '') ILIKE '%ผู้ช่วย%'
+                      OR COALESCE(to_jsonb(sp)->>'position_name', '') ILIKE '%ผู้ช่วย%'
+                      OR COALESCE(to_jsonb(sp)->>'position_title', '') ILIKE '%ผู้ช่วย%'
+                      OR UPPER(COALESCE(to_jsonb(upos)->>'role_template_code', '')) LIKE '%ASSISTANT%'
+                      OR UPPER(COALESCE(to_jsonb(upos)->>'role_template_code', '')) LIKE '%DEPUTY%'
                   )
             `, [String(villageId)]);
-            assistantCount = Number(aRes.rows[0]?.cnt || 0);
+            assistantCount = Number(posRes.rows[0]?.cnt || 0);
         } catch (_) {
-            try {
-                const aRes2 = await client.query(`
+            assistantCount = 0;
+        }
+
+        if (assistantCount === 0) {
+            const fallbackAssistantQueries = [
+                `
+                    SELECT COUNT(*)::int AS cnt
+                    FROM village_committees vc
+                    WHERE vc.village_id::text = $1::text
+                      AND COALESCE(UPPER(to_jsonb(vc)->>'status'), 'ACTIVE') IN ('ACTIVE', 'APPROVED')
+                      AND (
+                          COALESCE(to_jsonb(vc)->>'position_name', '') ILIKE '%ผู้ช่วย%'
+                          OR COALESCE(to_jsonb(vc)->>'custom_position_title', '') ILIKE '%ผู้ช่วย%'
+                          OR COALESCE(to_jsonb(vc)->>'committee_name', '') ILIKE '%ผู้ช่วย%'
+                      )
+                `,
+                `
                     SELECT COUNT(*)::int AS cnt
                     FROM community_committees cc
                     WHERE cc.village_id::text = $1::text
+                      AND COALESCE(UPPER(to_jsonb(cc)->>'status'), 'ACTIVE') IN ('ACTIVE', 'APPROVED')
                       AND (
                           COALESCE(to_jsonb(cc)->>'position_name', '') ILIKE '%ผู้ช่วย%'
                           OR COALESCE(to_jsonb(cc)->>'custom_position_title', '') ILIKE '%ผู้ช่วย%'
-                          OR COALESCE(to_jsonb(cc)->>'role_name', '') ILIKE '%ผู้ช่วย%'
                           OR COALESCE(to_jsonb(cc)->>'committee_name', '') ILIKE '%ผู้ช่วย%'
                       )
-                `, [String(villageId)]);
-                assistantCount = Number(aRes2.rows[0]?.cnt || 0);
-            } catch (_) {
-                assistantCount = 0;
+                `
+            ];
+
+            for (const q of fallbackAssistantQueries) {
+                try {
+                    const r = await client.query(q, [String(villageId)]);
+                    const c = Number(r.rows[0]?.cnt || 0);
+                    if (c > assistantCount) assistantCount = c;
+                } catch (_) {}
             }
         }
         const step5Done = assistantCount >= 2;
