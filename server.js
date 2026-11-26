@@ -9678,7 +9678,6 @@ app.post('/api/v3/committee-leaders/revoke', async (req, res) => {
     }
 });
 
-
 // =========================================================================
 // 1. API ตรวจสอบความพร้อมของหมู่บ้าน 5 ข้อ (ครบ 100% จึงปลดล็อก Copy Link)
 //    - ข้อ 1: มีรูปโปรไฟล์ผู้ใหญ่บ้าน
@@ -9918,7 +9917,125 @@ app.get('/api/villages/:villageId/leaders-line', async (req, res) => {
                 full_name: [r.first_name, r.last_name].filter(Boolean).join(' ') || r.vc_json?.full_name || null,
                 nickname: r.nickname || null,
                 has_account: hasAccount,
+                can_login: canLogin,
+                login_status_label: canLogin ? 'พร้อมเข้าสู่ระบบ (Login ได้แล้ว)' : 'ต้องลงทะเบียนบัญชีเพื่อ Login'
+            };
+        });
 
+        res.json({
+            success: true,
+            village_id: villageId,
+            total_leaders: leaders.length,
+            assistant_headman_count: leaders.filter(l => l.line_group === 'ASSISTANT_HEADMAN').length,
+            leaders
+        });
+    } catch (error) {
+        console.error('Leaders Line Error:', error);
+        res.status(500).json({ success: false, message: error.message });
+    } finally {
+        client.release();
+    }
+});
+
+
+// =========================================================================
+// 3. API ลงทะเบียนบัญชีให้ผู้ช่วยผู้ใหญ่บ้าน / บุคคลในผัง เพื่อ Login เข้าระบบ
+//    - สร้าง/ผูก user_profiles + user_accounts และอัปเดต account_id ในผังทันที
+// =========================================================================
+app.post('/api/villages/:villageId/leaders/register-account', async (req, res) => {
+    const { villageId } = req.params;
+    const {
+        committee_id,
+        phone_number,
+        password,
+        first_name,
+        last_name,
+        nickname,
+        citizen_id,
+        gender,
+        dob,
+        role
+    } = req.body;
+
+    if (!phone_number || !password || !first_name || !last_name) {
+        return res.status(400).json({
+            success: false,
+            message: 'กรุณากรอกเบอร์โทรศัพท์ รหัสผ่าน ชื่อจริง และนามสกุลให้ครบถ้วน'
+        });
+    }
+
+    const cleanPhone = String(phone_number).replace(/\D/g, '');
+    if (cleanPhone.length !== 10) {
+        return res.status(400).json({ success: false, message: 'เบอร์โทรศัพท์ต้องเป็นตัวเลข 10 หลัก' });
+    }
+    if (String(password).length < 6) {
+        return res.status(400).json({ success: false, message: 'รหัสผ่านต้องมีอย่างน้อย 6 ตัวอักษร' });
+    }
+
+    const client = await pgPool.connect();
+    try {
+        await client.query('BEGIN');
+
+        const existsPhone = await client.query(
+            'SELECT account_id FROM user_accounts WHERE username_phone = $1 LIMIT 1',
+            [cleanPhone]
+        );
+        if (existsPhone.rows.length > 0) {
+            await client.query('ROLLBACK');
+            return res.status(409).json({
+                success: false,
+                message: 'เบอร์โทรศัพท์นี้มีบัญชีในระบบแล้ว สามารถใช้ Login ได้ทันที'
+            });
+        }
+
+        const cleanCid = citizen_id ? String(citizen_id).replace(/\D/g, '').trim() : null;
+        const finalCid = cleanCid || `999${Math.floor(Math.random() * 10000000000).toString().padStart(10, '0')}`;
+        const finalGender = gender && String(gender).trim() !== '' ? String(gender).trim() : null;
+        const finalDob = dob && String(dob).trim() !== '' ? String(dob).trim() : '1900-01-01';
+        const finalRole = ['HEADMAN', 'CITIZEN'].includes(String(role || '').toUpperCase())
+            ? String(role).toUpperCase()
+            : 'CITIZEN';
+
+        const profRes = await client.query(`
+            INSERT INTO user_profiles (profile_id, first_name, last_name, nickname, citizen_id, gender, dob)
+            VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6)
+            RETURNING profile_id
+        `, [first_name.trim(), last_name.trim(), nickname ? nickname.trim() : null, finalCid, finalGender, finalDob]);
+        const newProfileId = profRes.rows[0].profile_id;
+
+        const hashedPassword = await bcrypt.hash(String(password), 10);
+        const accRes = await client.query(`
+            INSERT INTO user_accounts (account_id, username_phone, password_hash, is_active, area_code, profile_id, role, village_id)
+            VALUES (gen_random_uuid(), $1, $2, true, '100000', $3, $4, $5)
+            RETURNING account_id
+        `, [cleanPhone, hashedPassword, newProfileId, finalRole, villageId]);
+        const newAccountId = accRes.rows[0].account_id;
+
+        if (committee_id) {
+            await client.query(`
+                UPDATE village_committees
+                SET account_id = $1
+                WHERE committee_id::text = $2::text
+                  AND village_id::text = $3::text
+            `, [newAccountId, String(committee_id), String(villageId)]);
+        }
+
+        await client.query('COMMIT');
+        res.json({
+            success: true,
+            message: 'ลงทะเบียนบัญชีสำเร็จ สามารถใช้เบอร์โทรศัพท์และรหัสผ่าน Login เข้าระบบได้ทันที',
+            account_id: newAccountId,
+            profile_id: newProfileId,
+            username_phone: cleanPhone
+        });
+    } catch (error) {
+        await client.query('ROLLBACK');
+        console.error('Leader Register Account Error:', error);
+        res.status(500).json({ success: false, message: error.message });
+    } finally {
+        client.release();
+    }
+});
 
 app.listen(port, () => {
     console.log(`Server is running on port ${port}`);
