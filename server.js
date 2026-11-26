@@ -25,6 +25,7 @@ const allowedOrigins = [
   'https://banrao.life',
   'https://www.banrao.life',
   'https://supper.banrao.life',
+  'https://chat.banrao.life',
   'https://emp.banrao.life',
   'http://localhost:5173',
   'http://localhost:5174'
