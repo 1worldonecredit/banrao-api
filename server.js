@@ -9691,57 +9691,29 @@ app.get('/api/villages/:villageId/registration-readiness', async (req, res) => {
     const client = await pgPool.connect();
 
     try {
-        // 1. ดึงข้อมูลหมู่บ้านและบัญชีผู้ใหญ่บ้าน
-        const vRes = await client.query(`
-            SELECT
-                v.*,
-                to_jsonb(v) AS v_json,
-                ua.account_id AS headman_acc_id,
-                ua.username_phone AS headman_phone,
-                to_jsonb(ua) AS ua_json,
-                to_jsonb(up) AS up_json
-            FROM villages v
-            LEFT JOIN user_accounts ua
-                ON ua.account_id = v.headman_account_id
-                OR (ua.village_id = v.village_id AND UPPER(COALESCE(ua.role, '')) = 'HEADMAN')
-            LEFT JOIN user_profiles up
-                ON up.profile_id = ua.profile_id
-            WHERE v.village_id::text = $1::text
-            ORDER BY (ua.account_id = v.headman_account_id) DESC NULLS LAST
-            LIMIT 1
-        `, [String(villageId)]);
-
-        if (vRes.rows.length === 0) {
-            return res.status(404).json({ success: false, message: 'ไม่พบข้อมูลหมู่บ้าน' });
-        }
-
-        const row = vRes.rows[0];
-        const vJson = row.v_json || {};
-        const uaJson = row.ua_json || {};
-        const upJson = row.up_json || {};
-
-        // เช็กข้อ 1: รูปโปรไฟล์ผู้ใหญ่บ้าน (รองรับ user_image, avatar_url, profile_image และตารางสื่อโปรไฟล์)
+       // เช็กข้อ 1: รูปโปรไฟล์ผู้ใหญ่บ้าน (ดึงจาก citizen_profiles_media โดยเลือก is_active = true และ uploaded_at ล่าสุด)
         let avatarUrl =
+            upJson.image_url ||
             upJson.user_image ||
             upJson.avatar_url ||
             upJson.profile_image ||
             upJson.photo_url ||
-            upJson.image_url ||
+            uaJson.image_url ||
             uaJson.user_image ||
             uaJson.avatar_url ||
             '';
 
-        if (!String(avatarUrl).trim() && (upJson.profile_id || row.headman_acc_id)) {
+        if (!String(avatarUrl).trim()) {
             try {
                 const mediaRes = await client.query(`
-                    SELECT media_url
+                    SELECT image_url
                     FROM citizen_profiles_media
                     WHERE profile_id::text = COALESCE($1::text, '')
-                    ORDER BY created_at DESC NULLS LAST
+                    ORDER BY COALESCE(is_active, false) DESC, uploaded_at DESC NULLS LAST
                     LIMIT 1
-                `, [upJson.profile_id || null]);
-                if (mediaRes.rows[0]?.media_url) {
-                    avatarUrl = mediaRes.rows[0].media_url;
+                `, [upJson.profile_id || row.profile_id || null]);
+                if (mediaRes.rows[0]?.image_url) {
+                    avatarUrl = mediaRes.rows[0].image_url;
                 }
             } catch (_) {}
         }
