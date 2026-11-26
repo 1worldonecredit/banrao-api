@@ -319,33 +319,7 @@ app.get('/api/villages/by-tambon-id/:tambonId', async (req, res) => {
     }
 });
 
-
-// ==========================================
-// API: ค้นหาข้อมูลผู้แนะนำจากเบอร์โทรศัพท์
-// ==========================================
-app.get('/api/users/referrer/:phone', async (req, res) => {
-    try {
-        const { phone } = req.params;
-        const result = await pgPool.query(`
-            SELECT u.account_id, p.first_name, p.last_name, v.village_no, v.village_name
-            FROM user_accounts u
-            JOIN user_profiles p ON u.profile_id = p.profile_id
-            LEFT JOIN villages v ON u.village_id = v.village_id
-            WHERE u.username_phone = $1 AND u.is_active = true
-            LIMIT 1
-        `, [phone]);
-
-        if (result.rows.length > 0) {
-            res.json({ success: true, data: result.rows[0] });
-        } else {
-            res.json({ success: false, message: 'ไม่พบข้อมูล' });
-        }
-    } catch (error) {
-        res.status(500).json({ success: false, message: error.message });
-    }
-});
-
-
+// เส้น 1: แปลง ref จากลิงก์เชิญ -> เบอร์โทร + รูปโปรไฟล์ + ที่อยู่เต็มถึงจังหวัด
 app.get('/api/referrers/resolve', async (req, res) => {
     const rawRef = String(req.query.ref || '').trim();
     if (!rawRef) {
@@ -361,13 +335,31 @@ app.get('/api/referrers/resolve', async (req, res) => {
                 ua.username_phone,
                 up.first_name,
                 up.last_name,
+                up.nickname,
                 v.village_no,
-                v.village_name
+                v.village_name,
+                COALESCE(to_jsonb(v)->>'tambon_name', to_jsonb(v)->>'sub_district', st.tambon_name_th, '') AS sub_district,
+                COALESCE(to_jsonb(v)->>'amphure_name', to_jsonb(v)->>'district', sa.amphure_name_th, '') AS district,
+                COALESCE(to_jsonb(v)->>'province_name', to_jsonb(v)->>'province', sp.province_name_th, '') AS province,
+                cpm.image_url AS profile_image
             FROM user_accounts ua
             LEFT JOIN user_profiles up
                 ON up.profile_id::text = ua.profile_id::text
             LEFT JOIN villages v
                 ON v.village_id::text = ua.village_id::text
+            LEFT JOIN sys_tambons st
+                ON st.tambon_id::text = (to_jsonb(v)->>'tambon_id')
+            LEFT JOIN sys_amphures sa
+                ON sa.amphure_id::text = COALESCE(to_jsonb(v)->>'amphure_id', st.amphure_id::text)
+            LEFT JOIN sys_provinces sp
+                ON sp.province_id::text = COALESCE(to_jsonb(v)->>'province_id', sa.province_id::text)
+            LEFT JOIN LATERAL (
+                SELECT image_url
+                FROM citizen_profiles_media
+                WHERE profile_id::text = ua.profile_id::text
+                ORDER BY COALESCE(is_active, false) DESC, uploaded_at DESC NULLS LAST
+                LIMIT 1
+            ) cpm ON true
             WHERE ua.account_id::text = $1::text
                OR COALESCE(ua.referral_code::text, '') = $1::text
                OR ($2 <> '' AND regexp_replace(COALESCE(ua.username_phone::text, ''), '\\D', '', 'g') = $2)
@@ -388,12 +380,89 @@ app.get('/api/referrers/resolve', async (req, res) => {
                 account_id: row.account_id,
                 first_name: row.first_name || '',
                 last_name: row.last_name || '',
+                nickname: row.nickname || '',
+                profile_image: row.profile_image || '',
                 village_no: row.village_no || '',
-                village_name: row.village_name || ''
+                village_name: row.village_name || '',
+                sub_district: row.sub_district || '',
+                district: row.district || '',
+                province: row.province || ''
             }
         });
     } catch (err) {
         console.error('Resolve Referrer Error:', err);
+        return res.status(500).json({ success: false, message: err.message });
+    } finally {
+        client.release();
+    }
+});
+
+// เส้น 2: ค้นหาผู้แนะนำจากเบอร์โทร 10 หลัก -> ส่งรูปโปรไฟล์ + ที่อยู่เต็มถึงจังหวัด
+app.get('/api/users/referrer/:phone', async (req, res) => {
+    const cleanPhone = String(req.params.phone || '').replace(/\D/g, '');
+    if (cleanPhone.length !== 10) {
+        return res.status(400).json({ success: false, message: 'เบอร์โทรศัพท์ไม่ถูกต้อง' });
+    }
+
+    const client = await pgPool.connect();
+    try {
+        const r = await client.query(`
+            SELECT
+                ua.account_id,
+                ua.username_phone,
+                up.first_name,
+                up.last_name,
+                up.nickname,
+                v.village_no,
+                v.village_name,
+                COALESCE(to_jsonb(v)->>'tambon_name', to_jsonb(v)->>'sub_district', st.tambon_name_th, '') AS sub_district,
+                COALESCE(to_jsonb(v)->>'amphure_name', to_jsonb(v)->>'district', sa.amphure_name_th, '') AS district,
+                COALESCE(to_jsonb(v)->>'province_name', to_jsonb(v)->>'province', sp.province_name_th, '') AS province,
+                cpm.image_url AS profile_image
+            FROM user_accounts ua
+            LEFT JOIN user_profiles up
+                ON up.profile_id::text = ua.profile_id::text
+            LEFT JOIN villages v
+                ON v.village_id::text = ua.village_id::text
+            LEFT JOIN sys_tambons st
+                ON st.tambon_id::text = (to_jsonb(v)->>'tambon_id')
+            LEFT JOIN sys_amphures sa
+                ON sa.amphure_id::text = COALESCE(to_jsonb(v)->>'amphure_id', st.amphure_id::text)
+            LEFT JOIN sys_provinces sp
+                ON sp.province_id::text = COALESCE(to_jsonb(v)->>'province_id', sa.province_id::text)
+            LEFT JOIN LATERAL (
+                SELECT image_url
+                FROM citizen_profiles_media
+                WHERE profile_id::text = ua.profile_id::text
+                ORDER BY COALESCE(is_active, false) DESC, uploaded_at DESC NULLS LAST
+                LIMIT 1
+            ) cpm ON true
+            WHERE regexp_replace(COALESCE(ua.username_phone::text, ''), '\\D', '', 'g') = $1
+            LIMIT 1
+        `, [cleanPhone]);
+
+        if (r.rows.length === 0) {
+            return res.status(404).json({ success: false, message: 'ไม่พบข้อมูลเบอร์โทรศัพท์นี้' });
+        }
+
+        const row = r.rows[0];
+        return res.json({
+            success: true,
+            data: {
+                account_id: row.account_id,
+                first_name: row.first_name || '',
+                last_name: row.last_name || '',
+                nickname: row.nickname || '',
+                profile_image: row.profile_image || '',
+                village_no: row.village_no || '',
+                village_name: row.village_name || '',
+                sub_district: row.sub_district || '',
+                district: row.district || '',
+                province: row.province || ''
+            }
+        });
+    } catch (err) {
+        console.error('Check Referrer Phone Error:', err);
         return res.status(500).json({ success: false, message: err.message });
     } finally {
         client.release();
