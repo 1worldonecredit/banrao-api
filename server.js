@@ -12277,6 +12277,8 @@ app.get('/api/admin/bank-statements', async (req, res) => {
     }
 });
 
+
+
 app.post('/api/admin/bank-statements', async (req, res) => {
     const {
         channel_id,
@@ -12293,6 +12295,12 @@ app.post('/api/admin/bank-statements', async (req, res) => {
         return res.status(400).json({ success: false, message: 'กรุณาระบุยอดเงิน วันที่ และเวลาเงินเข้าให้ครบถ้วน' });
     }
 
+    const safeChannelId =
+        channel_id !== null && channel_id !== undefined && /^\d+$/.test(String(channel_id).trim())
+            ? Number(channel_id)
+            : null;
+    const safeAmount = Number.isFinite(Number(amount)) ? Number(amount) : 0;
+
     try {
         const result = await pgPool.query(
             `INSERT INTO bank_statement_entries (
@@ -12301,10 +12309,10 @@ app.post('/api/admin/bank-statements', async (req, res) => {
             ) VALUES ($1,$2,$3,$4,$5,$6,$7,'UNMATCHED',$8)
             RETURNING *`,
             [
-                channel_id ? Number(channel_id) : null,
+                safeChannelId,
                 bank_name_th || null,
                 account_number || null,
-                Number(amount),
+                safeAmount,
                 received_date,
                 received_time_hms,
                 note,
