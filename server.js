@@ -12081,7 +12081,7 @@ app.post('/api/upload-slip', async (req, res) => {
 });
 
 // -------------------------------------------------------------------------
-// [SLIP-02] POST /api/payment-slips — บันทึกข้อมูลแจ้งโอน (ใครโอน เข้าบัญชีไหน เวลา HH:mm:ss + ลิงก์สลิป R2)
+// [SLIP-02] POST /api/payment-slips — บันทึกข้อมูลแจ้งโอน (กัน NaN 100%)
 // -------------------------------------------------------------------------
 app.post('/api/payment-slips', async (req, res) => {
     const {
@@ -12107,6 +12107,13 @@ app.post('/api/payment-slips', async (req, res) => {
         });
     }
 
+    // แปลงเป็นตัวเลขเฉพาะกรณีที่เป็นตัวเลขล้วนเท่านั้น (กัน NaN)
+    const safeChannelId =
+        channel_id !== null && channel_id !== undefined && /^\d+$/.test(String(channel_id).trim())
+            ? Number(channel_id)
+            : null;
+    const safeAmount = Number.isFinite(Number(amount)) ? Number(amount) : 0;
+
     try {
         const result = await pgPool.query(
             `INSERT INTO payment_slip_submissions (
@@ -12120,11 +12127,11 @@ app.post('/api/payment-slips', async (req, res) => {
                 tx_category,
                 payer_account_id || null,
                 payer_name || null,
-                channel_id ? Number(channel_id) : null,
+                safeChannelId,
                 receiver_name || null,
                 receiver_bank_name || null,
                 receiver_account_number || null,
-                Number(amount || 0),
+                safeAmount,
                 transfer_date,
                 transfer_time_hms,
                 slip_image_url,
