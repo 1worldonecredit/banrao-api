@@ -10221,6 +10221,747 @@ app.post('/api/villages/:villageId/leaders/register-account', async (req, res) =
     }
 });
 
+
+
+
+// =========================================================================
+// [PARKGATE-SYSTEM-START] ระบบแพ็กเกจ (PARKGATE) + กระเป๋าเงินกลาง + SUPER ADMIN
+// =========================================================================
+
+// -------------------------------------------------------------------------
+// [PKG-HELPER-01] คำนวณวันหมดอายุ นับถอยหลัง และสถานะแจ้งเตือนล่วงหน้า (Asia/Bangkok)
+// -------------------------------------------------------------------------
+function buildPackageStatusMeta(subRow, notifyDaysBefore = 30) {
+    const now = new Date();
+    const tz = 'Asia/Bangkok';
+    const formatThaiDateTime = (d) => {
+        if (!d) return null;
+        return new Date(d).toLocaleString('th-TH', {
+            timeZone: tz,
+            year: 'numeric',
+            month: 'short',
+            day: 'numeric',
+            hour: '2-digit',
+            minute: '2-digit'
+        });
+    };
+
+    if (!subRow) {
+        return {
+            has_subscription: false,
+            package_code: null,
+            package_name: 'ยังไม่ได้เลือกแพ็กเกจ',
+            badge_tier: 'FREE',
+            payment_status: 'UNSELECTED',
+            expires_at: null,
+            expires_at_th: null,
+            days_remaining: null,
+            is_expiring_soon: false,
+            is_expired: false,
+            should_prompt_package: true,
+            prompt_reason: 'FIRST_TIME_UNSELECTED'
+        };
+    }
+
+    const expiresAt = subRow.expires_at ? new Date(subRow.expires_at) : null;
+    const diffMs = expiresAt ? expiresAt.getTime() - now.getTime() : null;
+    const daysRemaining = diffMs !== null ? Math.ceil(diffMs / (1000 * 60 * 60 * 24)) : null;
+    const isExpired = daysRemaining !== null ? daysRemaining <= 0 : false;
+    const isExpiringSoon = daysRemaining !== null
+        ? (!isExpired && daysRemaining <= Number(notifyDaysBefore || 30))
+        : false;
+
+    const neverSelectedOrUnpaid =
+        !subRow.has_seen_package_prompt &&
+        !['PAID', 'FREE_GRANTED'].includes(String(subRow.payment_status || '').toUpperCase());
+
+    const shouldPromptPackage = neverSelectedOrUnpaid || isExpiringSoon || isExpired;
+    let promptReason = null;
+    if (neverSelectedOrUnpaid) promptReason = 'FIRST_TIME_UNSELECTED';
+    else if (isExpired) promptReason = 'EXPIRED';
+    else if (isExpiringSoon) promptReason = 'EXPIRING_SOON';
+
+    return {
+        has_subscription: true,
+        subscription_id: subRow.subscription_id,
+        package_id: subRow.package_id,
+        package_code: subRow.package_code,
+        package_name: subRow.package_name_th,
+        badge_tier: subRow.badge_tier || 'FREE',
+        payment_status: subRow.payment_status || 'PAID',
+        payment_method: subRow.payment_method || null,
+        amount_paid: Number(subRow.amount_paid || 0),
+        started_at: subRow.started_at,
+        expires_at: subRow.expires_at,
+        expires_at_th: formatThaiDateTime(subRow.expires_at),
+        days_remaining: daysRemaining,
+        notify_days_before: Number(notifyDaysBefore || 30),
+        is_expiring_soon: isExpiringSoon,
+        is_expired: isExpired,
+        should_prompt_package: shouldPromptPackage,
+        prompt_reason: promptReason
+    };
+}
+
+// -------------------------------------------------------------------------
+// [PKG-USER-01] GET /api/packages/overview — ดึงแพ็กเกจ + บริการ + สถานะผู้ใช้/หมู่บ้าน
+// -------------------------------------------------------------------------
+app.get('/api/packages/overview', async (req, res) => {
+    const accountId = String(req.query.account_id || '').trim();
+    const villageId = String(req.query.village_id || '').trim();
+    const client = await pgPool.connect();
+
+    try {
+        const settingsRes = await client.query(`
+            SELECT * FROM package_system_settings WHERE setting_key = 'DEFAULT' LIMIT 1
+        `);
+        const settings = settingsRes.rows[0] || {
+            notify_days_before: 30,
+            free_village_years_default: 1,
+            qr_prompt_info: 'สแกน QR Code เพื่อชำระเงินค่าแพ็กเกจ',
+            timezone_name: 'Asia/Bangkok'
+        };
+
+        const pkgRes = await client.query(`
+            SELECT
+                p.*,
+                COALESCE(
+                    json_agg(
+                        json_build_object(
+                            'feature_id', pf.feature_id,
+                            'feature_key', pf.feature_key,
+                            'title_th', pf.title_th,
+                            'description_th', pf.description_th,
+                            'is_included', pf.is_included,
+                            'sort_order', pf.sort_order
+                        ) ORDER BY pf.sort_order ASC, pf.created_at ASC
+                    ) FILTER (WHERE pf.feature_id IS NOT NULL),
+                    '[]'::json
+                ) AS features
+            FROM packages p
+            LEFT JOIN package_features pf ON pf.package_id = p.package_id
+            WHERE p.is_active = true
+            GROUP BY p.package_id
+            ORDER BY p.sort_order ASC, p.created_at ASC
+        `);
+
+        let villageFreeYears = 0;
+        let villageFreeUntil = null;
+        if (villageId) {
+            const vRes = await client.query(`
+                SELECT
+                    COALESCE((to_jsonb(v)->>'free_years')::int, 0) AS free_years,
+                    (to_jsonb(v)->>'package_free_until')::timestamptz AS package_free_until
+                FROM villages v
+                WHERE v.village_id::text = $1::text
+                LIMIT 1
+            `, [villageId]);
+            if (vRes.rows[0]) {
+                villageFreeYears = Number(vRes.rows[0].free_years || 0);
+                villageFreeUntil = vRes.rows[0].package_free_until || null;
+            }
+        }
+
+        let subRow = null;
+        if (accountId) {
+            const sRes = await client.query(`
+                SELECT
+                    ups.*,
+                    p.code AS package_code,
+                    p.name_th AS package_name_th,
+                    p.badge_tier
+                FROM user_package_subscriptions ups
+                JOIN packages p ON p.package_id = ups.package_id
+                WHERE ups.account_id::text = $1::text
+                ORDER BY ups.created_at DESC
+                LIMIT 1
+            `, [accountId]);
+            subRow = sRes.rows[0] || null;
+        }
+
+        const statusMeta = buildPackageStatusMeta(subRow, settings.notify_days_before);
+
+        return res.json({
+            success: true,
+            settings,
+            village_grant: {
+                free_years: villageFreeYears,
+                package_free_until: villageFreeUntil,
+                has_free_grant: villageFreeYears > 0 || Boolean(villageFreeUntil)
+            },
+            subscription: statusMeta,
+            packages: pkgRes.rows
+        });
+    } catch (err) {
+        console.error('[PKG-USER-01] Packages Overview Error:', err);
+        return res.status(500).json({ success: false, message: err.message });
+    } finally {
+        client.release();
+    }
+});
+
+// -------------------------------------------------------------------------
+// [PKG-USER-02] POST /api/packages/subscribe — เลือกแพ็กเกจ / หักกระเป๋าเงิน / สร้าง QR
+// -------------------------------------------------------------------------
+app.post('/api/packages/subscribe', async (req, res) => {
+    const {
+        account_id,
+        village_id,
+        package_id,
+        wallet_id = null,
+        payment_method = 'WALLET', // 'WALLET' | 'QR_CODE'
+        qr_reference = null
+    } = req.body;
+
+    if (!account_id || !package_id) {
+        return res.status(400).json({ success: false, message: 'กรุณาระบุบัญชีผู้ใช้งานและแพ็กเกจ' });
+    }
+
+    const client = await pgPool.connect();
+    try {
+        await client.query('BEGIN');
+
+        const pkgRes = await client.query(`
+            SELECT * FROM packages WHERE package_id::text = $1::text LIMIT 1
+        `, [String(package_id)]);
+        if (pkgRes.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ success: false, message: 'ไม่พบแพ็กเกจที่เลือก' });
+        }
+        const pkg = pkgRes.rows[0];
+        const amount = Number(pkg.price_amount || 0);
+        const now = new Date();
+
+        // ตรวจสิทธิ์ฟรี 1-5 ปีของหมู่บ้าน (ถ้ามี)
+        let grantYears = 0;
+        let grantUntil = null;
+        if (village_id) {
+            const vRes = await client.query(`
+                SELECT
+                    COALESCE((to_jsonb(v)->>'free_years')::int, 0) AS free_years,
+                    (to_jsonb(v)->>'package_free_until')::timestamptz AS package_free_until
+                FROM villages v
+                WHERE v.village_id::text = $1::text
+                LIMIT 1
+            `, [String(village_id)]);
+            if (vRes.rows[0]) {
+                grantYears = Number(vRes.rows[0].free_years || 0);
+                grantUntil = vRes.rows[0].package_free_until ? new Date(vRes.rows[0].package_free_until) : null;
+            }
+        }
+
+        let finalPaymentStatus = 'PAID';
+        let finalPaymentMethod = payment_method;
+        let finalAmountPaid = amount;
+        let expiresAt = new Date(now.getTime() + Number(pkg.duration_days || 365) * 24 * 60 * 60 * 1000);
+
+        if (amount === 0 || pkg.code === 'FREE') {
+            finalPaymentStatus = (grantYears > 0 || grantUntil) ? 'FREE_GRANTED' : 'PAID';
+            finalPaymentMethod = (grantYears > 0 || grantUntil) ? 'FREE_VILLAGE_GRANT' : 'FREE';
+            finalAmountPaid = 0;
+
+            if (grantUntil && grantUntil > now) {
+                expiresAt = grantUntil;
+            } else if (grantYears > 0) {
+                const d = new Date(now);
+                d.setFullYear(d.getFullYear() + Math.min(grantYears, 5));
+                expiresAt = d;
+            }
+        } else if (payment_method === 'WALLET') {
+            const wRes = wallet_id
+                ? await client.query(`
+                    SELECT * FROM wallets
+                    WHERE wallet_id::text = $1::text AND status = 'ACTIVE'
+                    FOR UPDATE
+                `, [String(wallet_id)])
+                : await client.query(`
+                    SELECT * FROM wallets
+                    WHERE owner_type = 'USER' AND owner_id::text = $1::text AND status = 'ACTIVE'
+                    FOR UPDATE
+                `, [String(account_id)]);
+
+            if (wRes.rows.length === 0) {
+                await client.query('ROLLBACK');
+                return res.status(404).json({ success: false, message: 'ไม่พบกระเป๋าเงินสำหรับชำระรายการนี้' });
+            }
+
+            const wallet = wRes.rows[0];
+            const currentBalance = Number(wallet.balance || 0);
+            if (currentBalance < amount) {
+                await client.query('ROLLBACK');
+                return res.status(400).json({
+                    success: false,
+                    message: `ยอดเงินในกระเป๋า "${wallet.wallet_name}" ไม่เพียงพอ (คงเหลือ ฿${currentBalance.toLocaleString()} / ต้องชำระ ฿${amount.toLocaleString()})`
+                });
+            }
+
+            const afterBalance = currentBalance - amount;
+            await client.query(`
+                UPDATE wallets
+                SET balance = $1, updated_at = NOW()
+                WHERE wallet_id = $2
+            `, [afterBalance, wallet.wallet_id]);
+
+            await client.query(`
+                INSERT INTO wallet_transactions (
+                    wallet_id, tx_type, direction, amount, balance_before, balance_after,
+                    reference_type, reference_id, description, created_by
+                )
+                VALUES ($1, 'PACKAGE_PAYMENT', 'OUT', $2, $3, $4, 'PACKAGE', $5, $6, $7::uuid)
+            `, [
+                wallet.wallet_id,
+                amount,
+                currentBalance,
+                afterBalance,
+                String(pkg.package_id),
+                `ชำระค่าแพ็กเกจ ${pkg.name_th}`,
+                String(account_id)
+            ]);
+        } else if (payment_method === 'QR_CODE') {
+            finalPaymentStatus = 'PENDING';
+        }
+
+        const subInsert = await client.query(`
+            INSERT INTO user_package_subscriptions (
+                account_id, village_id, package_id, payment_status, payment_method,
+                amount_paid, started_at, expires_at, has_seen_package_prompt
+            )
+            VALUES ($1::uuid, $2, $3::uuid, $4, $5, $6, $7, $8, true)
+            RETURNING *
+        `, [
+            String(account_id),
+            village_id || null,
+            String(pkg.package_id),
+            finalPaymentStatus,
+            finalPaymentMethod,
+            finalAmountPaid,
+            now.toISOString(),
+            expiresAt.toISOString()
+        ]);
+
+        const sub = subInsert.rows[0];
+        const refCode = qr_reference || `PKG-${Date.now()}`;
+
+        await client.query(`
+            INSERT INTO package_payments (
+                subscription_id, account_id, package_id, payment_method, amount, status, qr_reference, paid_at
+            )
+            VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5, $6, $7, $8)
+        `, [
+            sub.subscription_id,
+            String(account_id),
+            String(pkg.package_id),
+            finalPaymentMethod,
+            amount,
+            finalPaymentStatus === 'PENDING' ? 'PENDING' : 'COMPLETED',
+            refCode,
+            finalPaymentStatus === 'PENDING' ? null : now.toISOString()
+        ]);
+
+        await client.query('COMMIT');
+        return res.json({
+            success: true,
+            subscription: {
+                ...sub,
+                package_code: pkg.code,
+                package_name_th: pkg.name_th,
+                badge_tier: pkg.badge_tier
+            },
+            qr_reference: refCode
+        });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error('[PKG-USER-02] Subscribe Package Error:', err);
+        return res.status(500).json({ success: false, message: err.message });
+    } finally {
+        client.release();
+    }
+});
+
+// -------------------------------------------------------------------------
+// [WALLET-01] GET /api/wallets/my — ดึงกระเป๋าเงิน (User + หมู่บ้าน + ร้านค้า/ธุรกิจ)
+// -------------------------------------------------------------------------
+app.get('/api/wallets/my', async (req, res) => {
+    const accountId = String(req.query.account_id || '').trim();
+    if (!accountId) {
+        return res.status(400).json({ success: false, message: 'กรุณาระบุ account_id' });
+    }
+
+    const client = await pgPool.connect();
+    try {
+        await client.query(`
+            INSERT INTO wallets (owner_type, owner_id, account_id, wallet_name, balance)
+            SELECT
+                'USER',
+                ua.account_id,
+                ua.account_id,
+                COALESCE(
+                    NULLIF(TRIM(CONCAT(COALESCE(up.first_name, ''), ' ', COALESCE(up.last_name, ''))), ''),
+                    ua.username_phone,
+                    'กระเป๋าผู้ใช้งาน'
+                ),
+                0.00
+            FROM user_accounts ua
+            LEFT JOIN user_profiles up ON up.profile_id::text = ua.profile_id::text
+            WHERE ua.account_id::text = $1::text
+            ON CONFLICT (owner_type, owner_id) DO NOTHING
+        `, [accountId]);
+
+        const wRes = await client.query(`
+            SELECT
+                w.wallet_id,
+                w.owner_type,
+                w.owner_id,
+                w.account_id,
+                CASE
+                    WHEN w.owner_type = 'USER' THEN COALESCE(
+                        NULLIF(TRIM(CONCAT(COALESCE(up.first_name, ''), ' ', COALESCE(up.last_name, ''))), ''),
+                        w.wallet_name
+                    )
+                    WHEN w.owner_type = 'VILLAGE' THEN COALESCE(
+                        NULLIF(TRIM(CONCAT('หมู่ที่ ', COALESCE(v.village_no::text, '-'), ' ', COALESCE(v.village_name, ''))), ''),
+                        w.wallet_name
+                    )
+                    WHEN w.owner_type IN ('SHOP', 'BUSINESS') THEN COALESCE(
+                        NULLIF(TRIM(cp.place_name), ''),
+                        w.wallet_name
+                    )
+                    ELSE w.wallet_name
+                END AS wallet_name,
+                w.balance,
+                w.currency,
+                w.status
+            FROM wallets w
+            LEFT JOIN user_accounts ua ON w.owner_type = 'USER' AND ua.account_id = w.owner_id
+            LEFT JOIN user_profiles up ON up.profile_id = ua.profile_id
+            LEFT JOIN villages v ON w.owner_type = 'VILLAGE' AND v.village_id = w.owner_id
+            LEFT JOIN community_places cp ON w.owner_type IN ('SHOP', 'BUSINESS') AND cp.place_id = w.owner_id
+            WHERE w.account_id::text = $1::text
+               OR (w.owner_type = 'USER' AND w.owner_id::text = $1::text)
+               OR (w.owner_type = 'VILLAGE' AND v.headman_account_id::text = $1::text)
+            ORDER BY
+                CASE w.owner_type
+                    WHEN 'USER' THEN 1
+                    WHEN 'VILLAGE' THEN 2
+                    WHEN 'SHOP' THEN 3
+                    ELSE 4
+                END ASC,
+                w.created_at ASC
+        `, [accountId]);
+
+        return res.json({ success: true, wallets: wRes.rows });
+    } catch (err) {
+        console.error('[WALLET-01] Get My Wallets Error:', err);
+        return res.status(500).json({ success: false, message: err.message });
+    } finally {
+        client.release();
+    }
+});
+
+// -------------------------------------------------------------------------
+// [WALLET-02] POST /api/wallets/topup — เติมเงินเข้ากระเป๋าเงิน (ทดสอบ/ยืนยัน QR)
+// -------------------------------------------------------------------------
+app.post('/api/wallets/topup', async (req, res) => {
+    const { wallet_id, amount, note = 'เติมเงินเข้ากระเป๋า', created_by = null } = req.body;
+    const numAmount = Number(amount || 0);
+    if (!wallet_id || numAmount <= 0) {
+        return res.status(400).json({ success: false, message: 'กรุณาระบุกระเป๋าเงินและจำนวนเงินที่ถูกต้อง' });
+    }
+
+    const client = await pgPool.connect();
+    try {
+        await client.query('BEGIN');
+        const wRes = await client.query(`
+            SELECT * FROM wallets WHERE wallet_id::text = $1::text FOR UPDATE
+        `, [String(wallet_id)]);
+
+        if (wRes.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ success: false, message: 'ไม่พบกระเป๋าเงิน' });
+        }
+
+        const wallet = wRes.rows[0];
+        const beforeBal = Number(wallet.balance || 0);
+        const afterBal = beforeBal + numAmount;
+
+        await client.query(`
+            UPDATE wallets SET balance = $1, updated_at = NOW() WHERE wallet_id = $2
+        `, [afterBal, wallet.wallet_id]);
+
+        await client.query(`
+            INSERT INTO wallet_transactions (
+                wallet_id, tx_type, direction, amount, balance_before, balance_after,
+                reference_type, description, created_by
+            )
+            VALUES ($1, 'DEPOSIT', 'IN', $2, $3, $4, 'TOPUP', $5, $6)
+        `, [wallet.wallet_id, numAmount, beforeBal, afterBal, note, created_by || null]);
+
+        await client.query('COMMIT');
+        return res.json({ success: true, balance: afterBal });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        return res.status(500).json({ success: false, message: err.message });
+    } finally {
+        client.release();
+    }
+});
+
+// -------------------------------------------------------------------------
+// [SUPER-ADMIN-01] PUT /api/super-admin/packages/settings — ตั้งวันเตือนล่วงหน้า + Update
+// -------------------------------------------------------------------------
+app.put('/api/super-admin/packages/settings', async (req, res) => {
+    const { notify_days_before, free_village_years_default, qr_prompt_info, updated_by } = req.body;
+    const days = Math.max(1, Number(notify_days_before ?? 30));
+    const freeYears = Math.min(5, Math.max(0, Number(free_village_years_default ?? 1)));
+
+    const client = await pgPool.connect();
+    try {
+        const r = await client.query(`
+            INSERT INTO package_system_settings (
+                setting_key, notify_days_before, free_village_years_default, qr_prompt_info, timezone_name, updated_by, updated_at
+            )
+            VALUES ('DEFAULT', $1, $2, $3, 'Asia/Bangkok', $4, NOW())
+            ON CONFLICT (setting_key) DO UPDATE SET
+                notify_days_before = EXCLUDED.notify_days_before,
+                free_village_years_default = EXCLUDED.free_village_years_default,
+                qr_prompt_info = COALESCE(EXCLUDED.qr_prompt_info, package_system_settings.qr_prompt_info),
+                updated_by = EXCLUDED.updated_by,
+                updated_at = NOW()
+            RETURNING *
+        `, [days, freeYears, qr_prompt_info ?? null, updated_by || null]);
+
+        return res.json({ success: true, settings: r.rows[0] });
+    } catch (err) {
+        console.error('[SUPER-ADMIN-01] Update Package Settings Error:', err);
+        return res.status(500).json({ success: false, message: err.message });
+    } finally {
+        client.release();
+    }
+});
+
+// -------------------------------------------------------------------------
+// [SUPER-ADMIN-02] POST / PUT / DELETE /api/super-admin/packages — จัดการแพ็กเกจ/บริการ/ราคา
+// -------------------------------------------------------------------------
+app.post('/api/super-admin/packages', async (req, res) => {
+    const {
+        code, name_th, name_en, badge_tier = 'SILVER',
+        price_amount = 0, billing_cycle = 'YEARLY', duration_days = 365,
+        max_shop_products = null, sort_order = 10, features = []
+    } = req.body;
+
+    const client = await pgPool.connect();
+    try {
+        await client.query('BEGIN');
+        const pRes = await client.query(`
+            INSERT INTO packages (
+                code, name_th, name_en, badge_tier, price_amount, billing_cycle, duration_days, max_shop_products, is_active, sort_order
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true, $9)
+            RETURNING *
+        `, [
+            String(code).toUpperCase(),
+            name_th,
+            name_en || name_th,
+            badge_tier,
+            Number(price_amount || 0),
+            billing_cycle,
+            Number(duration_days || 365),
+            max_shop_products,
+            Number(sort_order || 10)
+        ]);
+
+        const pkg = pRes.rows[0];
+        if (Array.isArray(features)) {
+            for (let i = 0; i < features.length; i++) {
+                const f = features[i];
+                if (!f || !f.title_th) continue;
+                await client.query(`
+                    INSERT INTO package_features (package_id, feature_key, title_th, description_th, is_included, sort_order)
+                    VALUES ($1::uuid, $2, $3, $4, $5, $6)
+                `, [pkg.package_id, f.feature_key || `feat_${i + 1}`, f.title_th, f.description_th || '', f.is_included !== false, i + 1]);
+            }
+        }
+
+        await client.query('COMMIT');
+        return res.json({ success: true, package: pkg });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        return res.status(500).json({ success: false, message: err.message });
+    } finally {
+        client.release();
+    }
+});
+
+app.put('/api/super-admin/packages/:packageId', async (req, res) => {
+    const { packageId } = req.params;
+    const {
+        name_th, name_en, badge_tier, price_amount,
+        billing_cycle, duration_days, max_shop_products, is_active, sort_order, features
+    } = req.body;
+
+    const client = await pgPool.connect();
+    try {
+        await client.query('BEGIN');
+        const uRes = await client.query(`
+            UPDATE packages SET
+                name_th = COALESCE($2, name_th),
+                name_en = COALESCE($3, name_en),
+                badge_tier = COALESCE($4, badge_tier),
+                price_amount = COALESCE($5, price_amount),
+                billing_cycle = COALESCE($6, billing_cycle),
+                duration_days = COALESCE($7, duration_days),
+                max_shop_products = $8,
+                is_active = COALESCE($9, is_active),
+                sort_order = COALESCE($10, sort_order),
+                updated_at = NOW()
+            WHERE package_id::text = $1::text
+            RETURNING *
+        `, [
+            String(packageId),
+            name_th ?? null,
+            name_en ?? null,
+            badge_tier ?? null,
+            price_amount !== undefined ? Number(price_amount) : null,
+            billing_cycle ?? null,
+            duration_days !== undefined ? Number(duration_days) : null,
+            max_shop_products !== undefined ? max_shop_products : null,
+            is_active !== undefined ? Boolean(is_active) : null,
+            sort_order !== undefined ? Number(sort_order) : null
+        ]);
+
+        if (uRes.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ success: false, message: 'ไม่พบแพ็กเกจ' });
+        }
+
+        if (Array.isArray(features)) {
+            await client.query(`DELETE FROM package_features WHERE package_id::text = $1::text`, [String(packageId)]);
+            for (let i = 0; i < features.length; i++) {
+                const f = features[i];
+                if (!f || !f.title_th) continue;
+                await client.query(`
+                    INSERT INTO package_features (package_id, feature_key, title_th, description_th, is_included, sort_order)
+                    VALUES ($1::uuid, $2, $3, $4, $5, $6)
+                `, [String(packageId), f.feature_key || `feat_${i + 1}`, f.title_th, f.description_th || '', f.is_included !== false, i + 1]);
+            }
+        }
+
+        await client.query('COMMIT');
+        return res.json({ success: true, package: uRes.rows[0] });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        return res.status(500).json({ success: false, message: err.message });
+    } finally {
+        client.release();
+    }
+});
+
+app.delete('/api/super-admin/packages/:packageId', async (req, res) => {
+    const { packageId } = req.params;
+    const client = await pgPool.connect();
+    try {
+        await client.query(`DELETE FROM packages WHERE package_id::text = $1::text`, [String(packageId)]);
+        return res.json({ success: true });
+    } catch (err) {
+        return res.status(500).json({ success: false, message: err.message });
+    } finally {
+        client.release();
+    }
+});
+
+// -------------------------------------------------------------------------
+// [SUPER-ADMIN-03] GET / PUT /api/super-admin/package-users — รายชื่อผู้ใช้ & วันหมดอายุ
+// -------------------------------------------------------------------------
+app.get('/api/super-admin/package-users', async (req, res) => {
+    const client = await pgPool.connect();
+    try {
+        const sRes = await client.query(`
+            SELECT notify_days_before FROM package_system_settings WHERE setting_key = 'DEFAULT' LIMIT 1
+        `);
+        const notifyDays = Number(sRes.rows[0]?.notify_days_before || 30);
+
+        const r = await client.query(`
+            SELECT
+                ua.account_id,
+                ua.username_phone,
+                ua.role,
+                ua.village_id,
+                up.first_name,
+                up.last_name,
+                v.village_no,
+                v.village_name,
+                latest_sub.subscription_id,
+                latest_sub.package_id,
+                latest_sub.payment_status,
+                latest_sub.payment_method,
+                latest_sub.amount_paid,
+                latest_sub.expires_at,
+                latest_sub.has_seen_package_prompt,
+                p.code AS package_code,
+                p.name_th AS package_name_th,
+                p.badge_tier
+            FROM user_accounts ua
+            LEFT JOIN user_profiles up ON up.profile_id::text = ua.profile_id::text
+            LEFT JOIN villages v ON v.village_id::text = ua.village_id::text
+            LEFT JOIN LATERAL (
+                SELECT *
+                FROM user_package_subscriptions ups
+                WHERE ups.account_id::text = ua.account_id::text
+                ORDER BY ups.created_at DESC
+                LIMIT 1
+            ) latest_sub ON true
+            LEFT JOIN packages p ON p.package_id = latest_sub.package_id
+            ORDER BY latest_sub.expires_at ASC NULLS LAST, ua.created_at DESC NULLS LAST
+            LIMIT 200
+        `);
+
+        const items = r.rows.map((row) => ({
+            ...row,
+            status_meta: buildPackageStatusMeta(
+                row.subscription_id ? row : null,
+                notifyDays
+            )
+        }));
+
+        return res.json({ success: true, notify_days_before: notifyDays, users: items });
+    } catch (err) {
+        return res.status(500).json({ success: false, message: err.message });
+    } finally {
+        client.release();
+    }
+});
+
+app.put('/api/super-admin/package-users/:subscriptionId', async (req, res) => {
+    const { subscriptionId } = req.params;
+    const { expires_at, payment_status, package_id } = req.body;
+    const client = await pgPool.connect();
+    try {
+        const r = await client.query(`
+            UPDATE user_package_subscriptions SET
+                expires_at = COALESCE($2::timestamptz, expires_at),
+                payment_status = COALESCE($3, payment_status),
+                package_id = COALESCE($4::uuid, package_id),
+                updated_at = NOW()
+            WHERE subscription_id::text = $1::text
+            RETURNING *
+        `, [String(subscriptionId), expires_at || null, payment_status || null, package_id || null]);
+
+        if (r.rows.length === 0) {
+            return res.status(404).json({ success: false, message: 'ไม่พบรายการสมัครแพ็กเกจ' });
+        }
+        return res.json({ success: true, subscription: r.rows[0] });
+    } catch (err) {
+        return res.status(500).json({ success: false, message: err.message });
+    } finally {
+        client.release();
+    }
+});
+
+// =========================================================================
+// [PARKGATE-SYSTEM-END]
+// =========================================================================
+
+
 app.listen(port, () => {
     console.log(`Server is running on port ${port}`);
 });
