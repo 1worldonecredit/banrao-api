@@ -11756,7 +11756,6 @@ app.post('/api/super-admin/verifications/:id/review', async (req, res) => {
     }
 });
 
-
 // -------------------------------------------------------------------------
 // [PAY-CH-01] GET /api/payment-channels — ดึงรายการช่องทางรับเงิน & QR ของระบบ
 // -------------------------------------------------------------------------
@@ -11862,6 +11861,7 @@ app.post('/api/payment-channels', async (req, res) => {
         return res.status(500).json({ success: false, message: err.message });
     }
 });
+
 
 app.listen(port, () => {
     console.log(`Server is running on port ${port}`);
