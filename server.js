@@ -10464,7 +10464,7 @@ app.get('/api/packages/overview', async (req, res) => {
 
 
 // -------------------------------------------------------------------------
-// [PKG-API-02] POST /api/packages/subscribe — สมัคร/ต่ออายุแพ็กเกจ + คืนข้อมูลใบเสร็จ/ผู้รับเงินสำหรับสร้าง QR Code
+// [PKG-API-02] POST /api/packages/subscribe — ตรงกับคอลัมน์จริงของ packages, user_package_subscriptions, package_payments
 // -------------------------------------------------------------------------
 app.post('/api/packages/subscribe', async (req, res) => {
     const {
@@ -10489,9 +10489,9 @@ app.post('/api/packages/subscribe', async (req, res) => {
     try {
         await client.query('BEGIN');
 
-        // [1.1] ดึงข้อมูลแพ็กเกจ
+        // [1.1] ดึงข้อมูลแพ็กเกจจากตาราง packages
         const pkgRes = await client.query(`
-            SELECT * FROM parkgate_packages WHERE package_id::text = $1::text
+            SELECT * FROM packages WHERE package_id::text = $1::text
         `, [String(package_id)]);
 
         if (pkgRes.rows.length === 0) {
@@ -10500,8 +10500,10 @@ app.post('/api/packages/subscribe', async (req, res) => {
         }
         const pkg = pkgRes.rows[0];
         const priceAmount = Number(pkg.price_amount || 0);
+        const pkgName = pkg.name_th || pkg.name_en || 'แพ็กเกจระบบ';
+        const badgeTier = pkg.badge_tier || 'FREE';
 
-        // [1.2] ดึงบัญชีผู้รับเงินจากที่ส่งมา หรือบัญชีระบบ/ธุรกิจที่ผูกไว้ในระบบ
+        // [1.2] ดึงบัญชีผู้รับเงินจากที่ส่งมา หรือบัญชีระบบ/ธุรกิจ/หมู่บ้าน/ร้านค้าที่ผูกไว้
         let recvName = receiver_name;
         let recvOwnerType = receiver_owner_type || 'SYSTEM';
         let recvBankName = receiver_bank_name;
@@ -10530,7 +10532,7 @@ app.post('/api/packages/subscribe', async (req, res) => {
             }
         }
 
-        // [1.3] ตรวจสอบวิธีชำระเงิน
+        // [1.3] ตรวจสอบวิธีชำระเงินและหักกระเป๋า (ถ้าเลือก WALLET)
         let paymentStatus = 'PAID';
         const methodUpper = String(payment_method || 'WALLET').toUpperCase();
         const refCode = qr_reference || `PK-${Date.now().toString().slice(-6)}`;
@@ -10560,77 +10562,104 @@ app.post('/api/packages/subscribe', async (req, res) => {
             `, [priceAmount, String(wallet_id)]);
             paymentStatus = 'PAID';
         } else if (methodUpper === 'QR_CODE' && priceAmount > 0) {
-            // สร้าง QR รอตรวจสลิป/ยอดโอน (หรือปรับเป็น PAID เมื่อแอดมินอนุมัติในหน้า bank-reconciliation)
             paymentStatus = 'PENDING';
         }
 
-        // [1.4] คำนวณวันหมดอายุ
+        // [1.4] อัปเดตหรือเพิ่มรายการใน user_package_subscriptions
         const durationDays = Number(pkg.duration_days || 365);
         const expiresAt = new Date(Date.now() + durationDays * 24 * 60 * 60 * 1000);
+        const amountPaidToStore = paymentStatus === 'PAID' ? priceAmount : 0;
 
-        const subRes = await client.query(`
-            INSERT INTO account_package_subscriptions (
-                account_id, village_id, package_id, status, payment_status,
-                payment_method, starts_at, expires_at, updated_at
-            )
-            VALUES ($1, $2, $3, 'ACTIVE', $4, $5, NOW(), $6, NOW())
-            ON CONFLICT (account_id) DO UPDATE SET
-                village_id = COALESCE(EXCLUDED.village_id, account_package_subscriptions.village_id),
-                package_id = EXCLUDED.package_id,
-                status = 'ACTIVE',
-                payment_status = EXCLUDED.payment_status,
-                payment_method = EXCLUDED.payment_method,
-                starts_at = NOW(),
-                expires_at = EXCLUDED.expires_at,
-                updated_at = NOW()
-            RETURNING *
-        `, [account_id, village_id, pkg.package_id, paymentStatus, methodUpper, expiresAt.toISOString()]);
+        const existingSub = await client.query(`
+            SELECT subscription_id FROM user_package_subscriptions
+            WHERE account_id::text = $1::text
+            ORDER BY created_at DESC
+            LIMIT 1
+        `, [String(account_id)]);
 
-        // [1.5] บันทึกใบเสร็จ (ถ้ามีตาราง payment_receipts)
+        let subRow;
+        if (existingSub.rows.length > 0) {
+            const updSub = await client.query(`
+                UPDATE user_package_subscriptions
+                SET village_id = COALESCE($2::uuid, village_id),
+                    package_id = $3::uuid,
+                    payment_status = $4,
+                    payment_method = $5,
+                    amount_paid = $6,
+                    started_at = NOW(),
+                    expires_at = $7,
+                    updated_at = NOW()
+                WHERE subscription_id = $1::uuid
+                RETURNING *
+            `, [
+                existingSub.rows[0].subscription_id,
+                village_id || null,
+                pkg.package_id,
+                paymentStatus,
+                methodUpper,
+                amountPaidToStore,
+                expiresAt.toISOString()
+            ]);
+            subRow = updSub.rows[0];
+        } else {
+            const insSub = await client.query(`
+                INSERT INTO user_package_subscriptions (
+                    account_id, village_id, package_id, payment_status,
+                    payment_method, amount_paid, started_at, expires_at, created_at, updated_at
+                )
+                VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5, $6, NOW(), $7, NOW(), NOW())
+                RETURNING *
+            `, [
+                account_id,
+                village_id || null,
+                pkg.package_id,
+                paymentStatus,
+                methodUpper,
+                amountPaidToStore,
+                expiresAt.toISOString()
+            ]);
+            subRow = insSub.rows[0];
+        }
+
+        // [1.5] บันทึกประวัติการชำระเงินลง package_payments ให้ตรงทุกคอลัมน์
         const receiptNo = `RCP-${Date.now()}`;
-        const purposeTitle = `ชำระค่าแพ็กเกจ: ${pkg.name_th} (${pkg.badge_tier || 'VIP'})`;
+        const purposeTitle = `ชำระค่าแพ็กเกจ: ${pkgName} (${badgeTier})`;
         const lineItems = [
             {
-                name: `${pkg.name_th} (${pkg.billing_cycle === 'YEARLY' ? 'รายปี' : 'ตามรอบบิล'})`,
+                name: `${pkgName} (${pkg.billing_cycle === 'YEARLY' ? 'รายปี' : 'ตามรอบบิล'})`,
                 qty: 1,
                 price: priceAmount
             }
         ];
+        const paymentRowStatus = paymentStatus === 'PAID' ? 'PAID' : 'PENDING';
+        const slipNote = `RECEIPT:${receiptNo} | TO:${recvName} (${recvOwnerType}) | ${recvBankName} (${recvAccountNo})`;
 
-        try {
-            await client.query(`
-                INSERT INTO payment_receipts (
-                    receipt_no, qr_reference, tx_category, payer_account_id,
-                    receiver_name, receiver_owner_type, receiver_bank_name, receiver_account_number,
-                    purpose_title, line_items, total_amount, payment_method, payment_status
-                )
-                VALUES ($1, $2, 'PACKAGE', $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12)
-            `, [
-                receiptNo,
-                refCode,
-                account_id,
-                recvName,
-                recvOwnerType,
-                recvBankName,
-                recvAccountNo,
-                purposeTitle,
-                JSON.stringify(lineItems),
-                priceAmount,
-                methodUpper,
-                paymentStatus
-            ]);
-        } catch (_) {
-            // ข้ามหากยังไม่ได้สร้างตาราง payment_receipts
-        }
+        await client.query(`
+            INSERT INTO package_payments (
+                subscription_id, account_id, package_id, payment_method,
+                amount, status, qr_reference, slip_or_ref_note, paid_at, created_at, updated_at
+            )
+            VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5, $6, $7, $8, $9, NOW(), NOW())
+        `, [
+            subRow.subscription_id,
+            account_id,
+            pkg.package_id,
+            methodUpper,
+            priceAmount,
+            paymentRowStatus,
+            refCode,
+            slipNote,
+            paymentRowStatus === 'PAID' ? new Date().toISOString() : null
+        ]);
 
         await client.query('COMMIT');
         return res.json({
             success: true,
             qr_reference: refCode,
             subscription: {
-                ...subRes.rows[0],
-                package_name: pkg.name_th,
-                badge_tier: pkg.badge_tier
+                ...subRow,
+                package_name: pkgName,
+                badge_tier: badgeTier
             },
             receipt: {
                 receipt_no: receiptNo,
