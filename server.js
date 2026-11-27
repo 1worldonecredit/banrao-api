@@ -11757,6 +11757,112 @@ app.post('/api/super-admin/verifications/:id/review', async (req, res) => {
 });
 
 
+// -------------------------------------------------------------------------
+// [PAY-CH-01] GET /api/payment-channels — ดึงรายการช่องทางรับเงิน & QR ของระบบ
+// -------------------------------------------------------------------------
+app.get('/api/payment-channels', async (req, res) => {
+    try {
+        const includeInactive = String(req.query.include_inactive || 'false') === 'true';
+        const whereSql = includeInactive ? '' : 'WHERE is_active = true';
+
+        const result = await pgPool.query(`
+            SELECT *
+            FROM system_payment_channels
+            ${whereSql}
+            ORDER BY sort_order ASC, created_at ASC
+        `);
+
+        return res.json({
+            success: true,
+            channels: result.rows
+        });
+    } catch (err) {
+        console.error('[PAY-CH-01] GET error:', err);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// -------------------------------------------------------------------------
+// [PAY-CH-02] POST /api/payment-channels — เพิ่ม/อัปเดตช่องทางรับเงิน & QR ลงตาราง
+// -------------------------------------------------------------------------
+app.post('/api/payment-channels', async (req, res) => {
+    const {
+        channel_code,
+        channel_name_th,
+        owner_type = 'SYSTEM',
+        receiver_name,
+        bank_code = '',
+        bank_name_th = '',
+        account_number = '',
+        promptpay_id = '',
+        qr_image_url = '',
+        annual_tx_warn_count = 350,
+        annual_amount_warn_thb = 1800000,
+        is_active = true,
+        sort_order = 1
+    } = req.body;
+
+    if (!channel_name_th || !receiver_name) {
+        return res.status(400).json({
+            success: false,
+            message: 'กรุณาระบุชื่อช่องทางรับเงินและชื่อผู้รับเงิน'
+        });
+    }
+
+    try {
+        const codeFinal =
+            String(channel_code || '').trim() ||
+            `CH_${Date.now().toString().slice(-6)}`;
+
+        const result = await pgPool.query(`
+            INSERT INTO system_payment_channels (
+                channel_code, channel_name_th, owner_type, receiver_name,
+                bank_code, bank_name_th, account_number, promptpay_id,
+                qr_image_url, annual_tx_warn_count, annual_amount_warn_thb,
+                is_active, sort_order, updated_at
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW())
+            ON CONFLICT (channel_code) DO UPDATE SET
+                channel_name_th = EXCLUDED.channel_name_th,
+                owner_type = EXCLUDED.owner_type,
+                receiver_name = EXCLUDED.receiver_name,
+                bank_code = EXCLUDED.bank_code,
+                bank_name_th = EXCLUDED.bank_name_th,
+                account_number = EXCLUDED.account_number,
+                promptpay_id = EXCLUDED.promptpay_id,
+                qr_image_url = EXCLUDED.qr_image_url,
+                annual_tx_warn_count = EXCLUDED.annual_tx_warn_count,
+                annual_amount_warn_thb = EXCLUDED.annual_amount_warn_thb,
+                is_active = EXCLUDED.is_active,
+                sort_order = EXCLUDED.sort_order,
+                updated_at = NOW()
+            RETURNING *
+        `, [
+            codeFinal,
+            String(channel_name_th).trim(),
+            String(owner_type || 'SYSTEM').toUpperCase(),
+            String(receiver_name).trim(),
+            String(bank_code || '').trim(),
+            String(bank_name_th || '').trim(),
+            String(account_number || '').trim(),
+            String(promptpay_id || '').trim(),
+            String(qr_image_url || '').trim(),
+            Number(annual_tx_warn_count || 350),
+            Number(annual_amount_warn_thb || 1800000),
+            Boolean(is_active),
+            Number(sort_order || 1)
+        ]);
+
+        return res.json({
+            success: true,
+            channel: result.rows[0]
+        });
+    } catch (err) {
+        console.error('[PAY-CH-02] POST error:', err);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+});
+
 app.listen(port, () => {
     console.log(`Server is running on port ${port}`);
 });
