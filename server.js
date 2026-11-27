@@ -11056,6 +11056,321 @@ app.put('/api/super-admin/package-users/:subscriptionId', async (req, res) => {
 // =========================================================================
 
 
+
+// =========================================================================
+// [PAY-API-START] ผูกบัญชีธนาคาร + รหัสยืนยัน PIN + ใบเสร็จ/QR (หน้าบ้าน & หลังบ้าน)
+// =========================================================================
+
+const DEFAULT_INITIAL_PIN = '000000'; // รหัสเริ่มต้นสำหรับผูกบัญชีครั้งแรก
+
+// [PAY-HELPER-01] ตรวจรหัสยืนยัน PIN ของบัญชี (ถ้ายังไม่เคยตั้ง ให้ใช้รหัสเริ่มต้น '000000' ได้)
+async function verifyAccountPin(client, accountId, inputPin) {
+    const cleanPin = String(inputPin || '').trim();
+    if (!cleanPin) {
+        return { ok: false, message: 'กรุณากรอกรหัสยืนยัน (PIN)' };
+    }
+
+    const pinRes = await client.query(`
+        SELECT * FROM user_security_pins WHERE account_id::text = $1::text LIMIT 1
+    `, [String(accountId)]);
+
+    if (pinRes.rows.length === 0) {
+        if (cleanPin === DEFAULT_INITIAL_PIN) {
+            return { ok: true, usedDefaultPin: true };
+        }
+        return {
+            ok: false,
+            message: `รหัสยืนยันไม่ถูกต้อง (รหัสเริ่มต้นสำหรับการผูกบัญชีคือ ${DEFAULT_INITIAL_PIN})`
+        };
+    }
+
+    const row = pinRes.rows[0];
+    if (cleanPin === String(row.pin_hash)) {
+        return { ok: true, usedDefaultPin: Boolean(row.is_default_pin) };
+    }
+    return { ok: false, message: 'รหัสยืนยัน (PIN) ไม่ถูกต้อง' };
+}
+
+// [PAY-API-01] GET /api/payment-methods/my — ดึงบัญชีธนาคารที่ผูก + ข้อมูลชื่อผู้ใช้งาน/หมู่บ้าน/ร้านค้า
+app.get('/api/payment-methods/my', async (req, res) => {
+    const accountId = String(req.query.account_id || '').trim();
+    if (!accountId) {
+        return res.status(400).json({ success: false, message: 'กรุณาระบุ account_id' });
+    }
+
+    const client = await pgPool.connect();
+    try {
+        const accRes = await client.query(`
+            SELECT
+                ua.account_id,
+                ua.username_phone,
+                ua.village_id,
+                TRIM(CONCAT(COALESCE(up.first_name, ''), ' ', COALESCE(up.last_name, ''))) AS full_name,
+                v.village_name,
+                v.village_no
+            FROM user_accounts ua
+            LEFT JOIN user_profiles up ON up.profile_id::text = ua.profile_id::text
+            LEFT JOIN villages v ON v.village_id::text = ua.village_id::text
+            WHERE ua.account_id::text = $1::text
+            LIMIT 1
+        `, [accountId]);
+
+        const pinRes = await client.query(`
+            SELECT is_default_pin, updated_at FROM user_security_pins WHERE account_id::text = $1::text LIMIT 1
+        `, [accountId]);
+
+        const bankRes = await client.query(`
+            SELECT *
+            FROM user_bank_accounts
+            WHERE account_id::text = $1::text AND status = 'ACTIVE'
+            ORDER BY is_default DESC, created_at DESC
+        `, [accountId]);
+
+        return res.json({
+            success: true,
+            account_info: accRes.rows[0] || null,
+            pin_status: {
+                has_custom_pin: pinRes.rows.length > 0 && !pinRes.rows[0].is_default_pin,
+                default_pin_hint: DEFAULT_INITIAL_PIN
+            },
+            bank_accounts: bankRes.rows
+        });
+    } catch (err) {
+        console.error('[PAY-API-01] Get Payment Methods Error:', err);
+        return res.status(500).json({ success: false, message: err.message });
+    } finally {
+        client.release();
+    }
+});
+
+// [PAY-API-02] POST /api/payment-methods/pin — ตั้งหรือเปลี่ยนรหัสยืนยัน (PIN)
+app.post('/api/payment-methods/pin', async (req, res) => {
+    const { account_id, current_pin, new_pin } = req.body;
+    const cleanNewPin = String(new_pin || '').trim();
+    if (!account_id || cleanNewPin.length < 4) {
+        return res.status(400).json({ success: false, message: 'กรุณาระบุ account_id และรหัสยืนยันใหม่อย่างน้อย 4 หลัก' });
+    }
+
+    const client = await pgPool.connect();
+    try {
+        const check = await verifyAccountPin(client, account_id, current_pin);
+        if (!check.ok) {
+            return res.status(401).json({ success: false, message: check.message });
+        }
+
+        await client.query(`
+            INSERT INTO user_security_pins (account_id, pin_hash, is_default_pin, updated_at)
+            VALUES ($1::uuid, $2, false, NOW())
+            ON CONFLICT (account_id) DO UPDATE SET
+                pin_hash = EXCLUDED.pin_hash,
+                is_default_pin = false,
+                updated_at = NOW()
+        `, [String(account_id), cleanNewPin]);
+
+        return res.json({ success: true, message: 'บันทึกรหัสยืนยัน (PIN) ใหม่เรียบร้อยแล้ว' });
+    } catch (err) {
+        return res.status(500).json({ success: false, message: err.message });
+    } finally {
+        client.release();
+    }
+});
+
+// [PAY-API-03] POST /api/payment-methods/bank-accounts — เพิ่มบัญชีธนาคารรับเงิน (ต้องใช้ PIN + ตรวจกฎชื่อบัญชี)
+app.post('/api/payment-methods/bank-accounts', async (req, res) => {
+    const {
+        account_id,
+        created_by = null,
+        owner_type = 'USER', // 'USER' | 'VILLAGE' | 'SHOP' | 'BUSINESS'
+        owner_ref_id = null,
+        bank_code,
+        bank_name_th,
+        account_number,
+        account_holder_name,
+        pin,
+        is_default = false,
+        bypass_pin_for_admin = false
+    } = req.body;
+
+    if (!account_id || !bank_code || !bank_name_th || !account_number || !account_holder_name) {
+        return res.status(400).json({ success: false, message: 'กรุณากรอกข้อมูลบัญชีธนาคารให้ครบถ้วน' });
+    }
+
+    const client = await pgPool.connect();
+    try {
+        await client.query('BEGIN');
+
+        if (!bypass_pin_for_admin) {
+            const pinCheck = await verifyAccountPin(client, account_id, pin);
+            if (!pinCheck.ok) {
+                await client.query('ROLLBACK');
+                return res.status(401).json({ success: false, message: pinCheck.message });
+            }
+        }
+
+        const normOwnerType = String(owner_type || 'USER').toUpperCase();
+        const holderNameClean = String(account_holder_name).trim();
+
+        // ดึงชื่อผู้ใช้งานเจ้าของบัญชีเพื่อบังคับกฎชื่อบัญชี
+        const uRes = await client.query(`
+            SELECT
+                TRIM(CONCAT(COALESCE(up.first_name, ''), ' ', COALESCE(up.last_name, ''))) AS full_name,
+                ua.username_phone
+            FROM user_accounts ua
+            LEFT JOIN user_profiles up ON up.profile_id::text = ua.profile_id::text
+            WHERE ua.account_id::text = $1::text
+            LIMIT 1
+        `, [String(account_id)]);
+
+        const userFullName = String(uRes.rows[0]?.full_name || '').trim();
+        let holderTypeTag = 'ACCOUNT_OWNER';
+
+        if (normOwnerType === 'USER') {
+            holderTypeTag = 'USER_MATCH';
+            if (userFullName && holderNameClean !== userFullName) {
+                await client.query('ROLLBACK');
+                return res.status(400).json({
+                    success: false,
+                    message: `สำหรับบัญชีผู้ใช้งาน (USER) ชื่อบัญชีธนาคารต้องตรงกับชื่อผู้ใช้งาน "${userFullName}" (ยกเว้นบัญชีหมู่บ้าน ร้านค้า หรือเจ้าของกิจการ)`
+                });
+            }
+        }
+
+        if (is_default) {
+            await client.query(`
+                UPDATE user_bank_accounts SET is_default = false WHERE account_id::text = $1::text
+            `, [String(account_id)]);
+        }
+
+        const ins = await client.query(`
+            INSERT INTO user_bank_accounts (
+                account_id, owner_type, owner_ref_id, bank_code, bank_name_th,
+                account_number, account_holder_name, account_holder_type, is_default, created_by
+            )
+            VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            RETURNING *
+        `, [
+            String(account_id),
+            normOwnerType,
+            owner_ref_id || null,
+            String(bank_code).toUpperCase(),
+            String(bank_name_th).trim(),
+            String(account_number).trim(),
+            holderNameClean,
+            holderTypeTag,
+            Boolean(is_default),
+            created_by || String(account_id)
+        ]);
+
+        await client.query('COMMIT');
+        return res.json({ success: true, bank_account: ins.rows[0] });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error('[PAY-API-03] Add Bank Account Error:', err);
+        return res.status(500).json({ success: false, message: err.message });
+    } finally {
+        client.release();
+    }
+});
+
+// [PAY-API-04] POST /api/receipts/generate-qr — สร้างใบเสร็จ & QR Payload เก็บรายละเอียดผู้รับเงิน + รายการที่จ่าย
+app.post('/api/receipts/generate-qr', async (req, res) => {
+    const {
+        tx_category = 'PACKAGE', // 'PACKAGE' | 'SHOP_ORDER' | 'WITHDRAWAL' | 'TRANSFER'
+        payer_account_id = null,
+        payer_name = 'ผู้ใช้งานระบบ',
+        receiver_account_id = null,
+        receiver_owner_type = 'SYSTEM', // 'USER' | 'VILLAGE' | 'SHOP' | 'BUSINESS' | 'SYSTEM'
+        receiver_name = 'ระบบชุมชนบ้านเรา (BAN RAO)',
+        receiver_bank_name = null,
+        receiver_account_number = null,
+        purpose_title = 'ชำระค่าบริการระบบ',
+        line_items = [],
+        total_amount = 0,
+        payment_method = 'QR_CODE',
+        payment_status = 'PENDING'
+    } = req.body;
+
+    const client = await pgPool.connect();
+    try {
+        const nowIso = new Date().toISOString();
+        const issuedAtTh = new Date().toLocaleString('th-TH', {
+            timeZone: 'Asia/Bangkok',
+            dateStyle: 'medium',
+            timeStyle: 'short'
+        });
+        const stamp = Date.now();
+        const receiptNo = `RCP-${stamp}`;
+        const qrRef = `QR-${stamp.toString().slice(-8)}`;
+        const itemsArr = Array.isArray(line_items) && line_items.length > 0
+            ? line_items
+            : [{ name: purpose_title, qty: 1, price: Number(total_amount || 0) }];
+
+        const qrPayload = {
+            schema_version: 'BANRAO_QR_V1',
+            scan_type: tx_category === 'SHOP_ORDER' ? 'SHOP_PAY_READY' : 'RECEIPT_AND_PAY',
+            receipt_no: receiptNo,
+            qr_reference: qrRef,
+            issued_at_iso: nowIso,
+            issued_at_th: issuedAtTh,
+            payer: {
+                account_id: payer_account_id,
+                name: payer_name
+            },
+            receiver: {
+                account_id: receiver_account_id,
+                owner_type: receiver_owner_type,
+                name: receiver_name,
+                bank_name: receiver_bank_name,
+                account_number: receiver_account_number
+            },
+            purpose_title,
+            line_items: itemsArr,
+            total_amount: Number(total_amount || 0),
+            currency: 'THB'
+        };
+
+        const r = await client.query(`
+            INSERT INTO payment_receipts (
+                receipt_no, qr_reference, tx_category, payer_account_id, payer_name,
+                receiver_account_id, receiver_owner_type, receiver_name,
+                receiver_bank_name, receiver_account_number, purpose_title,
+                line_items, total_amount, payment_method, payment_status, qr_payload_json, paid_at
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb, $13, $14, $15, $16::jsonb, $17)
+            RETURNING *
+        `, [
+            receiptNo,
+            qrRef,
+            tx_category,
+            payer_account_id || null,
+            payer_name,
+            receiver_account_id || null,
+            receiver_owner_type,
+            receiver_name,
+            receiver_bank_name || null,
+            receiver_account_number || null,
+            purpose_title,
+            JSON.stringify(itemsArr),
+            Number(total_amount || 0),
+            payment_method,
+            payment_status,
+            JSON.stringify(qrPayload),
+            payment_status === 'PAID' ? nowIso : null
+        ]);
+
+        return res.json({ success: true, receipt: r.rows[0], qr_payload: qrPayload });
+    } catch (err) {
+        console.error('[PAY-API-04] Generate QR Receipt Error:', err);
+        return res.status(500).json({ success: false, message: err.message });
+    } finally {
+        client.release();
+    }
+});
+
+// =========================================================================
+// [PAY-API-END]
+// =========================================================================
+
 app.listen(port, () => {
     console.log(`Server is running on port ${port}`);
 });
