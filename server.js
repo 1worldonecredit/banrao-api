@@ -11781,20 +11781,14 @@ app.get('/api/payment-channels', async (req, res) => {
     }
 });
 
-
 // -------------------------------------------------------------------------
-// [PAY-CH-03] POST /api/upload-qr — รับไฟล์รูป QR (base64 dataURL) บันทึกลงโฟลเดอร์ uploads/qr แล้วคืน URL
+// [PAY-CH-03] POST /api/upload-qr — อัปโหลดรูป QR (base64 dataURL) ขึ้น Cloudflare R2 ถาวร (payment-qr/)
 // -------------------------------------------------------------------------
-const fs = require('fs');
-const path = require('path');
-
-const qrUploadDir = path.join(process.cwd(), 'uploads', 'qr');
-fs.mkdirSync(qrUploadDir, { recursive: true });
-app.use('/uploads', express.static(path.join(process.cwd(), 'uploads')));
-
 app.post('/api/upload-qr', async (req, res) => {
     try {
+        const { S3Client: QrS3Client, PutObjectCommand: QrPutObjectCommand } = require('@aws-sdk/client-s3');
         const { data_url, file_name = 'qr.jpg' } = req.body || {};
+
         if (!data_url || typeof data_url !== 'string' || !data_url.startsWith('data:image/')) {
             return res.status(400).json({ success: false, message: 'ไฟล์รูปภาพไม่ถูกต้อง' });
         }
@@ -11805,30 +11799,57 @@ app.post('/api/upload-qr', async (req, res) => {
         }
 
         const ext = match[1].toLowerCase() === 'jpeg' ? 'jpg' : match[1].toLowerCase();
-        const base64Data = match[2];
-        const buffer = Buffer.from(base64Data, 'base64');
+        const contentType = ext === 'jpg' ? 'image/jpeg' : `image/${ext}`;
+        const buffer = Buffer.from(match[2], 'base64');
 
-        // จำกัดขนาดไฟล์ไม่เกิน 3MB เพื่อไม่ให้โหลดช้า
         if (buffer.length > 3 * 1024 * 1024) {
             return res.status(400).json({ success: false, message: 'ขนาดรูป QR ต้องไม่เกิน 3MB' });
         }
 
-        const safeName = `qr-${Date.now()}-${Math.random().toString(36).slice(2, 7)}.${ext}`;
-        const fullPath = path.join(qrUploadDir, safeName);
-        fs.writeFileSync(fullPath, buffer);
+        const r2Endpoint =
+            process.env.R2_ENDPOINT ||
+            (process.env.R2_ACCOUNT_ID ? `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com` : '');
+        const bucketName = process.env.R2_BUCKET_NAME || 'banrao-media';
+        const publicBaseUrl = String(process.env.R2_PUBLIC_URL || '').replace(/\/+$/, '');
 
-        const protocol = req.headers['x-forwarded-proto'] || req.protocol || 'https';
-        const host = req.get('host');
-        const publicUrl = `${protocol}://${host}/uploads/qr/${safeName}`;
+        if (!r2Endpoint || !process.env.R2_ACCESS_KEY_ID || !process.env.R2_SECRET_ACCESS_KEY || !publicBaseUrl) {
+            return res.status(500).json({
+                success: false,
+                message: 'ตั้งค่าตัวแปร R2 บน Railway ไม่ครบ (R2_ENDPOINT/R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_PUBLIC_URL)'
+            });
+        }
+
+        const qrR2 = new QrS3Client({
+            region: 'auto',
+            endpoint: r2Endpoint,
+            credentials: {
+                accessKeyId: process.env.R2_ACCESS_KEY_ID,
+                secretAccessKey: process.env.R2_SECRET_ACCESS_KEY
+            }
+        });
+
+        const safeName = `qr-${Date.now()}-${Math.random().toString(36).slice(2, 7)}.${ext}`;
+        const objectKey = `payment-qr/${safeName}`;
+
+        await qrR2.send(
+            new QrPutObjectCommand({
+                Bucket: bucketName,
+                Key: objectKey,
+                Body: buffer,
+                ContentType: contentType
+            })
+        );
+
+        const publicUrl = `${publicBaseUrl}/${objectKey}`;
 
         return res.json({
             success: true,
             url: publicUrl,
-            path: `/uploads/qr/${safeName}`,
-            file_name: file_name
+            key: objectKey,
+            file_name
         });
     } catch (err) {
-        console.error('[PAY-CH-03] Upload QR error:', err);
+        console.error('[PAY-CH-03] Upload QR to R2 error:', err);
         return res.status(500).json({ success: false, message: err.message });
     }
 });
