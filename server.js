@@ -11464,6 +11464,254 @@ app.post('/api/super-admin/banks', async (req, res) => {
 // [PAY-API-END]
 // =========================================================================
 
+// -------------------------------------------------------------------------
+// [RECON-API-01] GET /api/payment-methods/bank-summary — สรุปยอดเงินเข้าบัญชีรายวัน/รายเดือน (แบบไทย) + สำเร็จ/ไม่สำเร็จ
+// -------------------------------------------------------------------------
+app.get('/api/payment-methods/bank-summary', async (req, res) => {
+    const bankAccountId = String(req.query.bank_account_id || '').trim();
+    const accountId = String(req.query.account_id || '').trim();
+    const client = await pgPool.connect();
+
+    try {
+        // [1.1] ดึงรายการตรวจสอบ/กระทบยอดที่เกี่ยวข้อง
+        const listRes = await client.query(`
+            SELECT *
+            FROM bank_incoming_verifications
+            WHERE ($1 = '' OR bank_account_id::text = $1::text)
+              AND ($2 = '' OR target_account_id::text = $2::text)
+            ORDER BY created_at DESC
+        `, [bankAccountId, accountId]);
+
+        const rows = listRes.rows || [];
+        const tz = 'Asia/Bangkok';
+        const todayKey = new Date().toLocaleDateString('th-TH', {
+            timeZone: tz,
+            year: 'numeric',
+            month: '2-digit',
+            day: '2-digit'
+        });
+        const monthKey = new Date().toLocaleDateString('th-TH', {
+            timeZone: tz,
+            year: 'numeric',
+            month: 'long'
+        });
+
+        let dailySuccessAmount = 0;
+        let dailySuccessCount = 0;
+        let dailyFailedCount = 0;
+
+        let monthlySuccessAmount = 0;
+        let monthlySuccessCount = 0;
+        let monthlyFailedCount = 0;
+
+        for (const r of rows) {
+            const dt = new Date(r.created_at);
+            const rDay = dt.toLocaleDateString('th-TH', {
+                timeZone: tz,
+                year: 'numeric',
+                month: '2-digit',
+                day: '2-digit'
+            });
+            const rMonth = dt.toLocaleDateString('th-TH', {
+                timeZone: tz,
+                year: 'numeric',
+                month: 'long'
+            });
+
+            const status = String(r.verification_status || '').toUpperCase();
+            const isSuccess = status === 'APPROVED' || status === 'PAID';
+            const isFailed = status === 'REJECTED' || status === 'FAILED';
+            const amt = Number(r.matched_amount ?? r.claimed_amount ?? 0);
+
+            if (rDay === todayKey) {
+                if (isSuccess) {
+                    dailySuccessAmount += amt;
+                    dailySuccessCount += 1;
+                } else if (isFailed) {
+                    dailyFailedCount += 1;
+                }
+            }
+
+            if (rMonth === monthKey) {
+                if (isSuccess) {
+                    monthlySuccessAmount += amt;
+                    monthlySuccessCount += 1;
+                } else if (isFailed) {
+                    monthlyFailedCount += 1;
+                }
+            }
+        }
+
+        return res.json({
+            success: true,
+            summary: {
+                today_label_th: new Date().toLocaleDateString('th-TH', {
+                    timeZone: tz,
+                    dateStyle: 'full'
+                }),
+                month_label_th: new Date().toLocaleDateString('th-TH', {
+                    timeZone: tz,
+                    year: 'numeric',
+                    month: 'long'
+                }),
+                daily_success_amount: dailySuccessAmount,
+                daily_success_count: dailySuccessCount,
+                daily_failed_count: dailyFailedCount,
+                monthly_success_amount: monthlySuccessAmount,
+                monthly_success_count: monthlySuccessCount,
+                monthly_failed_count: monthlyFailedCount
+            },
+            verifications: rows
+        });
+    } catch (err) {
+        console.error('[RECON-API-01] Bank Summary Error:', err);
+        return res.status(500).json({ success: false, message: err.message });
+    } finally {
+        client.release();
+    }
+});
+
+// -------------------------------------------------------------------------
+// [RECON-API-02] POST /api/payment-methods/verifications — ผู้ใช้/แอดมินส่งยอดโอน + สลิปรอตรวจสอบ
+// -------------------------------------------------------------------------
+app.post('/api/payment-methods/verifications', async (req, res) => {
+    const {
+        bank_account_id,
+        target_account_id = null,
+        receipt_no = null,
+        tx_category = 'PACKAGE',
+        claimed_amount = 0,
+        transfer_date_th = '',
+        slip_url = '',
+        slip_note = ''
+    } = req.body;
+
+    if (!bank_account_id || Number(claimed_amount || 0) <= 0) {
+        return res.status(400).json({ success: false, message: 'กรุณาระบุบัญชีธนาคารและยอดเงินที่โอน' });
+    }
+
+    const client = await pgPool.connect();
+    try {
+        const r = await client.query(`
+            INSERT INTO bank_incoming_verifications (
+                bank_account_id, target_account_id, receipt_no, tx_category,
+                claimed_amount, transfer_date_th, slip_url, slip_note, verification_status
+            )
+            VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, 'PENDING')
+            RETURNING *
+        `, [
+            String(bank_account_id),
+            target_account_id || null,
+            receipt_no || null,
+            tx_category,
+            Number(claimed_amount),
+            transfer_date_th || null,
+            slip_url || null,
+            slip_note || null
+        ]);
+
+        return res.json({ success: true, verification: r.rows[0] });
+    } catch (err) {
+        console.error('[RECON-API-02] Create Verification Error:', err);
+        return res.status(500).json({ success: false, message: err.message });
+    } finally {
+        client.release();
+    }
+});
+
+// -------------------------------------------------------------------------
+// [RECON-API-03] POST /api/super-admin/verifications/:id/review — คีย์กระทบยอด เทียบสลิป อนุมัติเข้ากระเป๋า & ปรับสถานะชำระเงิน
+// -------------------------------------------------------------------------
+app.post('/api/super-admin/verifications/:id/review', async (req, res) => {
+    const verificationId = String(req.params.id || '').trim();
+    const {
+        decision, // 'APPROVED' | 'REJECTED' | 'FAILED'
+        matched_amount,
+        slip_note = '',
+        verified_by = null
+    } = req.body;
+
+    const normDecision = String(decision || '').toUpperCase();
+    if (!['APPROVED', 'REJECTED', 'FAILED'].includes(normDecision)) {
+        return res.status(400).json({ success: false, message: 'สถานะการตรวจไม่ถูกต้อง' });
+    }
+
+    const client = await pgPool.connect();
+    try {
+        await client.query('BEGIN');
+
+        const vRes = await client.query(`
+            SELECT * FROM bank_incoming_verifications WHERE verification_id::text = $1::text FOR UPDATE
+        `, [verificationId]);
+
+        if (vRes.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ success: false, message: 'ไม่พบรายการตรวจสอบยอดเงิน' });
+        }
+
+        const item = vRes.rows[0];
+        const finalMatched = matched_amount !== undefined && matched_amount !== ''
+            ? Number(matched_amount)
+            : Number(item.claimed_amount || 0);
+
+        // [3.1] อัปเดตสถานะการกระทบยอด
+        const updRes = await client.query(`
+            UPDATE bank_incoming_verifications
+            SET
+                verification_status = $1,
+                matched_amount = $2,
+                slip_note = COALESCE(NULLIF($3, ''), slip_note),
+                verified_by = $4,
+                verified_at = NOW(),
+                updated_at = NOW()
+            WHERE verification_id::text = $5::text
+            RETURNING *
+        `, [normDecision, finalMatched, String(slip_note || '').trim(), verified_by || null, verificationId]);
+
+        // [3.2] ถ้าอนุมัติ (APPROVED) -> เติมยอดเข้ากระเป๋าเงินหลักของผู้ใช้ (ถ้ามี target_account_id) และอัปเดตสถานะใบเสร็จเป็น PAID
+        let creditedWallet = null;
+        if (normDecision === 'APPROVED') {
+            if (item.target_account_id && finalMatched > 0) {
+                const wRes = await client.query(`
+                    UPDATE wallets
+                    SET balance = COALESCE(balance, 0) + $1, updated_at = NOW()
+                    WHERE owner_account_id::text = $2::text
+                    RETURNING *
+                `, [finalMatched, String(item.target_account_id)]);
+                creditedWallet = wRes.rows[0] || null;
+            }
+
+            if (item.receipt_no) {
+                await client.query(`
+                    UPDATE payment_receipts
+                    SET payment_status = 'PAID', paid_at = NOW()
+                    WHERE receipt_no = $1
+                `, [item.receipt_no]);
+            }
+        } else if (item.receipt_no) {
+            await client.query(`
+                UPDATE payment_receipts
+                SET payment_status = 'CANCELLED'
+                WHERE receipt_no = $1
+            `, [item.receipt_no]);
+        }
+
+        await client.query('COMMIT');
+        return res.json({
+            success: true,
+            verification: updRes.rows[0],
+            credited_wallet: creditedWallet
+        });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error('[RECON-API-03] Review Verification Error:', err);
+        return res.status(500).json({ success: false, message: err.message });
+    } finally {
+        client.release();
+    }
+});
+
+
 app.listen(port, () => {
     console.log(`Server is running on port ${port}`);
 });
