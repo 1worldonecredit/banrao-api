@@ -10461,178 +10461,194 @@ app.get('/api/packages/overview', async (req, res) => {
         client.release();
     }
 });
+
+
 // -------------------------------------------------------------------------
-// [PKG-USER-02] POST /api/packages/subscribe — เลือกแพ็กเกจ / หักกระเป๋าเงิน / สร้าง QR
+// [PKG-API-02] POST /api/packages/subscribe — สมัคร/ต่ออายุแพ็กเกจ + คืนข้อมูลใบเสร็จ/ผู้รับเงินสำหรับสร้าง QR Code
 // -------------------------------------------------------------------------
 app.post('/api/packages/subscribe', async (req, res) => {
     const {
         account_id,
-        village_id,
+        village_id = null,
         package_id,
+        payment_method = 'WALLET', // 'WALLET' | 'QR_CODE' | 'FREE'
         wallet_id = null,
-        payment_method = 'WALLET', // 'WALLET' | 'QR_CODE'
-        qr_reference = null
+        bank_account_id = null,
+        qr_reference = null,
+        receiver_name = null,
+        receiver_owner_type = null,
+        receiver_bank_name = null,
+        receiver_account_number = null
     } = req.body;
 
     if (!account_id || !package_id) {
-        return res.status(400).json({ success: false, message: 'กรุณาระบุบัญชีผู้ใช้งานและแพ็กเกจ' });
+        return res.status(400).json({ success: false, message: 'กรุณาระบุ account_id และ package_id' });
     }
 
     const client = await pgPool.connect();
     try {
         await client.query('BEGIN');
 
+        // [1.1] ดึงข้อมูลแพ็กเกจ
         const pkgRes = await client.query(`
-            SELECT * FROM packages WHERE package_id::text = $1::text LIMIT 1
+            SELECT * FROM parkgate_packages WHERE package_id::text = $1::text
         `, [String(package_id)]);
+
         if (pkgRes.rows.length === 0) {
             await client.query('ROLLBACK');
             return res.status(404).json({ success: false, message: 'ไม่พบแพ็กเกจที่เลือก' });
         }
         const pkg = pkgRes.rows[0];
-        const amount = Number(pkg.price_amount || 0);
-        const now = new Date();
+        const priceAmount = Number(pkg.price_amount || 0);
 
-        // ตรวจสิทธิ์ฟรี 1-5 ปีของหมู่บ้าน (ถ้ามี)
-        let grantYears = 0;
-        let grantUntil = null;
-        if (village_id) {
-            const vRes = await client.query(`
-                SELECT
-                    COALESCE((to_jsonb(v)->>'free_years')::int, 0) AS free_years,
-                    (to_jsonb(v)->>'package_free_until')::timestamptz AS package_free_until
-                FROM villages v
-                WHERE v.village_id::text = $1::text
+        // [1.2] ดึงบัญชีผู้รับเงินจากที่ส่งมา หรือบัญชีระบบ/ธุรกิจที่ผูกไว้ในระบบ
+        let recvName = receiver_name;
+        let recvOwnerType = receiver_owner_type || 'SYSTEM';
+        let recvBankName = receiver_bank_name;
+        let recvAccountNo = receiver_account_number;
+
+        if (!recvName) {
+            const bRes = await client.query(`
+                SELECT bank_name_th, account_number, account_holder_name, owner_type
+                FROM user_bank_accounts
+                WHERE ($1 != '' AND bank_account_id::text = $1::text)
+                   OR UPPER(owner_type) IN ('BUSINESS', 'VILLAGE', 'SHOP')
+                ORDER BY is_default DESC, created_at ASC
                 LIMIT 1
-            `, [String(village_id)]);
-            if (vRes.rows[0]) {
-                grantYears = Number(vRes.rows[0].free_years || 0);
-                grantUntil = vRes.rows[0].package_free_until ? new Date(vRes.rows[0].package_free_until) : null;
+            `, [String(bank_account_id || '')]);
+
+            if (bRes.rows.length > 0) {
+                recvName = bRes.rows[0].account_holder_name;
+                recvOwnerType = bRes.rows[0].owner_type || 'SYSTEM';
+                recvBankName = bRes.rows[0].bank_name_th;
+                recvAccountNo = bRes.rows[0].account_number;
+            } else {
+                recvName = 'ระบบชุมชนบ้านเรา (BAN RAO)';
+                recvOwnerType = 'SYSTEM';
+                recvBankName = 'บัญชีระบบกลาง';
+                recvAccountNo = '-';
             }
         }
 
-        let finalPaymentStatus = 'PAID';
-        let finalPaymentMethod = payment_method;
-        let finalAmountPaid = amount;
-        let expiresAt = new Date(now.getTime() + Number(pkg.duration_days || 365) * 24 * 60 * 60 * 1000);
+        // [1.3] ตรวจสอบวิธีชำระเงิน
+        let paymentStatus = 'PAID';
+        const methodUpper = String(payment_method || 'WALLET').toUpperCase();
+        const refCode = qr_reference || `PK-${Date.now().toString().slice(-6)}`;
 
-        if (amount === 0 || pkg.code === 'FREE') {
-            finalPaymentStatus = (grantYears > 0 || grantUntil) ? 'FREE_GRANTED' : 'PAID';
-            finalPaymentMethod = (grantYears > 0 || grantUntil) ? 'FREE_VILLAGE_GRANT' : 'FREE';
-            finalAmountPaid = 0;
-
-            if (grantUntil && grantUntil > now) {
-                expiresAt = grantUntil;
-            } else if (grantYears > 0) {
-                const d = new Date(now);
-                d.setFullYear(d.getFullYear() + Math.min(grantYears, 5));
-                expiresAt = d;
+        if (methodUpper === 'WALLET' && priceAmount > 0) {
+            if (!wallet_id) {
+                await client.query('ROLLBACK');
+                return res.status(400).json({ success: false, message: 'กรุณาเลือกกระเป๋าเงินที่จะหักยอด' });
             }
-        } else if (payment_method === 'WALLET') {
-            const wRes = wallet_id
-                ? await client.query(`
-                    SELECT * FROM wallets
-                    WHERE wallet_id::text = $1::text AND status = 'ACTIVE'
-                    FOR UPDATE
-                `, [String(wallet_id)])
-                : await client.query(`
-                    SELECT * FROM wallets
-                    WHERE owner_type = 'USER' AND owner_id::text = $1::text AND status = 'ACTIVE'
-                    FOR UPDATE
-                `, [String(account_id)]);
+            const wRes = await client.query(`
+                SELECT * FROM wallets WHERE wallet_id::text = $1::text FOR UPDATE
+            `, [String(wallet_id)]);
 
             if (wRes.rows.length === 0) {
                 await client.query('ROLLBACK');
-                return res.status(404).json({ success: false, message: 'ไม่พบกระเป๋าเงินสำหรับชำระรายการนี้' });
+                return res.status(404).json({ success: false, message: 'ไม่พบกระเป๋าเงิน' });
             }
-
-            const wallet = wRes.rows[0];
-            const currentBalance = Number(wallet.balance || 0);
-            if (currentBalance < amount) {
+            const bal = Number(wRes.rows[0].balance || 0);
+            if (bal < priceAmount) {
                 await client.query('ROLLBACK');
-                return res.status(400).json({
-                    success: false,
-                    message: `ยอดเงินในกระเป๋า "${wallet.wallet_name}" ไม่เพียงพอ (คงเหลือ ฿${currentBalance.toLocaleString()} / ต้องชำระ ฿${amount.toLocaleString()})`
-                });
+                return res.status(400).json({ success: false, message: 'ยอดเงินในกระเป๋าไม่เพียงพอ' });
             }
 
-            const afterBalance = currentBalance - amount;
             await client.query(`
-                UPDATE wallets
-                SET balance = $1, updated_at = NOW()
-                WHERE wallet_id = $2
-            `, [afterBalance, wallet.wallet_id]);
-
-            await client.query(`
-                INSERT INTO wallet_transactions (
-                    wallet_id, tx_type, direction, amount, balance_before, balance_after,
-                    reference_type, reference_id, description, created_by
-                )
-                VALUES ($1, 'PACKAGE_PAYMENT', 'OUT', $2, $3, $4, 'PACKAGE', $5, $6, $7::uuid)
-            `, [
-                wallet.wallet_id,
-                amount,
-                currentBalance,
-                afterBalance,
-                String(pkg.package_id),
-                `ชำระค่าแพ็กเกจ ${pkg.name_th}`,
-                String(account_id)
-            ]);
-        } else if (payment_method === 'QR_CODE') {
-            finalPaymentStatus = 'PENDING';
+                UPDATE wallets SET balance = balance - $1, updated_at = NOW()
+                WHERE wallet_id::text = $2::text
+            `, [priceAmount, String(wallet_id)]);
+            paymentStatus = 'PAID';
+        } else if (methodUpper === 'QR_CODE' && priceAmount > 0) {
+            // สร้าง QR รอตรวจสลิป/ยอดโอน (หรือปรับเป็น PAID เมื่อแอดมินอนุมัติในหน้า bank-reconciliation)
+            paymentStatus = 'PENDING';
         }
 
-        const subInsert = await client.query(`
-            INSERT INTO user_package_subscriptions (
-                account_id, village_id, package_id, payment_status, payment_method,
-                amount_paid, started_at, expires_at, has_seen_package_prompt
+        // [1.4] คำนวณวันหมดอายุ
+        const durationDays = Number(pkg.duration_days || 365);
+        const expiresAt = new Date(Date.now() + durationDays * 24 * 60 * 60 * 1000);
+
+        const subRes = await client.query(`
+            INSERT INTO account_package_subscriptions (
+                account_id, village_id, package_id, status, payment_status,
+                payment_method, starts_at, expires_at, updated_at
             )
-            VALUES ($1::uuid, $2, $3::uuid, $4, $5, $6, $7, $8, true)
+            VALUES ($1, $2, $3, 'ACTIVE', $4, $5, NOW(), $6, NOW())
+            ON CONFLICT (account_id) DO UPDATE SET
+                village_id = COALESCE(EXCLUDED.village_id, account_package_subscriptions.village_id),
+                package_id = EXCLUDED.package_id,
+                status = 'ACTIVE',
+                payment_status = EXCLUDED.payment_status,
+                payment_method = EXCLUDED.payment_method,
+                starts_at = NOW(),
+                expires_at = EXCLUDED.expires_at,
+                updated_at = NOW()
             RETURNING *
-        `, [
-            String(account_id),
-            village_id || null,
-            String(pkg.package_id),
-            finalPaymentStatus,
-            finalPaymentMethod,
-            finalAmountPaid,
-            now.toISOString(),
-            expiresAt.toISOString()
-        ]);
+        `, [account_id, village_id, pkg.package_id, paymentStatus, methodUpper, expiresAt.toISOString()]);
 
-        const sub = subInsert.rows[0];
-        const refCode = qr_reference || `PKG-${Date.now()}`;
+        // [1.5] บันทึกใบเสร็จ (ถ้ามีตาราง payment_receipts)
+        const receiptNo = `RCP-${Date.now()}`;
+        const purposeTitle = `ชำระค่าแพ็กเกจ: ${pkg.name_th} (${pkg.badge_tier || 'VIP'})`;
+        const lineItems = [
+            {
+                name: `${pkg.name_th} (${pkg.billing_cycle === 'YEARLY' ? 'รายปี' : 'ตามรอบบิล'})`,
+                qty: 1,
+                price: priceAmount
+            }
+        ];
 
-        await client.query(`
-            INSERT INTO package_payments (
-                subscription_id, account_id, package_id, payment_method, amount, status, qr_reference, paid_at
-            )
-            VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5, $6, $7, $8)
-        `, [
-            sub.subscription_id,
-            String(account_id),
-            String(pkg.package_id),
-            finalPaymentMethod,
-            amount,
-            finalPaymentStatus === 'PENDING' ? 'PENDING' : 'COMPLETED',
-            refCode,
-            finalPaymentStatus === 'PENDING' ? null : now.toISOString()
-        ]);
+        try {
+            await client.query(`
+                INSERT INTO payment_receipts (
+                    receipt_no, qr_reference, tx_category, payer_account_id,
+                    receiver_name, receiver_owner_type, receiver_bank_name, receiver_account_number,
+                    purpose_title, line_items, total_amount, payment_method, payment_status
+                )
+                VALUES ($1, $2, 'PACKAGE', $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12)
+            `, [
+                receiptNo,
+                refCode,
+                account_id,
+                recvName,
+                recvOwnerType,
+                recvBankName,
+                recvAccountNo,
+                purposeTitle,
+                JSON.stringify(lineItems),
+                priceAmount,
+                methodUpper,
+                paymentStatus
+            ]);
+        } catch (_) {
+            // ข้ามหากยังไม่ได้สร้างตาราง payment_receipts
+        }
 
         await client.query('COMMIT');
         return res.json({
             success: true,
+            qr_reference: refCode,
             subscription: {
-                ...sub,
-                package_code: pkg.code,
-                package_name_th: pkg.name_th,
+                ...subRes.rows[0],
+                package_name: pkg.name_th,
                 badge_tier: pkg.badge_tier
             },
-            qr_reference: refCode
+            receipt: {
+                receipt_no: receiptNo,
+                qr_reference: refCode,
+                tx_category: 'PACKAGE',
+                receiver_name: recvName,
+                receiver_owner_type: recvOwnerType,
+                receiver_bank_name: recvBankName,
+                receiver_account_number: recvAccountNo,
+                purpose_title: purposeTitle,
+                line_items: lineItems,
+                total_amount: priceAmount,
+                payment_status: paymentStatus
+            }
         });
     } catch (err) {
         await client.query('ROLLBACK');
-        console.error('[PKG-USER-02] Subscribe Package Error:', err);
+        console.error('[PKG-API-02] Subscribe Error:', err);
         return res.status(500).json({ success: false, message: err.message });
     } finally {
         client.release();
