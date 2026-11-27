@@ -11781,6 +11781,58 @@ app.get('/api/payment-channels', async (req, res) => {
     }
 });
 
+
+// -------------------------------------------------------------------------
+// [PAY-CH-03] POST /api/upload-qr — รับไฟล์รูป QR (base64 dataURL) บันทึกลงโฟลเดอร์ uploads/qr แล้วคืน URL
+// -------------------------------------------------------------------------
+const fs = require('fs');
+const path = require('path');
+
+const qrUploadDir = path.join(process.cwd(), 'uploads', 'qr');
+fs.mkdirSync(qrUploadDir, { recursive: true });
+app.use('/uploads', express.static(path.join(process.cwd(), 'uploads')));
+
+app.post('/api/upload-qr', async (req, res) => {
+    try {
+        const { data_url, file_name = 'qr.jpg' } = req.body || {};
+        if (!data_url || typeof data_url !== 'string' || !data_url.startsWith('data:image/')) {
+            return res.status(400).json({ success: false, message: 'ไฟล์รูปภาพไม่ถูกต้อง' });
+        }
+
+        const match = data_url.match(/^data:image\/(png|jpeg|jpg|webp);base64,(.+)$/i);
+        if (!match) {
+            return res.status(400).json({ success: false, message: 'รองรับเฉพาะไฟล์ JPG, PNG, WEBP' });
+        }
+
+        const ext = match[1].toLowerCase() === 'jpeg' ? 'jpg' : match[1].toLowerCase();
+        const base64Data = match[2];
+        const buffer = Buffer.from(base64Data, 'base64');
+
+        // จำกัดขนาดไฟล์ไม่เกิน 3MB เพื่อไม่ให้โหลดช้า
+        if (buffer.length > 3 * 1024 * 1024) {
+            return res.status(400).json({ success: false, message: 'ขนาดรูป QR ต้องไม่เกิน 3MB' });
+        }
+
+        const safeName = `qr-${Date.now()}-${Math.random().toString(36).slice(2, 7)}.${ext}`;
+        const fullPath = path.join(qrUploadDir, safeName);
+        fs.writeFileSync(fullPath, buffer);
+
+        const protocol = req.headers['x-forwarded-proto'] || req.protocol || 'https';
+        const host = req.get('host');
+        const publicUrl = `${protocol}://${host}/uploads/qr/${safeName}`;
+
+        return res.json({
+            success: true,
+            url: publicUrl,
+            path: `/uploads/qr/${safeName}`,
+            file_name: file_name
+        });
+    } catch (err) {
+        console.error('[PAY-CH-03] Upload QR error:', err);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+});
+
 // -------------------------------------------------------------------------
 // [PAY-CH-02] POST /api/payment-channels — เพิ่ม/อัปเดตช่องทางรับเงิน & QR ลงตาราง
 // -------------------------------------------------------------------------
