@@ -11367,6 +11367,99 @@ app.post('/api/receipts/generate-qr', async (req, res) => {
     }
 });
 
+
+// -------------------------------------------------------------------------
+// [BANK-API-01] GET /api/banks — ดึงรายชื่อธนาคาร + โลโก้ + สีประจำธนาคารจาก Database
+// -------------------------------------------------------------------------
+app.get('/api/banks', async (req, res) => {
+    const client = await pgPool.connect();
+    try {
+        const r = await client.query(`
+            SELECT
+                bank_id,
+                bank_code,
+                bank_name_th,
+                bank_name_en,
+                COALESCE(NULLIF(TRIM(short_label), ''), CONCAT(bank_code, ' — ', bank_name_th)) AS short_label,
+                COALESCE(logo_url, '') AS logo_url,
+                COALESCE(NULLIF(TRIM(brand_color), ''), '#0f172a') AS brand_color,
+                is_active,
+                sort_order
+            FROM bank_master
+            WHERE is_active = true
+            ORDER BY sort_order ASC, created_at ASC
+        `);
+        return res.json({ success: true, banks: r.rows });
+    } catch (err) {
+        console.error('[BANK-API-01] Get Banks Error:', err);
+        return res.status(500).json({ success: false, message: err.message });
+    } finally {
+        client.release();
+    }
+});
+
+// -------------------------------------------------------------------------
+// [BANK-API-02] POST /api/super-admin/banks — เพิ่ม/อัปเดตธนาคาร + โลโก้ + สีประจำธนาคาร
+// -------------------------------------------------------------------------
+app.post('/api/super-admin/banks', async (req, res) => {
+    const {
+        bank_code,
+        bank_name_th,
+        bank_name_en = '',
+        short_label = '',
+        logo_url = '',
+        brand_color = '#0f172a',
+        sort_order = 10,
+        is_active = true
+    } = req.body;
+
+    if (!bank_code || !bank_name_th) {
+        return res.status(400).json({ success: false, message: 'กรุณาระบุ bank_code และ bank_name_th' });
+    }
+
+    const codeClean = String(bank_code).trim().toUpperCase();
+    const nameThClean = String(bank_name_th).trim();
+    const labelClean = String(short_label || '').trim() || `${codeClean} — ${nameThClean}`;
+    const logoClean = String(logo_url || '').trim() || null;
+    const colorClean = String(brand_color || '#0f172a').trim();
+
+    const client = await pgPool.connect();
+    try {
+        const r = await client.query(`
+            INSERT INTO bank_master (
+                bank_code, bank_name_th, bank_name_en, short_label, logo_url, brand_color, is_active, sort_order, updated_at
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+            ON CONFLICT (bank_code) DO UPDATE SET
+                bank_name_th = EXCLUDED.bank_name_th,
+                bank_name_en = COALESCE(NULLIF(EXCLUDED.bank_name_en, ''), bank_master.bank_name_en),
+                short_label = EXCLUDED.short_label,
+                logo_url = COALESCE(EXCLUDED.logo_url, bank_master.logo_url),
+                brand_color = EXCLUDED.brand_color,
+                is_active = EXCLUDED.is_active,
+                sort_order = EXCLUDED.sort_order,
+                updated_at = NOW()
+            RETURNING *
+        `, [
+            codeClean,
+            nameThClean,
+            String(bank_name_en).trim(),
+            labelClean,
+            logoClean,
+            colorClean,
+            Boolean(is_active),
+            Number(sort_order || 10)
+        ]);
+
+        return res.json({ success: true, bank: r.rows[0] });
+    } catch (err) {
+        console.error('[BANK-API-02] Save Bank Error:', err);
+        return res.status(500).json({ success: false, message: err.message });
+    } finally {
+        client.release();
+    }
+});
+
 // =========================================================================
 // [PAY-API-END]
 // =========================================================================
