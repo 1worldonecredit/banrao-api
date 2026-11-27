@@ -10302,29 +10302,69 @@ function buildPackageStatusMeta(subRow, notifyDaysBefore = 30) {
         prompt_reason: promptReason
     };
 }
+// -------------------------------------------------------------------------
+// [PKG-HELPER-02] ตัวช่วยคำนวณรอบแจ้งเตือนเชิญชวนอัปเกรดสำหรับ User Free
+// -------------------------------------------------------------------------
+function buildFreeUpsellMeta(subRow, settingsRow) {
+    const intervalDays = Math.max(1, Number(settingsRow?.free_upsell_interval_days || 7));
+    const intervalWeeks = Number((intervalDays / 7).toFixed(1));
+    const tier = String(subRow?.badge_tier || 'FREE').toUpperCase();
+    const isFreeOrUnselected = !subRow || tier === 'FREE' || Number(subRow?.amount_paid || 0) === 0;
+
+    if (!isFreeOrUnselected) {
+        return {
+            should_show_upsell: false,
+            interval_days: intervalDays,
+            interval_weeks: intervalWeeks,
+            headline: settingsRow?.free_upsell_headline || '',
+            message: settingsRow?.free_upsell_message || ''
+        };
+    }
+
+    const now = Date.now();
+    const lastShown = subRow?.last_upsell_shown_at ? new Date(subRow.last_upsell_shown_at).getTime() : 0;
+    const elapsedDays = lastShown ? (now - lastShown) / (1000 * 60 * 60 * 24) : intervalDays;
+
+    return {
+        should_show_upsell: elapsedDays >= intervalDays,
+        interval_days: intervalDays,
+        interval_weeks: intervalWeeks,
+        headline: settingsRow?.free_upsell_headline || 'อัปเกรดแพ็กเกจเพื่อปลดล็อกสิทธิ์และเพิ่มการมองเห็น!',
+        message: settingsRow?.free_upsell_message || 'ปลดล็อกโพสต์สินค้าได้มากขึ้น ดันการมองเห็นสินค้า/บริการ และแชทประสิทธิภาพสูงขึ้น'
+    };
+}
 
 // -------------------------------------------------------------------------
-// [PKG-USER-01] GET /api/packages/overview — ดึงแพ็กเกจ + บริการ + สถานะผู้ใช้/หมู่บ้าน
+// [PKG-USER-01] GET /api/packages/overview — ดึงแพ็กเกจ + บริการ + สิทธิ์ + การตลาด Free
 // -------------------------------------------------------------------------
 app.get('/api/packages/overview', async (req, res) => {
     const accountId = String(req.query.account_id || '').trim();
     const villageId = String(req.query.village_id || '').trim();
+    const audienceFilter = String(req.query.audience || '').trim().toUpperCase(); // กรองตามกลุ่มเป้าหมาย เช่น VILLAGE / USER / SHOP / BUSINESS
     const client = await pgPool.connect();
 
     try {
+        // [1.1] ดึงการตั้งค่าระบบ (วันเตือนหมดอายุ + รอบวันเชิญชวน User Free)
         const settingsRes = await client.query(`
             SELECT * FROM package_system_settings WHERE setting_key = 'DEFAULT' LIMIT 1
         `);
         const settings = settingsRes.rows[0] || {
             notify_days_before: 30,
             free_village_years_default: 1,
+            free_upsell_interval_days: 7,
+            free_upsell_headline: 'อัปเกรดแพ็กเกจเพื่อปลดล็อกสิทธิ์และเพิ่มการมองเห็น!',
+            free_upsell_message: 'ปลดล็อกโพสต์สินค้าได้มากขึ้น ดันการมองเห็นสินค้า/บริการ และแชทประสิทธิภาพสูงขึ้น',
             qr_prompt_info: 'สแกน QR Code เพื่อชำระเงินค่าแพ็กเกจ',
             timezone_name: 'Asia/Bangkok'
         };
 
+        // [1.2] ดึงรายการแพ็กเกจทั้งหมดพร้อมฟีเจอร์ และข้อมูลระดับสิทธิ์ (target_audience, visibility_boost_level, chat_tier)
         const pkgRes = await client.query(`
             SELECT
                 p.*,
+                COALESCE(p.target_audience, 'ALL') AS target_audience,
+                COALESCE(p.visibility_boost_level, 1) AS visibility_boost_level,
+                COALESCE(p.chat_tier, 'STANDARD') AS chat_tier,
                 COALESCE(
                     json_agg(
                         json_build_object(
@@ -10341,10 +10381,12 @@ app.get('/api/packages/overview', async (req, res) => {
             FROM packages p
             LEFT JOIN package_features pf ON pf.package_id = p.package_id
             WHERE p.is_active = true
+              AND ($1 = '' OR UPPER(COALESCE(p.target_audience, 'ALL')) IN ('ALL', $1))
             GROUP BY p.package_id
             ORDER BY p.sort_order ASC, p.created_at ASC
-        `);
+        `, [audienceFilter]);
 
+        // [1.3] ตรวจสอบสิทธิ์ใช้ฟรี 1-5 ปีของหมู่บ้าน (ถ้ามี village_id)
         let villageFreeYears = 0;
         let villageFreeUntil = null;
         if (villageId) {
@@ -10362,6 +10404,7 @@ app.get('/api/packages/overview', async (req, res) => {
             }
         }
 
+        // [1.4] ดึงแพ็กเกจปัจจุบันของผู้ใช้งาน (ถ้าล็อกอินแล้ว)
         let subRow = null;
         if (accountId) {
             const sRes = await client.query(`
@@ -10369,7 +10412,11 @@ app.get('/api/packages/overview', async (req, res) => {
                     ups.*,
                     p.code AS package_code,
                     p.name_th AS package_name_th,
-                    p.badge_tier
+                    p.badge_tier,
+                    p.max_shop_products,
+                    COALESCE(p.target_audience, 'ALL') AS target_audience,
+                    COALESCE(p.visibility_boost_level, 1) AS visibility_boost_level,
+                    COALESCE(p.chat_tier, 'STANDARD') AS chat_tier
                 FROM user_package_subscriptions ups
                 JOIN packages p ON p.package_id = ups.package_id
                 WHERE ups.account_id::text = $1::text
@@ -10379,7 +10426,20 @@ app.get('/api/packages/overview', async (req, res) => {
             subRow = sRes.rows[0] || null;
         }
 
+        // [1.5] คำนวณสถานะวันหมดอายุและการแจ้งเตือนล่วงหน้า (Asia/Bangkok)
         const statusMeta = buildPackageStatusMeta(subRow, settings.notify_days_before);
+
+        // [1.6] คำนวณสิทธิ์การใช้งานจริง (โควตาสินค้า, ระดับดันการมองเห็น, ระดับแชท)
+        const fallbackFreePkg = pkgRes.rows.find((p) => p.code === 'FREE') || pkgRes.rows[0] || null;
+        const entitlements = {
+            target_audience: subRow?.target_audience || fallbackFreePkg?.target_audience || 'ALL',
+            max_shop_products: subRow ? subRow.max_shop_products : (fallbackFreePkg?.max_shop_products ?? 10),
+            visibility_boost_level: Number(subRow?.visibility_boost_level || fallbackFreePkg?.visibility_boost_level || 1),
+            chat_tier: subRow?.chat_tier || fallbackFreePkg?.chat_tier || 'STANDARD'
+        };
+
+        // [1.7] คำนวณสถานะการตลาดเชิญชวน User Free ให้อัปเกรดตามรอบวัน/สัปดาห์
+        const freeUpsell = buildFreeUpsellMeta(subRow, settings);
 
         return res.json({
             success: true,
@@ -10390,6 +10450,8 @@ app.get('/api/packages/overview', async (req, res) => {
                 has_free_grant: villageFreeYears > 0 || Boolean(villageFreeUntil)
             },
             subscription: statusMeta,
+            entitlements,
+            free_upsell: freeUpsell,
             packages: pkgRes.rows
         });
     } catch (err) {
@@ -10399,7 +10461,6 @@ app.get('/api/packages/overview', async (req, res) => {
         client.release();
     }
 });
-
 // -------------------------------------------------------------------------
 // [PKG-USER-02] POST /api/packages/subscribe — เลือกแพ็กเกจ / หักกระเป๋าเงิน / สร้าง QR
 // -------------------------------------------------------------------------
@@ -10705,30 +10766,64 @@ app.post('/api/wallets/topup', async (req, res) => {
         client.release();
     }
 });
-
-// -------------------------------------------------------------------------
-// [SUPER-ADMIN-01] PUT /api/super-admin/packages/settings — ตั้งวันเตือนล่วงหน้า + Update
-// -------------------------------------------------------------------------
 app.put('/api/super-admin/packages/settings', async (req, res) => {
-    const { notify_days_before, free_village_years_default, qr_prompt_info, updated_by } = req.body;
+    const {
+        notify_days_before,
+        free_village_years_default,
+        qr_prompt_info,
+        free_upsell_interval_days,
+        free_upsell_headline,
+        free_upsell_message,
+        updated_by
+    } = req.body;
+
     const days = Math.max(1, Number(notify_days_before ?? 30));
     const freeYears = Math.min(5, Math.max(0, Number(free_village_years_default ?? 1)));
+    const upsellDays = Math.max(1, Number(free_upsell_interval_days ?? 7));
+    const upsellHeadline =
+        free_upsell_headline !== undefined && String(free_upsell_headline).trim() !== ''
+            ? String(free_upsell_headline).trim()
+            : 'อัปเกรดแพ็กเกจเพื่อปลดล็อกสิทธิ์และเพิ่มการมองเห็น!';
+    const upsellMessage =
+        free_upsell_message !== undefined && String(free_upsell_message).trim() !== ''
+            ? String(free_upsell_message).trim()
+            : 'ปลดล็อกโพสต์สินค้าได้มากขึ้น ดันการมองเห็นสินค้า/บริการ และแชทประสิทธิภาพสูงขึ้น';
 
     const client = await pgPool.connect();
     try {
         const r = await client.query(`
             INSERT INTO package_system_settings (
-                setting_key, notify_days_before, free_village_years_default, qr_prompt_info, timezone_name, updated_by, updated_at
+                setting_key,
+                notify_days_before,
+                free_village_years_default,
+                qr_prompt_info,
+                free_upsell_interval_days,
+                free_upsell_headline,
+                free_upsell_message,
+                timezone_name,
+                updated_by,
+                updated_at
             )
-            VALUES ('DEFAULT', $1, $2, $3, 'Asia/Bangkok', $4, NOW())
+            VALUES ('DEFAULT', $1, $2, $3, $4, $5, $6, 'Asia/Bangkok', $7, NOW())
             ON CONFLICT (setting_key) DO UPDATE SET
                 notify_days_before = EXCLUDED.notify_days_before,
                 free_village_years_default = EXCLUDED.free_village_years_default,
                 qr_prompt_info = COALESCE(EXCLUDED.qr_prompt_info, package_system_settings.qr_prompt_info),
+                free_upsell_interval_days = EXCLUDED.free_upsell_interval_days,
+                free_upsell_headline = EXCLUDED.free_upsell_headline,
+                free_upsell_message = EXCLUDED.free_upsell_message,
                 updated_by = EXCLUDED.updated_by,
                 updated_at = NOW()
             RETURNING *
-        `, [days, freeYears, qr_prompt_info ?? null, updated_by || null]);
+        `, [
+            days,
+            freeYears,
+            qr_prompt_info ?? null,
+            upsellDays,
+            upsellHeadline,
+            upsellMessage,
+            updated_by || null
+        ]);
 
         return res.json({ success: true, settings: r.rows[0] });
     } catch (err) {
@@ -10738,7 +10833,6 @@ app.put('/api/super-admin/packages/settings', async (req, res) => {
         client.release();
     }
 });
-
 // -------------------------------------------------------------------------
 // [SUPER-ADMIN-02] POST / PUT / DELETE /api/super-admin/packages — จัดการแพ็กเกจ/บริการ/ราคา
 // -------------------------------------------------------------------------
