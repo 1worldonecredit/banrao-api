@@ -12203,6 +12203,251 @@ app.post('/api/admin/payment-slips/:id/verify', async (req, res) => {
     }
 });
 
+
+// -------------------------------------------------------------------------
+// [RECON-01] POST /api/admin/payment-slips/:id/review-slip
+// แอดมินฝั่งตรวจสลิป: ยืนยันสลิปถูกต้อง (SLIP_VERIFIED) หรือส่งกลับแก้ไขพร้อมมาร์คจุดผิด (NEED_FIX) หรือปฏิเสธ (REJECTED)
+// -------------------------------------------------------------------------
+app.post('/api/admin/payment-slips/:id/review-slip', async (req, res) => {
+    const submissionId = Number(req.params.id);
+    const {
+        action, // 'SLIP_VERIFIED' | 'NEED_FIX' | 'REJECTED'
+        wrong_fields = [], // เช่น ['slip_image', 'transfer_date', 'transfer_time', 'amount']
+        admin_note = '',
+        checked_by = 'ADMIN'
+    } = req.body || {};
+
+    const allowed = ['SLIP_VERIFIED', 'NEED_FIX', 'REJECTED'];
+    const finalStatus = allowed.includes(String(action).toUpperCase())
+        ? String(action).toUpperCase()
+        : 'SLIP_VERIFIED';
+
+    try {
+        const result = await pgPool.query(
+            `UPDATE payment_slip_submissions
+             SET status = $1,
+                 wrong_fields = $2::jsonb,
+                 admin_note = $3,
+                 slip_checked_by = $4,
+                 slip_checked_at = NOW()
+             WHERE submission_id = $5
+             RETURNING *`,
+            [
+                finalStatus,
+                JSON.stringify(finalStatus === 'NEED_FIX' ? wrong_fields : []),
+                admin_note,
+                checked_by,
+                submissionId
+            ]
+        );
+
+        if (!result.rows[0]) {
+            return res.status(404).json({ success: false, message: 'ไม่พบรายการสลิปนี้' });
+        }
+        return res.json({ success: true, submission: result.rows[0] });
+    } catch (err) {
+        console.error('[RECON-01] Review slip error:', err);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// -------------------------------------------------------------------------
+// [RECON-02] GET & POST /api/admin/bank-statements — แอดมินฝั่งบัญชีคีย์ยอดเงินเข้า Statement
+// -------------------------------------------------------------------------
+app.get('/api/admin/bank-statements', async (req, res) => {
+    const status = String(req.query.status || 'ALL').toUpperCase();
+    try {
+        const result = await pgPool.query(
+            status === 'ALL'
+                ? `SELECT * FROM bank_statement_entries ORDER BY received_date DESC, received_time_hms DESC LIMIT 300`
+                : `SELECT * FROM bank_statement_entries WHERE match_status = $1 ORDER BY received_date DESC, received_time_hms DESC LIMIT 300`,
+            status === 'ALL' ? [] : [status]
+        );
+        return res.json({ success: true, statements: result.rows });
+    } catch (err) {
+        console.error('[RECON-02] GET statements error:', err);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+app.post('/api/admin/bank-statements', async (req, res) => {
+    const {
+        channel_id,
+        bank_name_th,
+        account_number,
+        amount,
+        received_date,
+        received_time_hms,
+        note = '',
+        entered_by = 'ACCOUNTING_ADMIN'
+    } = req.body || {};
+
+    if (!amount || !received_date || !received_time_hms) {
+        return res.status(400).json({ success: false, message: 'กรุณาระบุยอดเงิน วันที่ และเวลาเงินเข้าให้ครบถ้วน' });
+    }
+
+    try {
+        const result = await pgPool.query(
+            `INSERT INTO bank_statement_entries (
+                channel_id, bank_name_th, account_number, amount,
+                received_date, received_time_hms, note, match_status, entered_by
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,'UNMATCHED',$8)
+            RETURNING *`,
+            [
+                channel_id ? Number(channel_id) : null,
+                bank_name_th || null,
+                account_number || null,
+                Number(amount),
+                received_date,
+                received_time_hms,
+                note,
+                entered_by
+            ]
+        );
+        return res.json({ success: true, statement: result.rows[0] });
+    } catch (err) {
+        console.error('[RECON-02] POST statement error:', err);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// -------------------------------------------------------------------------
+// [RECON-03] POST /api/admin/auto-reconcile — ฟังก์ชันกระทบยอดอัตโนมัติ (จับคู่สลิปที่ผ่านแล้วกับ Statement)
+// เงื่อนไข: บัญชีตรงกัน + ยอดเงินตรงกัน + วันที่ตรงกัน + เวลาคลาดเคลื่อนไม่เกิน tolerance_sec (ค่าเริ่มต้น 60 วินาที)
+// -------------------------------------------------------------------------
+app.post('/api/admin/auto-reconcile', async (req, res) => {
+    const toleranceSec = Number(req.body?.tolerance_sec ?? 60);
+    const verifiedBy = req.body?.verified_by || 'AUTO_RECONCILE';
+
+    const hmsToSeconds = (hms) => {
+        const [h = 0, m = 0, s = 0] = String(hms || '00:00:00').split(':').map(Number);
+        return h * 3600 + m * 60 + s;
+    };
+
+    const client = await pgPool.connect();
+    try {
+        await client.query('BEGIN');
+
+        const slipsRes = await client.query(
+            `SELECT * FROM payment_slip_submissions
+             WHERE status = 'SLIP_VERIFIED' AND matched_statement_id IS NULL
+             ORDER BY transfer_date ASC, transfer_time_hms ASC`
+        );
+        const stmtsRes = await client.query(
+            `SELECT * FROM bank_statement_entries
+             WHERE match_status = 'UNMATCHED'
+             ORDER BY received_date ASC, received_time_hms ASC`
+        );
+
+        const availableStmts = [...stmtsRes.rows];
+        const matchedPairs = [];
+
+        for (const slip of slipsRes.rows) {
+            const slipDate = String(slip.transfer_date).slice(0, 10);
+            const slipSec = hmsToSeconds(slip.transfer_time_hms);
+            const slipAmt = Number(slip.amount);
+
+            const matchIdx = availableStmts.findIndex((st) => {
+                const stDate = String(st.received_date).slice(0, 10);
+                const stAmt = Number(st.amount);
+                const sameChannel =
+                    (!slip.channel_id || !st.channel_id) ||
+                    Number(slip.channel_id) === Number(st.channel_id);
+                const timeDiff = Math.abs(hmsToSeconds(st.received_time_hms) - slipSec);
+                return sameChannel && stDate === slipDate && stAmt === slipAmt && timeDiff <= toleranceSec;
+            });
+
+            if (matchIdx !== -1) {
+                const st = availableStmts.splice(matchIdx, 1)[0];
+
+                await client.query(
+                    `UPDATE payment_slip_submissions
+                     SET status = 'APPROVED',
+                         matched_statement_id = $1,
+                         verified_by = $2,
+                         verified_at = NOW()
+                     WHERE submission_id = $3`,
+                    [st.statement_id, verifiedBy, slip.submission_id]
+                );
+
+                await client.query(
+                    `UPDATE bank_statement_entries
+                     SET match_status = 'MATCHED',
+                         matched_submission_id = $1
+                     WHERE statement_id = $2`,
+                    [slip.submission_id, st.statement_id]
+                );
+
+                if (slip.tx_category === 'PACKAGE' && slip.payer_account_id) {
+                    await client.query(
+                        `UPDATE user_package_subscriptions
+                         SET payment_status = 'PAID', updated_at = NOW()
+                         WHERE account_id = $1 AND payment_status = 'PENDING'`,
+                        [slip.payer_account_id]
+                    );
+                }
+
+                matchedPairs.push({
+                    submission_id: slip.submission_id,
+                    statement_id: st.statement_id,
+                    amount: slipAmt,
+                    qr_reference: slip.qr_reference
+                });
+            }
+        }
+
+        await client.query('COMMIT');
+        return res.json({
+            success: true,
+            matched_count: matchedPairs.length,
+            unmatched_slips: slipsRes.rows.length - matchedPairs.length,
+            matched_pairs: matchedPairs
+        });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error('[RECON-03] Auto reconcile error:', err);
+        return res.status(500).json({ success: false, message: err.message });
+    } finally {
+        client.release();
+    }
+});
+
+// -------------------------------------------------------------------------
+// [RECON-04] GET /api/admin/reconcile-summary — สรุปยอดรายวัน / รายเดือน / รายปี
+// -------------------------------------------------------------------------
+app.get('/api/admin/reconcile-summary', async (req, res) => {
+    const mode = String(req.query.mode || 'DAILY').toUpperCase(); // DAILY | MONTHLY | YEARLY
+    const groupExpr =
+        mode === 'YEARLY'
+            ? `TO_CHAR(transfer_date, 'YYYY')`
+            : mode === 'MONTHLY'
+            ? `TO_CHAR(transfer_date, 'YYYY-MM')`
+            : `TO_CHAR(transfer_date, 'YYYY-MM-DD')`;
+
+    try {
+        const result = await pgPool.query(`
+            SELECT
+                ${groupExpr} AS period_key,
+                COUNT(*) AS total_count,
+                COALESCE(SUM(amount), 0) AS total_amount,
+                COUNT(*) FILTER (WHERE status = 'APPROVED') AS approved_count,
+                COALESCE(SUM(amount) FILTER (WHERE status = 'APPROVED'), 0) AS approved_amount,
+                COUNT(*) FILTER (WHERE status IN ('PENDING', 'RESUBMITTED', 'SLIP_VERIFIED')) AS pending_count,
+                COALESCE(SUM(amount) FILTER (WHERE status IN ('PENDING', 'RESUBMITTED', 'SLIP_VERIFIED')), 0) AS pending_amount,
+                COUNT(*) FILTER (WHERE status IN ('NEED_FIX', 'REJECTED')) AS failed_count,
+                COALESCE(SUM(amount) FILTER (WHERE status IN ('NEED_FIX', 'REJECTED')), 0) AS failed_amount
+            FROM payment_slip_submissions
+            GROUP BY period_key
+            ORDER BY period_key DESC
+            LIMIT 60
+        `);
+        return res.json({ success: true, mode, rows: result.rows });
+    } catch (err) {
+        console.error('[RECON-04] Summary error:', err);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+});
+
 app.listen(port, () => {
     console.log(`Server is running on port ${port}`);
 });
