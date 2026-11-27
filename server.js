@@ -11914,6 +11914,77 @@ app.post('/api/payment-channels', async (req, res) => {
     }
 });
 
+// -------------------------------------------------------------------------
+// [COMP-01] GET /api/company-profile — ดึงข้อมูลบริษัท/เลขผู้เสียภาษี สำหรับออกใบเสร็จ
+// -------------------------------------------------------------------------
+app.get('/api/company-profile', async (req, res) => {
+    try {
+        const result = await pgPool.query(`
+            SELECT * FROM system_company_profile
+            WHERE is_active = true
+            ORDER BY profile_id ASC
+            LIMIT 1
+        `);
+        return res.json({
+            success: true,
+            profile: result.rows[0] || null
+        });
+    } catch (err) {
+        console.error('[COMP-01] GET error:', err);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// -------------------------------------------------------------------------
+// [COMP-02] POST /api/company-profile — อัปเดตข้อมูลบริษัท/เลขผู้เสียภาษี/VAT
+// -------------------------------------------------------------------------
+app.post('/api/company-profile', async (req, res) => {
+    const {
+        company_name_th,
+        company_name_en = '',
+        branch_name_th = 'สำนักงานใหญ่',
+        tax_id,
+        address_th,
+        phone = '',
+        email = '',
+        vat_rate = 7.0,
+        vat_mode = 'INCLUDED',
+        receipt_prefix = 'BR-RCP'
+    } = req.body || {};
+
+    if (!company_name_th || !tax_id || !address_th) {
+        return res.status(400).json({ success: false, message: 'กรุณากรอกชื่อระบบ/บริษัท เลขผู้เสียภาษี และที่อยู่' });
+    }
+
+    try {
+        const existing = await pgPool.query(`SELECT profile_id FROM system_company_profile ORDER BY profile_id ASC LIMIT 1`);
+        let result;
+        if (existing.rows.length > 0) {
+            result = await pgPool.query(
+                `UPDATE system_company_profile
+                 SET company_name_th = $1, company_name_en = $2, branch_name_th = $3,
+                     tax_id = $4, address_th = $5, phone = $6, email = $7,
+                     vat_rate = $8, vat_mode = $9, receipt_prefix = $10, updated_at = NOW()
+                 WHERE profile_id = $11
+                 RETURNING *`,
+                [company_name_th, company_name_en, branch_name_th, tax_id, address_th, phone, email, Number(vat_rate), vat_mode, receipt_prefix, existing.rows[0].profile_id]
+            );
+        } else {
+            result = await pgPool.query(
+                `INSERT INTO system_company_profile
+                 (company_name_th, company_name_en, branch_name_th, tax_id, address_th, phone, email, vat_rate, vat_mode, receipt_prefix)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+                 RETURNING *`,
+                [company_name_th, company_name_en, branch_name_th, tax_id, address_th, phone, email, Number(vat_rate), vat_mode, receipt_prefix]
+            );
+        }
+        return res.json({ success: true, profile: result.rows[0] });
+    } catch (err) {
+        console.error('[COMP-02] POST error:', err);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+});
+
 
 app.listen(port, () => {
     console.log(`Server is running on port ${port}`);
