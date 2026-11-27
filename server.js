@@ -12008,6 +12008,201 @@ app.post('/api/company-profile', async (req, res) => {
 });
 
 
+// -------------------------------------------------------------------------
+// [SLIP-01] POST /api/upload-slip — อัปโหลดรูปสลิปโอนเงินขึ้น Cloudflare R2 ถาวร (payment-slips/)
+// -------------------------------------------------------------------------
+app.post('/api/upload-slip', async (req, res) => {
+    try {
+        const { S3Client: SlipS3Client, PutObjectCommand: SlipPutObjectCommand } = require('@aws-sdk/client-s3');
+        const { data_url, file_name = 'slip.jpg' } = req.body || {};
+
+        if (!data_url || typeof data_url !== 'string' || !data_url.startsWith('data:image/')) {
+            return res.status(400).json({ success: false, message: 'ไฟล์รูปสลิปไม่ถูกต้อง' });
+        }
+
+        const match = data_url.match(/^data:image\/(png|jpeg|jpg|webp);base64,(.+)$/i);
+        if (!match) {
+            return res.status(400).json({ success: false, message: 'รองรับเฉพาะไฟล์ JPG, PNG, WEBP' });
+        }
+
+        const ext = match[1].toLowerCase() === 'jpeg' ? 'jpg' : match[1].toLowerCase();
+        const contentType = ext === 'jpg' ? 'image/jpeg' : `image/${ext}`;
+        const buffer = Buffer.from(match[2], 'base64');
+
+        if (buffer.length > 5 * 1024 * 1024) {
+            return res.status(400).json({ success: false, message: 'ขนาดรูปสลิปต้องไม่เกิน 5MB' });
+        }
+
+        const accountId = process.env.CF_ACCOUNT_ID || process.env.R2_ACCOUNT_ID;
+        const r2Endpoint =
+            process.env.R2_ENDPOINT ||
+            (accountId ? `https://${accountId}.r2.cloudflarestorage.com` : '');
+        const bucketName = process.env.R2_BUCKET_NAME || 'banrao-media';
+        const publicBaseUrl = String(process.env.R2_PUBLIC_URL || '').replace(/\/+$/, '');
+
+        if (!r2Endpoint || !process.env.R2_ACCESS_KEY_ID || !process.env.R2_SECRET_ACCESS_KEY || !publicBaseUrl) {
+            return res.status(500).json({
+                success: false,
+                message: 'ตั้งค่าตัวแปร R2 บน Railway ไม่ครบ (CF_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_PUBLIC_URL)'
+            });
+        }
+
+        const slipR2 = new SlipS3Client({
+            region: 'auto',
+            endpoint: r2Endpoint,
+            credentials: {
+                accessKeyId: process.env.R2_ACCESS_KEY_ID,
+                secretAccessKey: process.env.R2_SECRET_ACCESS_KEY
+            }
+        });
+
+        const safeName = `slip-${Date.now()}-${Math.random().toString(36).slice(2, 7)}.${ext}`;
+        const objectKey = `payment-slips/${safeName}`;
+
+        await slipR2.send(
+            new SlipPutObjectCommand({
+                Bucket: bucketName,
+                Key: objectKey,
+                Body: buffer,
+                ContentType: contentType
+            })
+        );
+
+        return res.json({
+            success: true,
+            url: `${publicBaseUrl}/${objectKey}`,
+            key: objectKey,
+            file_name
+        });
+    } catch (err) {
+        console.error('[SLIP-01] Upload slip to R2 error:', err);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// -------------------------------------------------------------------------
+// [SLIP-02] POST /api/payment-slips — บันทึกข้อมูลแจ้งโอน (ใครโอน เข้าบัญชีไหน เวลา HH:mm:ss + ลิงก์สลิป R2)
+// -------------------------------------------------------------------------
+app.post('/api/payment-slips', async (req, res) => {
+    const {
+        qr_reference,
+        tx_category = 'PACKAGE',
+        payer_account_id,
+        payer_name,
+        channel_id,
+        receiver_name,
+        receiver_bank_name,
+        receiver_account_number,
+        amount,
+        transfer_date,
+        transfer_time_hms,
+        slip_image_url,
+        purpose_title
+    } = req.body || {};
+
+    if (!qr_reference || !transfer_date || !transfer_time_hms || !slip_image_url) {
+        return res.status(400).json({
+            success: false,
+            message: 'กรุณาแนบสลิปและระบุวันที่/เวลาที่โอน (ชั่วโมง:นาที:วินาที) ให้ครบถ้วน'
+        });
+    }
+
+    try {
+        const result = await pgPool.query(
+            `INSERT INTO payment_slip_submissions (
+                qr_reference, tx_category, payer_account_id, payer_name,
+                channel_id, receiver_name, receiver_bank_name, receiver_account_number,
+                amount, transfer_date, transfer_time_hms, slip_image_url, purpose_title, status
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'PENDING')
+            RETURNING *`,
+            [
+                qr_reference,
+                tx_category,
+                payer_account_id || null,
+                payer_name || null,
+                channel_id ? Number(channel_id) : null,
+                receiver_name || null,
+                receiver_bank_name || null,
+                receiver_account_number || null,
+                Number(amount || 0),
+                transfer_date,
+                transfer_time_hms,
+                slip_image_url,
+                purpose_title || null
+            ]
+        );
+        return res.json({ success: true, submission: result.rows[0] });
+    } catch (err) {
+        console.error('[SLIP-02] Save payment slip error:', err);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// -------------------------------------------------------------------------
+// [SLIP-03] GET /api/admin/payment-slips — ดึงรายการแจ้งโอน/สลิปให้แอดมินตรวจกระทบยอด
+// -------------------------------------------------------------------------
+app.get('/api/admin/payment-slips', async (req, res) => {
+    const status = String(req.query.status || 'PENDING').toUpperCase();
+    try {
+        const result = await pgPool.query(
+            status === 'ALL'
+                ? `SELECT * FROM payment_slip_submissions ORDER BY created_at DESC LIMIT 200`
+                : `SELECT * FROM payment_slip_submissions WHERE status = $1 ORDER BY created_at DESC LIMIT 200`,
+            status === 'ALL' ? [] : [status]
+        );
+        return res.json({ success: true, submissions: result.rows });
+    } catch (err) {
+        console.error('[SLIP-03] GET admin slips error:', err);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// -------------------------------------------------------------------------
+// [SLIP-04] POST /api/admin/payment-slips/:id/verify — แอดมินกดอนุมัติ (APPROVED) หรือปฏิเสธ (REJECTED)
+// -------------------------------------------------------------------------
+app.post('/api/admin/payment-slips/:id/verify', async (req, res) => {
+    const submissionId = Number(req.params.id);
+    const { action = 'APPROVED', admin_note = '', verified_by = 'ADMIN' } = req.body || {};
+    const finalAction = String(action).toUpperCase() === 'REJECTED' ? 'REJECTED' : 'APPROVED';
+
+    const client = await pgPool.connect();
+    try {
+        await client.query('BEGIN');
+
+        const subRes = await client.query(
+            `UPDATE payment_slip_submissions
+             SET status = $1, admin_note = $2, verified_by = $3, verified_at = NOW()
+             WHERE submission_id = $4
+             RETURNING *`,
+            [finalAction, admin_note, verified_by, submissionId]
+        );
+
+        const slip = subRes.rows[0];
+        if (!slip) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ success: false, message: 'ไม่พบรายการสลิปนี้' });
+        }
+
+        if (finalAction === 'APPROVED' && slip.tx_category === 'PACKAGE' && slip.payer_account_id) {
+            await client.query(
+                `UPDATE user_package_subscriptions
+                 SET payment_status = 'PAID', updated_at = NOW()
+                 WHERE account_id = $1 AND payment_status = 'PENDING'`,
+                [slip.payer_account_id]
+            );
+        }
+
+        await client.query('COMMIT');
+        return res.json({ success: true, submission: slip });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error('[SLIP-04] Verify slip error:', err);
+        return res.status(500).json({ success: false, message: err.message });
+    } finally {
+        client.release();
+    }
+});
+
 app.listen(port, () => {
     console.log(`Server is running on port ${port}`);
 });
