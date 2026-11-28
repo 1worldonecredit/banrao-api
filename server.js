@@ -12969,9 +12969,6 @@ app.post('/api/security/pin-set', async (req, res) => {
     }
 });
 
-// =========================================================================
-// [WALLET-GROUP] ดึงกระเป๋าทั้งหมดที่เป็นสมาชิก (ส่วนตัว + ร้านค้า + ธุรกิจ + กรรมการ) & สร้างกระเป๋ากลุ่ม
-// =========================================================================
 app.get('/api/wallets/my-all', async (req, res) => {
     const accountId = String(req.query.account_id || '').trim();
     if (!accountId) return res.status(400).json({ success: false, message: 'กรุณาระบุ account_id' });
@@ -12980,11 +12977,13 @@ app.get('/api/wallets/my-all', async (req, res) => {
             `SELECT w.*,
                     COALESCE(wm.role, 'OWNER') AS my_role,
                     (SELECT COUNT(*)::int FROM wallet_approval_requests r
-                     WHERE r.wallet_id = w.wallet_id AND r.status = 'PENDING_APPROVAL') AS pending_count
+                     WHERE r.wallet_id::text = w.wallet_id::text AND r.status = 'PENDING_APPROVAL') AS pending_count
              FROM wallets w
              LEFT JOIN wallet_members wm
-               ON wm.wallet_id = w.wallet_id AND wm.account_id = $1 AND wm.status = 'ACTIVE'
-             WHERE (w.account_id = $1 OR wm.account_id = $1)
+               ON wm.wallet_id::text = w.wallet_id::text
+              AND wm.account_id::text = $1::text
+              AND wm.status = 'ACTIVE'
+             WHERE (w.account_id::text = $1::text OR wm.account_id::text = $1::text)
                AND COALESCE(w.status, 'ACTIVE') != 'INACTIVE'
              ORDER BY CASE WHEN w.owner_type = 'PERSONAL' THEN 0 ELSE 1 END, w.created_at ASC`,
             [accountId]
@@ -12994,7 +12993,10 @@ app.get('/api/wallets/my-all', async (req, res) => {
         for (const w of result.rows) {
             if (!w.public_code || w.public_code.length !== 13) {
                 const newCode = await generateSafeNormalPublicCode();
-                await pgPool.query(`UPDATE wallets SET public_code = $1 WHERE wallet_id = $2`, [newCode, w.wallet_id]);
+                await pgPool.query(
+                    `UPDATE wallets SET public_code = $1 WHERE wallet_id::text = $2::text`,
+                    [newCode, String(w.wallet_id)]
+                );
                 w.public_code = newCode;
             }
         }
@@ -13004,6 +13006,7 @@ app.get('/api/wallets/my-all', async (req, res) => {
         return res.status(500).json({ success: false, message: err.message });
     }
 });
+
 
 app.post('/api/wallets/create-group', async (req, res) => {
     const {
