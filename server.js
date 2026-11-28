@@ -13532,6 +13532,183 @@ app.post('/api/legal/wallet-opening-consent', async (req, res) => {
 });
 
 
+
+// =========================================================================
+// [PIN-VAULT] ศูนย์รวมรหัส PIN ในหน้า Profile (ดูด้วยรูปดวงตา + ซิงก์เป็นรหัสเดียวกันทุกตาราง)
+// =========================================================================
+const PIN_VAULT_KEY = crypto
+    .createHash('sha256')
+    .update(process.env.PIN_VAULT_SECRET || 'banrao-secure-pin-vault-2026')
+    .digest();
+
+function encryptPinForVault(plainPin) {
+    const iv = crypto.randomBytes(12);
+    const cipher = crypto.createCipheriv('aes-256-gcm', PIN_VAULT_KEY, iv);
+    const encrypted = Buffer.concat([cipher.update(String(plainPin), 'utf8'), cipher.final()]);
+    const tag = cipher.getAuthTag();
+    return `${iv.toString('hex')}:${tag.toString('hex')}:${encrypted.toString('hex')}`;
+}
+
+function decryptPinFromVault(payload) {
+    if (!payload || !String(payload).includes(':')) return null;
+    try {
+        const [ivHex, tagHex, encHex] = String(payload).split(':');
+        const decipher = crypto.createDecipheriv('aes-256-gcm', PIN_VAULT_KEY, Buffer.from(ivHex, 'hex'));
+        decipher.setAuthTag(Buffer.from(tagHex, 'hex'));
+        const decrypted = Buffer.concat([decipher.update(Buffer.from(encHex, 'hex')), decipher.final()]);
+        return decrypted.toString('utf8');
+    } catch {
+        return null;
+    }
+}
+
+// 1. ดึงสถานะรหัส PIN ทุกจุดของผู้ใช้งาน (ยังไม่เปิดเผยตัวเลข)
+app.get('/api/profile/pins/summary', async (req, res) => {
+    const accountId = String(req.query.account_id || '').trim();
+    if (!accountId) return res.status(400).json({ success: false, message: 'กรุณาระบุ account_id' });
+    try {
+        const [finRes, appRes, sigRes] = await Promise.all([
+            pgPool.query(`SELECT account_id, updated_at, (pin_encrypted IS NOT NULL) AS can_reveal FROM user_security_pins WHERE account_id::text = $1::text`, [accountId]),
+            pgPool.query(`SELECT pin_id, scope_level, pin_purpose, updated_at FROM sys_approval_pins WHERE account_id::text = $1::text AND COALESCE(is_active, TRUE) = TRUE`, [accountId]),
+            pgPool.query(`SELECT 1 FROM user_e_signatures WHERE account_id::text = $1::text AND pin_hash IS NOT NULL LIMIT 1`, [accountId]).catch(() => ({ rows: [] }))
+        ]);
+
+        return res.json({
+            success: true,
+            items: [
+                {
+                    key: 'FINANCE',
+                    label: 'รหัสการเงิน (กระเป๋าเงิน / โอนจ่าย / Multi-Sig)',
+                    is_set: finRes.rows.length > 0,
+                    can_reveal: Boolean(finRes.rows[0]?.can_reveal),
+                    updated_at: finRes.rows[0]?.updated_at || null
+                },
+                {
+                    key: 'APPROVAL',
+                    label: `รหัสอนุมัติผู้นำชุมชน / ย้ายตำแหน่ง (${appRes.rows.length} รายการ)`,
+                    is_set: appRes.rows.length > 0,
+                    can_reveal: appRes.rows.length > 0,
+                    updated_at: appRes.rows[0]?.updated_at || null
+                },
+                {
+                    key: 'ESIGN',
+                    label: 'รหัสลายเซ็นอิเล็กทรอนิกส์ (E-Signature)',
+                    is_set: sigRes.rows.length > 0,
+                    can_reveal: Boolean(finRes.rows[0]?.can_reveal),
+                    updated_at: null
+                }
+            ]
+        });
+    } catch (err) {
+        return res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// 2. กดรูปดวงตาดูรหัส (ต้องกรอกรหัสการเงินเพื่อปลดล็อก)
+app.post('/api/profile/pins/reveal', async (req, res) => {
+    const { account_id, finance_pin } = req.body || {};
+    if (!account_id || !finance_pin) {
+        return res.status(400).json({ success: false, message: 'กรุณากรอกรหัส PIN การเงิน 6 หลัก' });
+    }
+    try {
+        const check = await verifyUserPin(pgPool, account_id, finance_pin);
+        if (!check.ok) return res.status(400).json({ success: false, message: check.message });
+
+        const [finRes, appRes] = await Promise.all([
+            pgPool.query(`SELECT pin_encrypted FROM user_security_pins WHERE account_id::text = $1::text`, [account_id]),
+            pgPool.query(`SELECT pin_code, scope_level, pin_purpose FROM sys_approval_pins WHERE account_id::text = $1::text AND COALESCE(is_active, TRUE) = TRUE`, [account_id])
+        ]);
+
+        const financePlain = decryptPinFromVault(finRes.rows[0]?.pin_encrypted) || String(finance_pin);
+        const approvalPlain = appRes.rows[0]?.pin_code || 'เข้ารหัสไว้ (กดตั้งเป็นรหัสเดียวกันเพื่อซิงก์)';
+
+        return res.json({
+            success: true,
+            revealed: {
+                FINANCE: financePlain,
+                APPROVAL: approvalPlain,
+                ESIGN: financePlain
+            }
+        });
+    } catch (err) {
+        return res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// 3. ตั้ง PIN เป็นรหัสเดียวกันทั้งหมด (อัปเดตทุกตารางในครั้งเดียว)
+app.post('/api/profile/pins/sync-all', async (req, res) => {
+    const { account_id, current_finance_pin, new_pin } = req.body || {};
+    if (!account_id || !/^\d{6}$/.test(String(new_pin || ''))) {
+        return res.status(400).json({ success: false, message: 'กรุณากรอกรหัส PIN ใหม่เป็นตัวเลข 6 หลัก' });
+    }
+
+    const client = await pgPool.connect();
+    try {
+        await client.query('BEGIN');
+
+        // ถ้าเคยตั้ง PIN การเงินไว้แล้ว ต้องยืนยันรหัสเดิมก่อน
+        const existingFin = await client.query(`SELECT account_id FROM user_security_pins WHERE account_id::text = $1::text`, [account_id]);
+        if (existingFin.rows.length > 0) {
+            const check = await verifyUserPin(client, account_id, current_finance_pin);
+            if (!check.ok) {
+                await client.query('ROLLBACK');
+                return res.status(400).json({ success: false, message: `รหัสการเงินเดิมไม่ถูกต้อง: ${check.message}` });
+            }
+        }
+
+        const salt = crypto.randomBytes(16).toString('hex');
+        const scryptHash = hashPin(new_pin, salt);
+        const encryptedVault = encryptPinForVault(new_pin);
+
+        // 1) อัปเดตตาราง user_security_pins (กระเป๋าเงิน + Multi-Sig)
+        await client.query(
+            `INSERT INTO user_security_pins (account_id, pin_salt, pin_hash, pin_encrypted, is_default_pin, failed_attempts, locked_until, updated_at)
+             VALUES ($1, $2, $3, $4, FALSE, 0, NULL, NOW())
+             ON CONFLICT (account_id) DO UPDATE
+             SET pin_salt = EXCLUDED.pin_salt,
+                 pin_hash = EXCLUDED.pin_hash,
+                 pin_encrypted = EXCLUDED.pin_encrypted,
+                 is_default_pin = FALSE,
+                 failed_attempts = 0,
+                 locked_until = NULL,
+                 updated_at = NOW()`,
+            [account_id, salt, scryptHash, encryptedVault]
+        );
+
+        // 2) อัปเดตตาราง sys_approval_pins (ผังผู้นำ / ย้ายตำแหน่ง)
+        const appUpd = await client.query(
+            `UPDATE sys_approval_pins
+             SET pin_code = $1, pin_hash = $2, updated_at = NOW()
+             WHERE account_id::text = $3::text`,
+            [String(new_pin), scryptHash, account_id]
+        );
+
+        // 3) อัปเดตตาราง user_e_signatures (ลายเซ็นอิเล็กทรอนิกส์)
+        let sigCount = 0;
+        try {
+            const sigUpd = await client.query(
+                `UPDATE user_e_signatures SET pin_hash = $1 WHERE account_id::text = $2::text`,
+                [scryptHash, account_id]
+            );
+            sigCount = sigUpd.rowCount;
+        } catch {
+            // ข้ามหากยังไม่มีแถวลายเซ็น
+        }
+
+        await client.query('COMMIT');
+        return res.json({
+            success: true,
+            message: `ตั้งรหัส PIN เป็นชุดเดียวกันเรียบร้อยแล้ว! (อัปเดตการเงิน 1, ผู้นำ/ย้ายตำแหน่ง ${appUpd.rowCount}, ลายเซ็น ${sigCount})`
+        });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error('[PIN-VAULT] sync-all error:', err);
+        return res.status(500).json({ success: false, message: err.message });
+    } finally {
+        client.release();
+    }
+});
+
 app.listen(port, () => {
     console.log(`Server is running on port ${port}`);
 });
