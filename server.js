@@ -11939,20 +11939,111 @@ app.post('/api/payment-channels', async (req, res) => {
 // -------------------------------------------------------------------------
 // [COMP-01] GET /api/company-profile — ดึงข้อมูลบริษัท/เลขผู้เสียภาษี สำหรับออกใบเสร็จ
 // -------------------------------------------------------------------------
+// -------------------------------------------------------------------------
+// [COMPANY-01] GET /api/company-profile — ดึงข้อมูลผู้ออกใบกำกับภาษี
+// -------------------------------------------------------------------------
 app.get('/api/company-profile', async (req, res) => {
     try {
-        const result = await pgPool.query(`
-            SELECT * FROM system_company_profile
-            WHERE is_active = true
-            ORDER BY profile_id ASC
-            LIMIT 1
-        `);
-        return res.json({
-            success: true,
-            profile: result.rows[0] || null
-        });
+        const result = await pgPool.query(
+            `SELECT * FROM system_company_profile ORDER BY id ASC LIMIT 1`
+        );
+        if (result.rows.length === 0) {
+            return res.json({
+                success: true,
+                profile: {
+                    company_name_th: 'ระบบชุมชนบ้านเรา (BAN RAO)',
+                    branch_name: 'สำนักงานใหญ่',
+                    address_full: 'เลขที่ 99/9 หมู่ที่ 1 ตำบลในเมือง อำเภอเมือง จังหวัดกรุงเทพมหานคร 10100',
+                    tax_id: '0-1055-69000-00-0',
+                    phone: '02-000-0000',
+                    email: 'support@banrao.life',
+                    vat_rate: 7
+                }
+            });
+        }
+        return res.json({ success: true, profile: result.rows[0] });
     } catch (err) {
-        console.error('[COMP-01] GET error:', err);
+        console.error('[COMPANY-01] GET error:', err);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// -------------------------------------------------------------------------
+// [COMPANY-02] PUT /api/admin/company-profile — อัปเดตข้อมูลผู้ออกใบกำกับภาษี
+// -------------------------------------------------------------------------
+app.put('/api/admin/company-profile', async (req, res) => {
+    const {
+        company_name_th = '',
+        branch_name = 'สำนักงานใหญ่',
+        address_full = '',
+        tax_id = '',
+        phone = '',
+        email = '',
+        vat_rate = 7
+    } = req.body || {};
+
+    if (!company_name_th.trim() || !address_full.trim()) {
+        return res.status(400).json({
+            success: false,
+            message: 'กรุณาระบุชื่อผู้ออกใบกำกับภาษีและที่อยู่ให้ครบถ้วน'
+        });
+    }
+
+    const safeVat = Number.isFinite(Number(vat_rate)) ? Number(vat_rate) : 7;
+
+    try {
+        const existing = await pgPool.query(
+            `SELECT id FROM system_company_profile ORDER BY id ASC LIMIT 1`
+        );
+
+        let saved;
+        if (existing.rows.length > 0) {
+            const upd = await pgPool.query(
+                `UPDATE system_company_profile
+                 SET company_name_th = $1,
+                     branch_name = $2,
+                     address_full = $3,
+                     tax_id = $4,
+                     phone = $5,
+                     email = $6,
+                     vat_rate = $7,
+                     updated_at = NOW()
+                 WHERE id = $8
+                 RETURNING *`,
+                [
+                    company_name_th.trim(),
+                    branch_name.trim(),
+                    address_full.trim(),
+                    tax_id.trim(),
+                    phone.trim(),
+                    email.trim(),
+                    safeVat,
+                    existing.rows[0].id
+                ]
+            );
+            saved = upd.rows[0];
+        } else {
+            const ins = await pgPool.query(
+                `INSERT INTO system_company_profile (
+                    company_name_th, branch_name, address_full, tax_id, phone, email, vat_rate
+                ) VALUES ($1,$2,$3,$4,$5,$6,$7)
+                RETURNING *`,
+                [
+                    company_name_th.trim(),
+                    branch_name.trim(),
+                    address_full.trim(),
+                    tax_id.trim(),
+                    phone.trim(),
+                    email.trim(),
+                    safeVat
+                ]
+            );
+            saved = ins.rows[0];
+        }
+
+        return res.json({ success: true, profile: saved });
+    } catch (err) {
+        console.error('[COMPANY-02] PUT error:', err);
         return res.status(500).json({ success: false, message: err.message });
     }
 });
