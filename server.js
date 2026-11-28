@@ -13459,7 +13459,7 @@ app.get('/api/legal/wallet-opening-status', async (req, res) => {
 });
 
 // =========================================================================
-// [LEGAL-02] POST /api/legal/wallet-opening-consent — ยื่นคำขอเปิดบัญชี + ยืนยัน PIN + อนุมัติอัตโนมัติ (แผนกการตลาด)
+// [LEGAL-02] POST /api/legal/wallet-opening-consent — ยื่นคำขอเปิดบัญชี + สร้างกระเป๋าอัตโนมัติ + อนุมัติโดยแผนกการตลาด
 // =========================================================================
 app.post('/api/legal/wallet-opening-consent', async (req, res) => {
     const { account_id, applicant_name = '', accepted_terms = false, pin } = req.body || {};
@@ -13474,15 +13474,19 @@ app.post('/api/legal/wallet-opening-consent', async (req, res) => {
     try {
         await client.query('BEGIN');
 
-        // 1. ถ้ายังไม่มี PIN ให้บันทึก PIN 6 หลักนี้ให้เลย / ถ้ามีแล้วให้ตรวจสอบ PIN เดิม
-        const existingPin = await client.query(`SELECT account_id FROM user_security_pins WHERE account_id = $1`, [account_id]);
+        // 1. บันทึกหรือตรวจสอบรหัส PIN 6 หลัก
+        const existingPin = await client.query(
+            `SELECT account_id FROM user_security_pins WHERE account_id::text = $1::text`,
+            [account_id]
+        );
         if (existingPin.rows.length === 0) {
             const salt = crypto.randomBytes(16).toString('hex');
             const hashed = hashPin(pin, salt);
+            const encryptedVault = typeof encryptPinForVault === 'function' ? encryptPinForVault(pin) : null;
             await client.query(
-                `INSERT INTO user_security_pins (account_id, pin_salt, pin_hash, failed_attempts, updated_at)
-                 VALUES ($1, $2, $3, 0, NOW())`,
-                [account_id, salt, hashed]
+                `INSERT INTO user_security_pins (account_id, pin_salt, pin_hash, pin_encrypted, failed_attempts, updated_at)
+                 VALUES ($1, $2, $3, $4, 0, NOW())`,
+                [account_id, salt, hashed, encryptedVault]
             );
         } else {
             const pinCheck = await verifyUserPin(client, account_id, pin);
@@ -13492,7 +13496,7 @@ app.post('/api/legal/wallet-opening-consent', async (req, res) => {
             }
         }
 
-        // 2. ดึงเอกสารทางกฎหมายเวอร์ชันล่าสุดที่ใช้งานอยู่
+        // 2. ดึงเอกสารทางกฎหมายเวอร์ชันล่าสุด
         const docRes = await client.query(
             `SELECT doc_id, version FROM legal_documents
              WHERE doc_code = 'WALLET_OPENING_TERMS' AND is_active = TRUE
@@ -13501,7 +13505,7 @@ app.post('/api/legal/wallet-opening-consent', async (req, res) => {
         const docId = docRes.rows[0]?.doc_id || null;
         const docVersion = docRes.rows[0]?.version || '1.0';
 
-        // 3. เก็บ IP และ User-Agent เป็นหลักฐานทางกฎหมาย + อนุมัติอัตโนมัติโดยแผนกการตลาด
+        // 3. บันทึกหลักฐานการขอเปิดบัญชี (Append-Only) + อนุมัติอัตโนมัติโดยแผนกการตลาด
         const ip = String(req.headers['x-forwarded-for'] || req.socket?.remoteAddress || '').split(',')[0].trim();
         const ua = String(req.headers['user-agent'] || '').slice(0, 500);
 
@@ -13516,11 +13520,40 @@ app.post('/api/legal/wallet-opening-consent', async (req, res) => {
             [account_id, applicant_name, docId, docVersion, ip, ua]
         );
 
+        // 4. เช็กว่ามีกระเป๋าส่วนตัวหรือยัง — ถ้ายังไม่มี ให้สร้างกระเป๋า + ออกรหัส 10 หลัก (BR-XXXXXXXXXX) อัตโนมัติทันที
+        const existingWallet = await client.query(
+            `SELECT wallet_id, public_code FROM wallets WHERE account_id::text = $1::text LIMIT 1`,
+            [account_id]
+        );
+
+        let createdWallet = existingWallet.rows[0] || null;
+        if (!createdWallet) {
+            const newWalletId = `WLT-${crypto.randomUUID().slice(0, 12).toUpperCase()}`;
+            const newCode = await generateSafeNormalPublicCode();
+            const wIns = await client.query(
+                `INSERT INTO wallets (
+                    wallet_id, account_id, wallet_name, owner_type, balance, locked_balance,
+                    required_approvals, public_code, status, created_at, updated_at
+                ) VALUES ($1,$2,$3,'PERSONAL',0,0,1,$4,'ACTIVE',NOW(),NOW())
+                RETURNING *`,
+                [newWalletId, account_id, applicant_name || 'กระเป๋าเงินของฉัน', newCode]
+            );
+            createdWallet = wIns.rows[0];
+
+            await client.query(
+                `INSERT INTO wallet_members (wallet_id, account_id, member_name, role, status, added_by)
+                 VALUES ($1,$2,$3,'OWNER','ACTIVE',$2)
+                 ON CONFLICT (wallet_id, account_id) DO NOTHING`,
+                [newWalletId, account_id, applicant_name || 'เจ้าของบัญชี']
+            );
+        }
+
         await client.query('COMMIT');
         return res.json({
             success: true,
             consent: ins.rows[0] || { account_id, approval_status: 'AUTO_APPROVED' },
-            message: 'อนุมัติเปิดบัญชีอัตโนมัติเรียบร้อยแล้ว (โดยฝ่ายดูแลลูกค้า แผนกการตลาด)'
+            wallet: createdWallet,
+            message: `อนุมัติเปิดบัญชีสำเร็จ! รหัสบัญชีของคุณคือ ${createdWallet.public_code} (อนุมัติอัตโนมัติโดยแผนกการตลาด)`
         });
     } catch (err) {
         await client.query('ROLLBACK');
