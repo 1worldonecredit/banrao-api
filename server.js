@@ -12889,6 +12889,541 @@ app.post('/api/admin/premium-numbers/seed-batch', async (req, res) => {
     }
 });
 
+// =========================================================================
+// [SECURITY-PIN] ระบบรหัส PIN 6 หลัก (scrypt + salt) สำหรับยืนยันธุรกรรมและอนุมัติ
+// =========================================================================
+function hashPin(pin, salt) {
+    return crypto.scryptSync(String(pin), String(salt), 64).toString('hex');
+}
+
+async function verifyUserPin(clientOrPool, accountId, pin) {
+    if (!/^\d{6}$/.test(String(pin || ''))) {
+        return { ok: false, message: 'กรุณากรอกรหัส PIN ตัวเลข 6 หลัก' };
+    }
+    const res = await clientOrPool.query(
+        `SELECT * FROM user_security_pins WHERE account_id = $1`,
+        [accountId]
+    );
+    if (res.rows.length === 0) {
+        return { ok: false, code: 'NO_PIN', message: 'คุณยังไม่ได้ตั้งรหัส PIN 6 หลัก กรุณาตั้งรหัสก่อนทำรายการ' };
+    }
+    const row = res.rows[0];
+    if (row.locked_until && new Date(row.locked_until) > new Date()) {
+        return { ok: false, message: 'รหัส PIN ถูกล็อกชั่วคราวเนื่องจากกรอกผิดหลายครั้ง กรุณารอ 15 นาที' };
+    }
+    const computed = hashPin(pin, row.pin_salt);
+    if (computed !== row.pin_hash) {
+        const nextFail = Number(row.failed_attempts || 0) + 1;
+        const lockSql = nextFail >= 5 ? `, locked_until = NOW() + INTERVAL '15 minutes'` : '';
+        await clientOrPool.query(
+            `UPDATE user_security_pins SET failed_attempts = $1 ${lockSql}, updated_at = NOW() WHERE account_id = $2`,
+            [nextFail, accountId]
+        );
+        return { ok: false, message: `รหัส PIN ไม่ถูกต้อง (ผิดครั้งที่ ${nextFail}/5)` };
+    }
+    if (row.failed_attempts > 0) {
+        await clientOrPool.query(
+            `UPDATE user_security_pins SET failed_attempts = 0, locked_until = NULL, updated_at = NOW() WHERE account_id = $1`,
+            [accountId]
+        );
+    }
+    return { ok: true };
+}
+
+app.get('/api/security/pin-status', async (req, res) => {
+    const accountId = String(req.query.account_id || '').trim();
+    if (!accountId) return res.status(400).json({ success: false, message: 'กรุณาระบุ account_id' });
+    try {
+        const r = await pgPool.query(`SELECT account_id FROM user_security_pins WHERE account_id = $1`, [accountId]);
+        return res.json({ success: true, has_pin: r.rows.length > 0 });
+    } catch (err) {
+        return res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+app.post('/api/security/pin-set', async (req, res) => {
+    const { account_id, pin, old_pin } = req.body || {};
+    if (!account_id || !/^\d{6}$/.test(String(pin || ''))) {
+        return res.status(400).json({ success: false, message: 'กรุณาระบุรหัส PIN เป็นตัวเลข 6 หลัก' });
+    }
+    try {
+        const existing = await pgPool.query(`SELECT account_id FROM user_security_pins WHERE account_id = $1`, [account_id]);
+        if (existing.rows.length > 0) {
+            const check = await verifyUserPin(pgPool, account_id, old_pin);
+            if (!check.ok) return res.status(400).json({ success: false, message: `รหัส PIN เดิมไม่ถูกต้อง: ${check.message}` });
+        }
+        const salt = crypto.randomBytes(16).toString('hex');
+        const hashed = hashPin(pin, salt);
+        await pgPool.query(
+            `INSERT INTO user_security_pins (account_id, pin_salt, pin_hash, failed_attempts, locked_until, updated_at)
+             VALUES ($1, $2, $3, 0, NULL, NOW())
+             ON CONFLICT (account_id) DO UPDATE
+             SET pin_salt = EXCLUDED.pin_salt, pin_hash = EXCLUDED.pin_hash, failed_attempts = 0, locked_until = NULL, updated_at = NOW()`,
+            [account_id, salt, hashed]
+        );
+        return res.json({ success: true, message: 'บันทึกรหัส PIN 6 หลักเรียบร้อยแล้ว' });
+    } catch (err) {
+        return res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// =========================================================================
+// [WALLET-GROUP] ดึงกระเป๋าทั้งหมดที่เป็นสมาชิก (ส่วนตัว + ร้านค้า + ธุรกิจ + กรรมการ) & สร้างกระเป๋ากลุ่ม
+// =========================================================================
+app.get('/api/wallets/my-all', async (req, res) => {
+    const accountId = String(req.query.account_id || '').trim();
+    if (!accountId) return res.status(400).json({ success: false, message: 'กรุณาระบุ account_id' });
+    try {
+        const result = await pgPool.query(
+            `SELECT w.*,
+                    COALESCE(wm.role, 'OWNER') AS my_role,
+                    (SELECT COUNT(*)::int FROM wallet_approval_requests r
+                     WHERE r.wallet_id = w.wallet_id AND r.status = 'PENDING_APPROVAL') AS pending_count
+             FROM wallets w
+             LEFT JOIN wallet_members wm
+               ON wm.wallet_id = w.wallet_id AND wm.account_id = $1 AND wm.status = 'ACTIVE'
+             WHERE (w.account_id = $1 OR wm.account_id = $1)
+               AND COALESCE(w.status, 'ACTIVE') != 'INACTIVE'
+             ORDER BY CASE WHEN w.owner_type = 'PERSONAL' THEN 0 ELSE 1 END, w.created_at ASC`,
+            [accountId]
+        );
+
+        // แจกรหัส 10 หลัก (BR-XXXXXXXXXX) อัตโนมัติให้กระเป๋าที่ยังไม่มีรหัสหรือยังเป็น 8 หลัก
+        for (const w of result.rows) {
+            if (!w.public_code || w.public_code.length !== 13) {
+                const newCode = await generateSafeNormalPublicCode();
+                await pgPool.query(`UPDATE wallets SET public_code = $1 WHERE wallet_id = $2`, [newCode, w.wallet_id]);
+                w.public_code = newCode;
+            }
+        }
+        return res.json({ success: true, wallets: result.rows });
+    } catch (err) {
+        console.error('[WALLET-GROUP] my-all error:', err);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+app.post('/api/wallets/create-group', async (req, res) => {
+    const {
+        account_id,
+        creator_name = 'ผู้สร้างกลุ่ม',
+        wallet_name,
+        owner_type = 'SHOP',       // 'SHOP' | 'BUSINESS' | 'COMMITTEE'
+        required_approvals = 1,    // 1 | 2 | 3
+        logo_url = null            // URL รูปโลโก้บน Cloudflare R2
+    } = req.body || {};
+
+    if (!account_id || !String(wallet_name || '').trim()) {
+        return res.status(400).json({ success: false, message: 'กรุณาระบุชื่อกระเป๋า/ชื่อร้านค้า/ชื่อกลุ่ม' });
+    }
+    const reqApp = Math.min(3, Math.max(1, Number(required_approvals) || 1));
+    const allowedTypes = ['SHOP', 'BUSINESS', 'COMMITTEE'];
+    const safeType = allowedTypes.includes(owner_type) ? owner_type : 'SHOP';
+
+    const client = await pgPool.connect();
+    try {
+        await client.query('BEGIN');
+        const newWalletId = `WLT-${crypto.randomUUID().slice(0, 12).toUpperCase()}`;
+        const newCode = await generateSafeNormalPublicCode();
+
+        const wIns = await client.query(
+            `INSERT INTO wallets (
+                wallet_id, account_id, wallet_name, owner_type, balance, locked_balance,
+                required_approvals, public_code, logo_url, status, created_at, updated_at
+            ) VALUES ($1,$2,$3,$4,0,0,$5,$6,$7,'ACTIVE',NOW(),NOW())
+            RETURNING *`,
+            [newWalletId, account_id, wallet_name.trim(), safeType, reqApp, newCode, logo_url]
+        );
+
+        await client.query(
+            `INSERT INTO wallet_members (wallet_id, account_id, member_name, role, status, added_by)
+             VALUES ($1,$2,$3,'OWNER','ACTIVE',$2)`,
+            [newWalletId, account_id, creator_name]
+        );
+
+        await client.query('COMMIT');
+        return res.json({ success: true, wallet: wIns.rows[0] });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error('[WALLET-GROUP] create-group error:', err);
+        return res.status(500).json({ success: false, message: err.message });
+    } finally {
+        client.release();
+    }
+});
+
+// =========================================================================
+// [WALLET-MEMBERS] จัดการรายชื่อกรรมการ (เพิ่มด้วยรหัส BR-XXXXXXXXXX / ปิด-เปิดสิทธิ์)
+// =========================================================================
+app.get('/api/wallets/:walletId/members', async (req, res) => {
+    try {
+        const r = await pgPool.query(
+            `SELECT * FROM wallet_members WHERE wallet_id = $1 ORDER BY created_at ASC`,
+            [req.params.walletId]
+        );
+        return res.json({ success: true, members: r.rows });
+    } catch (err) {
+        return res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+app.post('/api/wallets/:walletId/members', async (req, res) => {
+    const { walletId } = req.params;
+    const { added_by, member_public_code, role = 'APPROVER' } = req.body || {};
+    if (!added_by || !member_public_code) {
+        return res.status(400).json({ success: false, message: 'กรุณาระบุรหัส Banrao ID ของกรรมการที่จะเพิ่ม' });
+    }
+    const safeRole = ['APPROVER', 'MAKER', 'VIEWER'].includes(role) ? role : 'APPROVER';
+    try {
+        // ตรวจว่าผู้เพิ่มเป็น OWNER
+        const ownerCheck = await pgPool.query(
+            `SELECT 1 FROM wallet_members WHERE wallet_id = $1 AND account_id = $2 AND role = 'OWNER' AND status = 'ACTIVE'`,
+            [walletId, added_by]
+        );
+        if (ownerCheck.rows.length === 0) {
+            return res.status(403).json({ success: false, message: 'เฉพาะเจ้าของกระเป๋า (OWNER) เท่านั้นที่เพิ่มกรรมการได้' });
+        }
+
+        // ค้นหา account_id จากรหัส BR-XXXXXXXXXX
+        const targetRes = await pgPool.query(
+            `SELECT account_id, wallet_name FROM wallets WHERE UPPER(public_code) = $1 LIMIT 1`,
+            [String(member_public_code).trim().toUpperCase()]
+        );
+        if (targetRes.rows.length === 0) {
+            return res.status(404).json({ success: false, message: 'ไม่พบรหัส Banrao ID นี้ในระบบ' });
+        }
+        const target = targetRes.rows[0];
+
+        const ins = await pgPool.query(
+            `INSERT INTO wallet_members (wallet_id, account_id, member_name, role, status, added_by)
+             VALUES ($1,$2,$3,$4,'ACTIVE',$5)
+             ON CONFLICT (wallet_id, account_id) DO UPDATE
+             SET role = EXCLUDED.role, status = 'ACTIVE'
+             RETURNING *`,
+            [walletId, target.account_id, target.wallet_name, safeRole, added_by]
+        );
+        return res.json({ success: true, member: ins.rows[0] });
+    } catch (err) {
+        return res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// =========================================================================
+// [WALLET-TRANSFER & MULTI-SIG] โอนทันที (1 คน) หรือ สร้างคำขอรออนุมัติ (2-3 คน ไม่พร้อมกัน)
+// =========================================================================
+app.get('/api/wallets/lookup', async (req, res) => {
+    const code = String(req.query.code || '').trim().toUpperCase();
+    if (!code) return res.status(400).json({ success: false, message: 'กรุณาระบุรหัสบัญชี' });
+    try {
+        const result = await pgPool.query(
+            `SELECT wallet_id, account_id, wallet_name, owner_type, public_code, logo_url
+             FROM wallets WHERE UPPER(public_code) = $1 LIMIT 1`,
+            [code]
+        );
+        if (result.rows.length === 0) return res.status(404).json({ success: false, message: 'ไม่พบรหัสบัญชีนี้ในระบบ' });
+        return res.json({ success: true, target: result.rows[0] });
+    } catch (err) {
+        return res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+app.post('/api/wallets/transfer', async (req, res) => {
+    const {
+        from_wallet_id,
+        actor_account_id,
+        actor_name = 'ผู้ทำรายการ',
+        to_public_code,
+        amount,
+        tx_type = 'TRANSFER_OUT',
+        note = '',
+        attachment_url = null, // หลักฐาน/ใบแจ้งหนี้บน R2
+        pin
+    } = req.body || {};
+
+    const transferAmt = Number(amount);
+    if (!from_wallet_id || !actor_account_id || !to_public_code || !Number.isFinite(transferAmt) || transferAmt <= 0) {
+        return res.status(400).json({ success: false, message: 'ข้อมูลการโอนไม่ครบถ้วน หรือยอดเงินไม่ถูกต้อง' });
+    }
+
+    const client = await pgPool.connect();
+    try {
+        await client.query('BEGIN');
+
+        // 1. ยืนยัน PIN 6 หลักของผู้ทำรายการ
+        const pinCheck = await verifyUserPin(client, actor_account_id, pin);
+        if (!pinCheck.ok) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ success: false, code: pinCheck.code, message: pinCheck.message });
+        }
+
+        // 2. ตรวจสิทธิ์ในกระเป๋าต้นทาง
+        const memRes = await client.query(
+            `SELECT role FROM wallet_members WHERE wallet_id = $1 AND account_id = $2 AND status = 'ACTIVE'`,
+            [from_wallet_id, actor_account_id]
+        );
+        const myRole = memRes.rows[0]?.role;
+        if (!myRole || myRole === 'VIEWER') {
+            await client.query('ROLLBACK');
+            return res.status(403).json({ success: false, message: 'คุณไม่มีสิทธิ์ทำรายการโอนจากกระเป๋านี้' });
+        }
+
+        // 3. ล็อกกระเป๋าต้นทางและปลายทาง
+        const fromRes = await client.query(`SELECT * FROM wallets WHERE wallet_id = $1 FOR UPDATE`, [from_wallet_id]);
+        const toRes = await client.query(`SELECT * FROM wallets WHERE UPPER(public_code) = $1 FOR UPDATE`, [String(to_public_code).trim().toUpperCase()]);
+        if (fromRes.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ success: false, message: 'ไม่พบกระเป๋าต้นทาง' }); }
+        if (toRes.rows.length === 0) { await client.query('ROLLBACK'); return res.status(404).json({ success: false, message: 'ไม่พบรหัสบัญชีปลายทาง' }); }
+
+        const fromW = fromRes.rows[0];
+        const toW = toRes.rows[0];
+        if (String(fromW.wallet_id) === String(toW.wallet_id)) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ success: false, message: 'ไม่สามารถโอนเข้ากระเป๋าเดิมได้' });
+        }
+
+        const availableBal = Number(fromW.balance || 0) - Number(fromW.locked_balance || 0);
+        if (availableBal < transferAmt) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ success: false, message: `ยอดเงินที่ใช้ได้ไม่พอ (ใช้ได้ ฿${availableBal.toLocaleString()})` });
+        }
+
+        const reqApprovals = Number(fromW.required_approvals || 1);
+        const canApprove = myRole === 'OWNER' || myRole === 'APPROVER';
+
+        // กรณี A: อนุมัติ 1 คน และผู้ทำรายการมีสิทธิ์อนุมัติ -> ตัดเงินโอนทันที
+        if (reqApprovals <= 1 && canApprove) {
+            const fromBefore = Number(fromW.balance || 0);
+            const fromAfter = Number((fromBefore - transferAmt).toFixed(2));
+            const toBefore = Number(toW.balance || 0);
+            const toAfter = Number((toBefore + transferAmt).toFixed(2));
+            const baseRef = `TX-${Date.now().toString().slice(-8)}`;
+
+            await client.query(`UPDATE wallets SET balance = $1, updated_at = NOW() WHERE wallet_id = $2`, [fromAfter, fromW.wallet_id]);
+            await client.query(`UPDATE wallets SET balance = $1, updated_at = NOW() WHERE wallet_id = $2`, [toAfter, toW.wallet_id]);
+
+            await client.query(
+                `INSERT INTO wallet_transactions (tx_ref, wallet_id, account_id, tx_type, direction, amount, balance_before, balance_after, counterparty_code, counterparty_name, note, status)
+                 VALUES ($1,$2,$3,$4,'DEBIT',$5,$6,$7,$8,$9,$10,'COMPLETED')`,
+                [`${baseRef}-OUT`, fromW.wallet_id, actor_account_id, tx_type, transferAmt, fromBefore, fromAfter, toW.public_code, toW.wallet_name, note || 'โอนเงินในระบบ']
+            );
+            await client.query(
+                `INSERT INTO wallet_transactions (tx_ref, wallet_id, account_id, tx_type, direction, amount, balance_before, balance_after, counterparty_code, counterparty_name, note, status)
+                 VALUES ($1,$2,$3,'TRANSFER_IN','CREDIT',$4,$5,$6,$7,$8,$9,'COMPLETED')`,
+                [`${baseRef}-IN`, toW.wallet_id, toW.account_id, transferAmt, toBefore, toAfter, fromW.public_code, fromW.wallet_name, note || 'รับโอนเงินในระบบ']
+            );
+
+            await client.query('COMMIT');
+            return res.json({ success: true, mode: 'EXECUTED', tx_ref: baseRef, new_balance: fromAfter });
+        }
+
+        // กรณี B: ต้องอนุมัติ 2-3 คน (หรือ MAKER เป็นคนสร้าง) -> กันวงเงิน (locked_balance) และสร้างคำขอรออนุมัติ
+        const nextLocked = Number((Number(fromW.locked_balance || 0) + transferAmt).toFixed(2));
+        await client.query(`UPDATE wallets SET locked_balance = $1, updated_at = NOW() WHERE wallet_id = $2`, [nextLocked, fromW.wallet_id]);
+
+        const reqRef = `REQ-${Date.now().toString().slice(-8)}`;
+        const initApproved = canApprove ? 1 : 0;
+
+        const reqIns = await client.query(
+            `INSERT INTO wallet_approval_requests (
+                request_ref, wallet_id, tx_type, to_public_code, to_wallet_name,
+                amount, note, attachment_url, required_approvals, approved_count,
+                status, created_by, created_by_name
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'PENDING_APPROVAL',$11,$12)
+            RETURNING *`,
+            [reqRef, fromW.wallet_id, tx_type, toW.public_code, toW.wallet_name, transferAmt, note, attachment_url, reqApprovals, initApproved, actor_account_id, actor_name]
+        );
+
+        if (canApprove) {
+            await client.query(
+                `INSERT INTO wallet_approval_votes (request_id, approver_account_id, approver_name, decision)
+                 VALUES ($1,$2,$3,'APPROVE')`,
+                [reqIns.rows[0].request_id, actor_account_id, actor_name]
+            );
+        }
+
+        await client.query('COMMIT');
+        return res.json({
+            success: true,
+            mode: 'PENDING_APPROVAL',
+            request: reqIns.rows[0],
+            message: `สร้างคำขอโอนสำเร็จ (${initApproved}/${reqApprovals} เสียง) รอกรรมการท่านอื่นกดอนุมัติ`
+        });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error('[WALLET-TRANSFER] error:', err);
+        return res.status(500).json({ success: false, message: err.message });
+    } finally {
+        client.release();
+    }
+});
+
+// ดึงรายการรออนุมัติของกระเป๋า + รายชื่อกรรมการที่โหวตแล้ว
+app.get('/api/wallets/:walletId/approvals', async (req, res) => {
+    try {
+        const reqs = await pgPool.query(
+            `SELECT r.*,
+                    COALESCE(
+                        (SELECT json_agg(json_build_object(
+                            'approver_account_id', v.approver_account_id,
+                            'approver_name', v.approver_name,
+                            'decision', v.decision,
+                            'reject_reason', v.reject_reason,
+                            'voted_at', v.voted_at
+                        ) ORDER BY v.voted_at ASC)
+                        FROM wallet_approval_votes v WHERE v.request_id = r.request_id), '[]'::json
+                    ) AS votes
+             FROM wallet_approval_requests r
+             WHERE r.wallet_id = $1
+             ORDER BY CASE WHEN r.status = 'PENDING_APPROVAL' THEN 0 ELSE 1 END, r.created_at DESC
+             LIMIT 50`,
+            [req.params.walletId]
+        );
+        return res.json({ success: true, requests: reqs.rows });
+    } catch (err) {
+        return res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// กรรมการกดอนุมัติหรือปฏิเสธ (ไม่พร้อมกันได้ — ครบจำนวนปุ๊บโอนอัตโนมัติ)
+app.post('/api/wallets/approvals/:requestId/vote', async (req, res) => {
+    const { requestId } = req.params;
+    const { approver_account_id, approver_name = 'กรรมการ', decision = 'APPROVE', reject_reason = '', pin } = req.body || {};
+
+    const client = await pgPool.connect();
+    try {
+        await client.query('BEGIN');
+
+        const pinCheck = await verifyUserPin(client, approver_account_id, pin);
+        if (!pinCheck.ok) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ success: false, code: pinCheck.code, message: pinCheck.message });
+        }
+
+        const rRes = await client.query(
+            `SELECT * FROM wallet_approval_requests WHERE request_id = $1 FOR UPDATE`,
+            [requestId]
+        );
+        if (rRes.rows.length === 0 || rRes.rows[0].status !== 'PENDING_APPROVAL') {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ success: false, message: 'คำขอนี้ถูกดำเนินการไปแล้วหรือไม่อยู่ในสถานะรออนุมัติ' });
+        }
+        const reqRow = rRes.rows[0];
+
+        // ตรวจสิทธิ์กรรมการ
+        const memRes = await client.query(
+            `SELECT role FROM wallet_members WHERE wallet_id = $1 AND account_id = $2 AND status = 'ACTIVE'`,
+            [reqRow.wallet_id, approver_account_id]
+        );
+        const role = memRes.rows[0]?.role;
+        if (role !== 'OWNER' && role !== 'APPROVER') {
+            await client.query('ROLLBACK');
+            return res.status(403).json({ success: false, message: 'คุณไม่มีสิทธิ์อนุมัติรายการของกระเป๋านี้' });
+        }
+
+        // บันทึกโหวต (UNIQUE กันกดซ้ำ)
+        await client.query(
+            `INSERT INTO wallet_approval_votes (request_id, approver_account_id, approver_name, decision, reject_reason)
+             VALUES ($1,$2,$3,$4,$5)`,
+            [requestId, approver_account_id, approver_name, decision === 'REJECT' ? 'REJECT' : 'APPROVE', reject_reason]
+        );
+
+        const fromWRes = await client.query(`SELECT * FROM wallets WHERE wallet_id = $1 FOR UPDATE`, [reqRow.wallet_id]);
+        const fromW = fromWRes.rows[0];
+        const amt = Number(reqRow.amount);
+
+        // กรณีปฏิเสธ -> คืนวงเงิน locked_balance ทันที
+        if (decision === 'REJECT') {
+            const nextLocked = Math.max(0, Number((Number(fromW.locked_balance || 0) - amt).toFixed(2)));
+            await client.query(`UPDATE wallets SET locked_balance = $1, updated_at = NOW() WHERE wallet_id = $2`, [nextLocked, fromW.wallet_id]);
+            await client.query(`UPDATE wallet_approval_requests SET status = 'REJECTED', updated_at = NOW() WHERE request_id = $1`, [requestId]);
+            await client.query('COMMIT');
+            return res.json({ success: true, status: 'REJECTED', message: 'ปฏิเสธคำขอและคืนวงเงินเข้ากระเป๋าเรียบร้อยแล้ว' });
+        }
+
+        // กรณีอนุมัติ -> เพิ่มเสียง และเช็กว่าครบเกณฑ์หรือยัง
+        const nextApproved = Number(reqRow.approved_count || 0) + 1;
+        if (nextApproved < Number(reqRow.required_approvals)) {
+            await client.query(
+                `UPDATE wallet_approval_requests SET approved_count = $1, updated_at = NOW() WHERE request_id = $2`,
+                [nextApproved, requestId]
+            );
+            await client.query('COMMIT');
+            return res.json({
+                success: true,
+                status: 'PENDING_APPROVAL',
+                approved_count: nextApproved,
+                message: `บันทึกการอนุมัติสำเร็จ (${nextApproved}/${reqRow.required_approvals} เสียง)`
+            });
+        }
+
+        // เสียงครบแล้ว -> ตัดเงินจริง โอนเข้าปลายทาง ปลด locked_balance และลง Ledger
+        const toWRes = await client.query(`SELECT * FROM wallets WHERE UPPER(public_code) = $1 FOR UPDATE`, [reqRow.to_public_code.toUpperCase()]);
+        if (toWRes.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ success: false, message: 'ไม่พบกระเป๋าปลายทาง' });
+        }
+        const toW = toWRes.rows[0];
+
+        const fromBefore = Number(fromW.balance || 0);
+        const fromAfter = Number((fromBefore - amt).toFixed(2));
+        const nextLocked = Math.max(0, Number((Number(fromW.locked_balance || 0) - amt).toFixed(2)));
+        const toBefore = Number(toW.balance || 0);
+        const toAfter = Number((toBefore + amt).toFixed(2));
+        const baseRef = `TX-${Date.now().toString().slice(-8)}`;
+
+        await client.query(`UPDATE wallets SET balance = $1, locked_balance = $2, updated_at = NOW() WHERE wallet_id = $3`, [fromAfter, nextLocked, fromW.wallet_id]);
+        await client.query(`UPDATE wallets SET balance = $1, updated_at = NOW() WHERE wallet_id = $2`, [toAfter, toW.wallet_id]);
+
+        await client.query(
+            `UPDATE wallet_approval_requests
+             SET approved_count = $1, status = 'EXECUTED', executed_tx_ref = $2, updated_at = NOW()
+             WHERE request_id = $3`,
+            [nextApproved, baseRef, requestId]
+        );
+
+        await client.query(
+            `INSERT INTO wallet_transactions (tx_ref, wallet_id, account_id, tx_type, direction, amount, balance_before, balance_after, counterparty_code, counterparty_name, note, request_id, status)
+             VALUES ($1,$2,$3,$4,'DEBIT',$5,$6,$7,$8,$9,$10,$11,'COMPLETED')`,
+            [`${baseRef}-OUT`, fromW.wallet_id, approver_account_id, reqRow.tx_type, amt, fromBefore, fromAfter, toW.public_code, toW.wallet_name, `${reqRow.note || 'โอนอนุมัติกลุ่ม'} (ครบ ${nextApproved} เสียง)`, requestId]
+        );
+        await client.query(
+            `INSERT INTO wallet_transactions (tx_ref, wallet_id, account_id, tx_type, direction, amount, balance_before, balance_after, counterparty_code, counterparty_name, note, request_id, status)
+             VALUES ($1,$2,$3,'TRANSFER_IN','CREDIT',$4,$5,$6,$7,$8,$9,$10,'COMPLETED')`,
+            [`${baseRef}-IN`, toW.wallet_id, toW.account_id, amt, toBefore, toAfter, fromW.public_code, fromW.wallet_name, reqRow.note || 'รับโอนจากบัญชีกลุ่ม', requestId]
+        );
+
+        await client.query('COMMIT');
+        return res.json({
+            success: true,
+            status: 'EXECUTED',
+            tx_ref: baseRef,
+            message: `อนุมัติครบ ${nextApproved}/${reqRow.required_approvals} เสียง! ระบบโอนเงินสำเร็จแล้ว`
+        });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        if (err.code === '23505') {
+            return res.status(400).json({ success: false, message: 'คุณได้กดอนุมัติรายการนี้ไปแล้ว' });
+        }
+        console.error('[WALLET-VOTE] error:', err);
+        return res.status(500).json({ success: false, message: err.message });
+    } finally {
+        client.release();
+    }
+});
+
+// ดึงประวัติธุรกรรมตาม wallet_id
+app.get('/api/wallets/transactions', async (req, res) => {
+    const walletId = String(req.query.wallet_id || '').trim();
+    const accountId = String(req.query.account_id || '').trim();
+    try {
+        const result = walletId
+            ? await pgPool.query(`SELECT * FROM wallet_transactions WHERE wallet_id = $1 ORDER BY created_at DESC LIMIT 100`, [walletId])
+            : await pgPool.query(`SELECT * FROM wallet_transactions WHERE account_id = $1 ORDER BY created_at DESC LIMIT 100`, [accountId]);
+        return res.json({ success: true, transactions: result.rows });
+    } catch (err) {
+        return res.status(500).json({ success: false, message: err.message });
+    }
+});
+
 
 app.listen(port, () => {
     console.log(`Server is running on port ${port}`);
