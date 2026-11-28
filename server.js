@@ -12330,6 +12330,10 @@ app.post('/api/admin/bank-statements', async (req, res) => {
 // [RECON-03] POST /api/admin/auto-reconcile — ฟังก์ชันกระทบยอดอัตโนมัติ (จับคู่สลิปที่ผ่านแล้วกับ Statement)
 // เงื่อนไข: บัญชีตรงกัน + ยอดเงินตรงกัน + วันที่ตรงกัน + เวลาคลาดเคลื่อนไม่เกิน tolerance_sec (ค่าเริ่มต้น 60 วินาที)
 // -------------------------------------------------------------------------
+// -------------------------------------------------------------------------
+// [RECON-03] POST /api/admin/auto-reconcile — กระทบยอดอัตโนมัติ (เทียบวันที่จาก SQL ตรงๆ กันเพี้ยน Timezone)
+// เงื่อนไข: สลิปสถานะ SLIP_VERIFIED + ยอดเงินตรงกัน + วันที่ตรงกัน + เวลาคลาดเคลื่อนไม่เกิน tolerance_sec (60 วินาที)
+// -------------------------------------------------------------------------
 app.post('/api/admin/auto-reconcile', async (req, res) => {
     const toleranceSec = Number(req.body?.tolerance_sec ?? 60);
     const verifiedBy = req.body?.verified_by || 'AUTO_RECONCILE';
@@ -12344,12 +12348,14 @@ app.post('/api/admin/auto-reconcile', async (req, res) => {
         await client.query('BEGIN');
 
         const slipsRes = await client.query(
-            `SELECT * FROM payment_slip_submissions
+            `SELECT *, TO_CHAR(transfer_date, 'YYYY-MM-DD') AS transfer_date_str
+             FROM payment_slip_submissions
              WHERE status = 'SLIP_VERIFIED' AND matched_statement_id IS NULL
              ORDER BY transfer_date ASC, transfer_time_hms ASC`
         );
         const stmtsRes = await client.query(
-            `SELECT * FROM bank_statement_entries
+            `SELECT *, TO_CHAR(received_date, 'YYYY-MM-DD') AS received_date_str
+             FROM bank_statement_entries
              WHERE match_status = 'UNMATCHED'
              ORDER BY received_date ASC, received_time_hms ASC`
         );
@@ -12358,18 +12364,19 @@ app.post('/api/admin/auto-reconcile', async (req, res) => {
         const matchedPairs = [];
 
         for (const slip of slipsRes.rows) {
-            const slipDate = String(slip.transfer_date).slice(0, 10);
+            const slipDate = slip.transfer_date_str;
             const slipSec = hmsToSeconds(slip.transfer_time_hms);
             const slipAmt = Number(slip.amount);
 
             const matchIdx = availableStmts.findIndex((st) => {
-                const stDate = String(st.received_date).slice(0, 10);
+                const stDate = st.received_date_str;
                 const stAmt = Number(st.amount);
                 const sameChannel =
                     (!slip.channel_id || !st.channel_id) ||
                     Number(slip.channel_id) === Number(st.channel_id);
+                const sameAmount = Math.abs(stAmt - slipAmt) < 0.01;
                 const timeDiff = Math.abs(hmsToSeconds(st.received_time_hms) - slipSec);
-                return sameChannel && stDate === slipDate && stAmt === slipAmt && timeDiff <= toleranceSec;
+                return sameChannel && stDate === slipDate && sameAmount && timeDiff <= toleranceSec;
             });
 
             if (matchIdx !== -1) {
