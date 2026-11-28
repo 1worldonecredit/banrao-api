@@ -13742,6 +13742,117 @@ app.post('/api/profile/pins/sync-all', async (req, res) => {
     }
 });
 
+// =========================================================================
+// [ADMIN-LEGAL] จัดการเอกสารทางกฎหมาย & ดูทะเบียนหลักฐานการขอเปิดบัญชี
+// =========================================================================
+
+// 1. ดึงรายการเอกสารทางกฎหมายทุกเวอร์ชัน
+app.get('/api/admin/legal/documents', async (req, res) => {
+    try {
+        const result = await pgPool.query(
+            `SELECT * FROM legal_documents ORDER BY is_active DESC, doc_id DESC`
+        );
+        return res.json({ success: true, documents: result.rows });
+    } catch (err) {
+        console.error('[ADMIN-LEGAL] list docs error:', err);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// 2. เพิ่มเอกสารทางกฎหมายเวอร์ชันใหม่ (Append-Only ไม่ลบฉบับเก่า)
+app.post('/api/admin/legal/documents', async (req, res) => {
+    const {
+        doc_code = 'WALLET_OPENING_TERMS',
+        version = '1.1',
+        title_th,
+        content_th,
+        set_active = true,
+        created_by = 'ADMIN'
+    } = req.body || {};
+
+    if (!String(title_th || '').trim() || !String(content_th || '').trim()) {
+        return res.status(400).json({ success: false, message: 'กรุณากรอกชื่อเอกสารและเนื้อหาข้อตกลงให้ครบถ้วน' });
+    }
+
+    const client = await pgPool.connect();
+    try {
+        await client.query('BEGIN');
+        if (set_active) {
+            await client.query(
+                `UPDATE legal_documents SET is_active = FALSE, updated_at = NOW() WHERE doc_code = $1`,
+                [doc_code]
+            );
+        }
+        const ins = await client.query(
+            `INSERT INTO legal_documents (doc_code, version, title_th, content_th, is_active, created_by, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())
+             RETURNING *`,
+            [doc_code, String(version).trim(), String(title_th).trim(), String(content_th).trim(), Boolean(set_active), created_by]
+        );
+        await client.query('COMMIT');
+        return res.json({ success: true, document: ins.rows[0], message: 'บันทึกเอกสารทางกฎหมายเวอร์ชันใหม่เรียบร้อยแล้ว' });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error('[ADMIN-LEGAL] create doc error:', err);
+        return res.status(500).json({ success: false, message: err.message });
+    } finally {
+        client.release();
+    }
+});
+
+// 3. สลับฉบับที่ใช้งานอยู่ (Soft Status Toggle)
+app.patch('/api/admin/legal/documents/:docId/activate', async (req, res) => {
+    const docId = Number(req.params.docId);
+    if (!Number.isFinite(docId)) return res.status(400).json({ success: false, message: 'docId ไม่ถูกต้อง' });
+
+    const client = await pgPool.connect();
+    try {
+        await client.query('BEGIN');
+        const target = await client.query(`SELECT doc_code FROM legal_documents WHERE doc_id = $1`, [docId]);
+        if (target.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ success: false, message: 'ไม่พบเอกสารที่ระบุ' });
+        }
+        const docCode = target.rows[0].doc_code;
+        await client.query(`UPDATE legal_documents SET is_active = FALSE, updated_at = NOW() WHERE doc_code = $1`, [docCode]);
+        const upd = await client.query(
+            `UPDATE legal_documents SET is_active = TRUE, updated_at = NOW() WHERE doc_id = $1 RETURNING *`,
+            [docId]
+        );
+        await client.query('COMMIT');
+        return res.json({ success: true, document: upd.rows[0], message: 'ตั้งเป็นฉบับใช้งานปัจจุบันเรียบร้อยแล้ว' });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        return res.status(500).json({ success: false, message: err.message });
+    } finally {
+        client.release();
+    }
+});
+
+// 4. ดึงทะเบียนหลักฐานการขอเปิดบัญชีของลูกค้า (ค้นหาได้ตามชื่อ / Account ID / IP)
+app.get('/api/admin/legal/consents', async (req, res) => {
+    const q = String(req.query.q || '').trim();
+    try {
+        let sql = `
+            SELECT c.*, d.title_th AS doc_title
+            FROM wallet_opening_consents c
+            LEFT JOIN legal_documents d ON d.doc_id = c.doc_id
+        `;
+        const params = [];
+        if (q) {
+            params.push(`%${q}%`);
+            sql += ` WHERE c.applicant_name ILIKE $1 OR c.account_id::text ILIKE $1 OR c.ip_address ILIKE $1 `;
+        }
+        sql += ` ORDER BY c.accepted_at DESC LIMIT 300`;
+
+        const result = await pgPool.query(sql, params);
+        return res.json({ success: true, consents: result.rows });
+    } catch (err) {
+        console.error('[ADMIN-LEGAL] list consents error:', err);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+});
+
 app.listen(port, () => {
     console.log(`Server is running on port ${port}`);
 });
