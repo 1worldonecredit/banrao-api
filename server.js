@@ -319,6 +319,199 @@ app.get('/api/villages/by-tambon-id/:tambonId', async (req, res) => {
     }
 });
 
+
+// -------------------------------------------------------------------------
+// [NUMBER-01] ตัวคัดกรองเลข 10 หลักแบบเข้มข้น (กันเลขสวยทุกรูปแบบไม่ให้หลุดไปสุ่มฟรี)
+// -------------------------------------------------------------------------
+function classifyTenDigitNumber(digits) {
+    const d = String(digits || '');
+    if (!/^\d{10}$/.test(d)) return { isPremium: true, tier: 'INVALID', reason: 'ไม่ใช่เลข 10 หลัก' };
+
+    // 1. VIP: เหมือนกันหมด, เรียง 0-9 / 9-0, คู่เรียง 5 คู่ (1122334455), ซ้ำติดกัน 5 ตัวขึ้นไป, ตอง 3 ชุด
+    if (/^(\d)\1{9}$/.test(d)) return { isPremium: true, tier: 'VIP', reason: 'เลขตองสิบ' };
+    if (['0123456789', '1234567890', '9876543210'].includes(d)) {
+        return { isPremium: true, tier: 'VIP', reason: 'เลขเรียง 10 หลัก' };
+    }
+    if (/^(\d)\1(\d)\2(\d)\3(\d)\4(\d)\5$/.test(d)) {
+        return { isPremium: true, tier: 'VIP', reason: 'เลขคู่ 5 คู่ (AABBCCDDEE)' };
+    }
+    if (/(\d)\1{4,}/.test(d)) return { isPremium: true, tier: 'VIP', reason: 'เลขซ้ำติดกัน 5 ตัวขึ้นไป' };
+    if (/^(\d)\1\1(\d)\2\2(\d)\3\3\d$/.test(d) || /^\d(\d)\1\1(\d)\2\2(\d)\3\3$/.test(d)) {
+        return { isPremium: true, tier: 'VIP', reason: 'เลขตอง 3 ชุดติดกัน' };
+    }
+
+    // 2. SUPER_NICE (สวยมาก): ตองนำหน้า (111-999), ตองลงท้าย, ซ้ำติดกัน 4 ตัว, สลับคู่ทั้งชุด, ซ้ำครึ่ง
+    if (/^(\d)\1\1/.test(d)) return { isPremium: true, tier: 'SUPER_NICE', reason: 'เลขตองนำหน้า (111-999)' };
+    if (/(\d)\1\1$/.test(d)) return { isPremium: true, tier: 'SUPER_NICE', reason: 'เลขตองลงท้าย' };
+    if (/(\d)\1{3}/.test(d)) return { isPremium: true, tier: 'SUPER_NICE', reason: 'เลขซ้ำติดกัน 4 ตัว' };
+    if (/^(\d{2})\1{4}$/.test(d) || /^(\d{5})\1$/.test(d)) {
+        return { isPremium: true, tier: 'SUPER_NICE', reason: 'เลขสลับหรือซ้ำชุดใหญ่' };
+    }
+
+    // 3. NICE_TIER_2 (สวยรอง): เบิ้ลนำหน้า (11-99), เบิ้ลลงท้าย (00-99), มีตอง, สลับหัว/ท้าย, คู่หัว/ท้าย, กระจก, ใช้เลข <= 4 ตัว, เรียง 4 ตัว
+    if (/^(\d)\1/.test(d)) return { isPremium: true, tier: 'NICE_TIER_2', reason: 'เลขเบิ้ลนำหน้า (11-99)' };
+    if (/(\d)\1$/.test(d)) return { isPremium: true, tier: 'NICE_TIER_2', reason: 'เลขเบิ้ลลงท้าย (00-99)' };
+    if (/(\d)\1{2}/.test(d)) return { isPremium: true, tier: 'NICE_TIER_2', reason: 'มีเลขตองในชุด' };
+    if (/^(\d{2})\1/.test(d) || /(\d{2})\1$/.test(d)) {
+        return { isPremium: true, tier: 'NICE_TIER_2', reason: 'เลขสลับหัวหรือท้าย (ABAB)' };
+    }
+    if (/^(\d)\1(\d)\2/.test(d) || /(\d)\1(\d)\2$/.test(d)) {
+        return { isPremium: true, tier: 'NICE_TIER_2', reason: 'เลขเบิ้ลคู่หัวหรือท้าย (AABB)' };
+    }
+    if (d === d.split('').reverse().join('')) return { isPremium: true, tier: 'NICE_TIER_2', reason: 'เลขกระจก' };
+    if (new Set(d.split('')).size <= 4) return { isPremium: true, tier: 'NICE_TIER_2', reason: 'ใช้ตัวเลขน้อย (<= 4 ตัว)' };
+    if (/(0123|1234|2345|3456|4567|5678|6789|9876|8765|7654|6543|5432|4321|3210)/.test(d)) {
+        return { isPremium: true, tier: 'NICE_TIER_2', reason: 'มีเลขเรียง 4 ตัวติดกัน' };
+    }
+
+    // 4. NICE (สวย): มีเลขเบิ้ลตั้งแต่ 2 คู่ขึ้นไป หรือมีชุด 3 หลักซ้ำ
+    const pairMatches = d.match(/(\d)\1/g) || [];
+    if (pairMatches.length >= 2) return { isPremium: true, tier: 'NICE', reason: 'มีเลขเบิ้ล 2 คู่ขึ้นไป' };
+    if (/(\d{3}).*\1/.test(d)) return { isPremium: true, tier: 'NICE', reason: 'มีชุดเลข 3 หลักซ้ำ' };
+
+    // 5. LUCKY (เลขมงคล): มีหรือลงท้ายด้วยชุดเลขมงคลยอดนิยม
+    const tail4 = d.slice(-4);
+    const tail3 = d.slice(-3);
+    const tail2 = d.slice(-2);
+    if (['4289', '6395', '2895', '1689', '7895', '1595', '4595'].includes(tail4)) {
+        return { isPremium: true, tier: 'LUCKY', reason: 'ลงท้ายเลขมงคล 4 หลัก' };
+    }
+    if (/(168|789|289|456|656|595|959|428|639)/.test(d) || ['168', '789', '289', '456'].includes(tail3)) {
+        return { isPremium: true, tier: 'LUCKY', reason: 'มีชุดเลขมงคล 3 หลัก' };
+    }
+    if (['99', '88', '59', '95', '65', '56', '45', '54', '24', '42', '36', '63', '15', '51', '19', '91'].includes(tail2)) {
+        return { isPremium: true, tier: 'LUCKY', reason: 'ลงท้ายเลขมงคล 2 หลัก' };
+    }
+
+    return { isPremium: false, tier: 'NORMAL', reason: 'เลขสุ่มทั่วไปปลอดภัย' };
+}
+
+// ฟังก์ชันสุ่มเลข 10 หลักสำหรับผู้ใช้ทั่วไป (รับประกันไม่ชนคลังเลขสวยและไม่ตรงแพทเทิร์นเลขสวย)
+async function generateSafeNormalPublicCode() {
+    for (let attempt = 0; attempt < 50; attempt++) {
+        const digits = String(Math.floor(1000000000 + Math.random() * 8999999999));
+        const check = classifyTenDigitNumber(digits);
+        if (check.isPremium) continue;
+
+        const code = `BR-${digits}`;
+        const dupCheck = await pgPool.query(
+            `SELECT 1 FROM wallets WHERE public_code = $1
+             UNION ALL
+             SELECT 1 FROM premium_account_numbers WHERE public_code = $1
+             LIMIT 1`,
+            [code]
+        );
+        if (dupCheck.rows.length === 0) {
+            return code;
+        }
+    }
+    throw new Error('ไม่สามารถสุ่มรหัสบัญชีใหม่ได้ กรุณาลองอีกครั้ง');
+}
+
+// -------------------------------------------------------------------------
+// [NUMBER-02] GET /api/premium-numbers — ดึงรายการเลขสวยที่พร้อมขาย
+// -------------------------------------------------------------------------
+app.get('/api/premium-numbers', async (req, res) => {
+    const tier = String(req.query.tier || 'ALL').toUpperCase();
+    const status = String(req.query.status || 'AVAILABLE').toUpperCase();
+    try {
+        const params = [status];
+        let sql = `SELECT * FROM premium_account_numbers WHERE status = $1`;
+        if (tier !== 'ALL') {
+            params.push(tier);
+            sql += ` AND tier = $2`;
+        }
+        sql += ` ORDER BY price DESC, digits_only ASC LIMIT 200`;
+
+        const result = await pgPool.query(sql, params);
+        return res.json({ success: true, numbers: result.rows });
+    } catch (err) {
+        console.error('[NUMBER-02] GET premium-numbers error:', err);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// -------------------------------------------------------------------------
+// [NUMBER-03] POST /api/admin/premium-numbers/seed-batch — สร้างคลังเลขสวยเข้าตารางจำนวนมากอัตโนมัติ
+// -------------------------------------------------------------------------
+app.post('/api/admin/premium-numbers/seed-batch', async (req, res) => {
+    const items = [];
+    const add = (digits, tier, tier_label_th, pattern_note, price) => {
+        if (/^\d{10}$/.test(digits)) {
+            items.push({ public_code: `BR-${digits}`, digits_only: digits, tier, tier_label_th, pattern_note, price });
+        }
+    };
+
+    for (let i = 1; i <= 9; i++) {
+        add(String(i).repeat(10), 'VIP', 'เลข VIP', `เลข ${i} ล้วน 10 หลัก`, i === 8 || i === 9 ? 250000 : 150000);
+    }
+    for (let i = 1; i <= 5; i++) {
+        const d = `${i}${i}${i + 1}${i + 1}${i + 2}${i + 2}${i + 3}${i + 3}${i + 4}${i + 4}`;
+        add(d, 'VIP', 'เลข VIP', `เลขคู่เรียง ${i}${i}-${i + 4}${i + 4}`, 89000);
+    }
+    for (let i = 1; i <= 7; i++) {
+        const d = `${i}${i}${i}${i + 1}${i + 1}${i + 1}${i + 2}${i + 2}${i + 2}9`;
+        add(d, 'VIP', 'เลข VIP', `เลขตองเรียง ${i}${i}${i}-${i + 2}${i + 2}${i + 2}`, 79000);
+    }
+
+    const nicePairs = ['12', '15', '19', '24', '36', '45', '56', '59', '65', '68', '78', '89', '95', '98'];
+    for (const p of nicePairs) {
+        add(p.repeat(5), 'SUPER_NICE', 'สวยมาก', `เลขสลับคู่ ${p} ซ้ำ 5 รอบ`, 39000);
+    }
+    for (let a = 1; a <= 9; a++) {
+        for (let b = 8; b <= 9; b++) {
+            if (a === b) continue;
+            add(`${a}${a}${a}${b}${b}${b}${a}${a}${b}${b}`, 'SUPER_NICE', 'สวยมาก', `ตองนำหน้า ${a}${a}${a} สลับ ${b}${b}${b}`, 29000);
+        }
+    }
+
+    for (let a = 1; a <= 9; a++) {
+        add(`${a}${a}00${a}${a}00${a}${a}`, 'NICE_TIER_2', 'สวยรอง', `เบิ้ลนำหน้า ${a}${a} สลับ 00`, 15900);
+        add(`${a}${a}8899${a}${a}88`, 'NICE_TIER_2', 'สวยรอง', `เบิ้ลนำหน้า ${a}${a} คู่มงคล 8899`, 14900);
+        add(`${a}${a}123456${a}${a}`, 'NICE_TIER_2', 'สวยรอง', `เบิ้ลหัวท้าย ${a}${a} กลางเรียง`, 12900);
+    }
+
+    for (let a = 1; a <= 9; a++) {
+        add(`${a}${a}${a}0001689`, 'NICE', 'สวย', `ตองนำหน้า ${a}${a}${a} ลงท้าย 1689`, 5900);
+        add(`${a}${a}${a}2026888`, 'NICE', 'สวย', `ตองนำหน้า ${a}${a}${a} ลงท้าย 888`, 4900);
+        add(`${a}${a}${a}2026999`, 'NICE', 'สวย', `ตองนำหน้า ${a}${a}${a} ลงท้าย 999`, 5500);
+    }
+
+    const luckyPrefixes = ['19', '24', '45', '56', '59', '65', '78', '89', '95', '99'];
+    for (const lp of luckyPrefixes) {
+        add(`${lp}20264289`, 'LUCKY', 'เลขมงคล', `นำหน้า ${lp} ลงท้ายมังกร 4289`, 2999);
+        add(`${lp}20266395`, 'LUCKY', 'เลขมงคล', `นำหน้า ${lp} ลงท้ายเสน่ห์ 6395`, 2599);
+        add(`${lp}20261689`, 'LUCKY', 'เลขมงคล', `นำหน้า ${lp} ลงท้ายฮกลกซิ่ว 1689`, 2999);
+    }
+
+    const client = await pgPool.connect();
+    try {
+        await client.query('BEGIN');
+        let inserted = 0;
+        for (const it of items) {
+            const used = await client.query(`SELECT 1 FROM wallets WHERE public_code = $1 LIMIT 1`, [it.public_code]);
+            if (used.rows.length > 0) continue;
+
+            const r = await client.query(
+                `INSERT INTO premium_account_numbers (
+                    public_code, digits_only, tier, tier_label_th, pattern_note, price
+                ) VALUES ($1,$2,$3,$4,$5,$6)
+                ON CONFLICT (digits_only) DO NOTHING`,
+                [it.public_code, it.digits_only, it.tier, it.tier_label_th, it.pattern_note, it.price]
+            );
+            inserted += r.rowCount;
+        }
+        await client.query('COMMIT');
+        return res.json({ success: true, total_generated: items.length, newly_inserted: inserted });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error('[NUMBER-03] seed-batch error:', err);
+        return res.status(500).json({ success: false, message: err.message });
+    } finally {
+        client.release();
+    }
+});
+
 // เส้น 1: แปลง ref จากลิงก์เชิญ -> เบอร์โทร + รูปโปรไฟล์ + ที่อยู่เต็มถึงจังหวัด
 app.get('/api/referrers/resolve', async (req, res) => {
     const rawRef = String(req.query.ref || '').trim();
