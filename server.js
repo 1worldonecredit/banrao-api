@@ -13829,6 +13829,61 @@ app.patch('/api/admin/legal/documents/:docId/activate', async (req, res) => {
     }
 });
 
+
+
+// 5. แก้ไขเนื้อหาเอกสาร (ทีละข้อย่อย หรือทั้งฉบับ) — บังคับยืนยันด้วยรหัส PIN 6 หลักของผู้ Login
+app.patch('/api/admin/legal/documents/:docId', async (req, res) => {
+    const docId = Number(req.params.docId);
+    const { title_th, content_th, account_id, pin } = req.body || {};
+
+    if (!Number.isFinite(docId)) {
+        return res.status(400).json({ success: false, message: 'docId ไม่ถูกต้อง' });
+    }
+    if (!String(content_th || '').trim()) {
+        return res.status(400).json({ success: false, message: 'เนื้อหาข้อตกลงต้องไม่ว่างเปล่า' });
+    }
+    if (!account_id) {
+        return res.status(400).json({ success: false, message: 'ไม่พบรหัสผู้ใช้งาน (account_id) กรุณาเข้าสู่ระบบใหม่' });
+    }
+    if (!/^\d{6}$/.test(String(pin || ''))) {
+        return res.status(400).json({ success: false, message: 'กรุณากรอกรหัส PIN 6 หลักของผู้ Login เพื่อยืนยันการแก้ไข' });
+    }
+
+    const client = await pgPool.connect();
+    try {
+        // ตรวจสอบรหัส PIN 6 หลักของผู้ที่ Login อยู่
+        const pinCheck = await verifyUserPin(client, account_id, pin);
+        if (!pinCheck.ok) {
+            return res.status(400).json({ success: false, message: `รหัส PIN ไม่ถูกต้อง: ${pinCheck.message}` });
+        }
+
+        const upd = await client.query(
+            `UPDATE legal_documents
+             SET title_th = COALESCE($1, title_th),
+                 content_th = $2,
+                 updated_at = NOW()
+             WHERE doc_id = $3
+             RETURNING *`,
+            [title_th ? String(title_th).trim() : null, String(content_th).trim(), docId]
+        );
+
+        if (upd.rows.length === 0) {
+            return res.status(404).json({ success: false, message: 'ไม่พบเอกสารที่ต้องการแก้ไข' });
+        }
+
+        return res.json({
+            success: true,
+            document: upd.rows[0],
+            message: 'บันทึกการแก้ไขข้อตกลงเรียบร้อยแล้ว (ยืนยันตัวตนด้วย PIN สำเร็จ)'
+        });
+    } catch (err) {
+        console.error('[ADMIN-LEGAL] update doc error:', err);
+        return res.status(500).json({ success: false, message: err.message });
+    } finally {
+        client.release();
+    }
+});
+
 // 4. ดึงทะเบียนหลักฐานการขอเปิดบัญชีของลูกค้า (ค้นหาได้ตามชื่อ / Account ID / IP)
 app.get('/api/admin/legal/consents', async (req, res) => {
     const q = String(req.query.q || '').trim();
