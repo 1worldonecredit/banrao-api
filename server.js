@@ -11937,31 +11937,47 @@ app.post('/api/payment-channels', async (req, res) => {
 });
 
 // -------------------------------------------------------------------------
-// [COMP-01] GET /api/company-profile — ดึงข้อมูลบริษัท/เลขผู้เสียภาษี สำหรับออกใบเสร็จ
-// -------------------------------------------------------------------------
-// -------------------------------------------------------------------------
-// [COMPANY-01] GET /api/company-profile — ดึงข้อมูลผู้ออกใบกำกับภาษี
+// [COMPANY-01] GET /api/company-profile — ดึงข้อมูลผู้ออกใบกำกับภาษี (ตรงคอลัมน์จริง)
 // -------------------------------------------------------------------------
 app.get('/api/company-profile', async (req, res) => {
+    const fallbackProfile = {
+        company_name_th: 'ระบบชุมชนบ้านเรา (BAN RAO)',
+        branch_name_th: 'สำนักงานใหญ่',
+        branch_name: 'สำนักงานใหญ่',
+        address_th: 'เลขที่ 99/9 หมู่ที่ 1 ตำบลในเมือง อำเภอเมือง จังหวัดกรุงเทพมหานคร 10100',
+        address_full: 'เลขที่ 99/9 หมู่ที่ 1 ตำบลในเมือง อำเภอเมือง จังหวัดกรุงเทพมหานคร 10100',
+        tax_id: '0-1055-69000-00-0',
+        phone: '02-000-0000',
+        email: 'support@banrao.life',
+        vat_rate: 7,
+        vat_mode: 'INCLUDED'
+    };
+
     try {
-        const result = await pgPool.query(
-            `SELECT * FROM system_company_profile ORDER BY id ASC LIMIT 1`
-        );
+        const result = await pgPool.query(`SELECT * FROM system_company_profile LIMIT 1`);
         if (result.rows.length === 0) {
-            return res.json({
-                success: true,
-                profile: {
-                    company_name_th: 'ระบบชุมชนบ้านเรา (BAN RAO)',
-                    branch_name: 'สำนักงานใหญ่',
-                    address_full: 'เลขที่ 99/9 หมู่ที่ 1 ตำบลในเมือง อำเภอเมือง จังหวัดกรุงเทพมหานคร 10100',
-                    tax_id: '0-1055-69000-00-0',
-                    phone: '02-000-0000',
-                    email: 'support@banrao.life',
-                    vat_rate: 7
-                }
-            });
+            return res.json({ success: true, profile: fallbackProfile, company: fallbackProfile });
         }
-        return res.json({ success: true, profile: result.rows[0] });
+
+        const r = result.rows[0];
+        const branchVal = r.branch_name_th || r.branch_name || 'สำนักงานใหญ่';
+        const addrVal = r.address_th || r.address_full || '';
+
+        const normalized = {
+            ...r,
+            company_name_th: r.company_name_th || fallbackProfile.company_name_th,
+            branch_name_th: branchVal,
+            branch_name: branchVal,
+            address_th: addrVal,
+            address_full: addrVal,
+            tax_id: r.tax_id || '',
+            phone: r.phone || '',
+            email: r.email || '',
+            vat_rate: r.vat_rate ?? 7,
+            vat_mode: r.vat_mode || 'INCLUDED'
+        };
+
+        return res.json({ success: true, profile: normalized, company: normalized });
     } catch (err) {
         console.error('[COMPANY-01] GET error:', err);
         return res.status(500).json({ success: false, message: err.message });
@@ -11972,71 +11988,49 @@ app.get('/api/company-profile', async (req, res) => {
 // [COMPANY-02] PUT /api/admin/company-profile — อัปเดตข้อมูลผู้ออกใบกำกับภาษี
 // -------------------------------------------------------------------------
 app.put('/api/admin/company-profile', async (req, res) => {
-    const {
-        company_name_th = '',
-        branch_name = 'สำนักงานใหญ่',
-        address_full = '',
-        tax_id = '',
-        phone = '',
-        email = '',
-        vat_rate = 7
-    } = req.body || {};
+    const body = req.body || {};
+    const company_name_th = String(body.company_name_th || '').trim();
+    const branch_name_th = String(body.branch_name_th || body.branch_name || 'สำนักงานใหญ่').trim();
+    const address_th = String(body.address_th || body.address_full || '').trim();
+    const tax_id = String(body.tax_id || '').trim();
+    const phone = String(body.phone || '').trim();
+    const email = String(body.email || '').trim();
+    const safeVat = Number.isFinite(Number(body.vat_rate)) ? Number(body.vat_rate) : 7;
 
-    if (!company_name_th.trim() || !address_full.trim()) {
+    if (!company_name_th || !address_th) {
         return res.status(400).json({
             success: false,
             message: 'กรุณาระบุชื่อผู้ออกใบกำกับภาษีและที่อยู่ให้ครบถ้วน'
         });
     }
 
-    const safeVat = Number.isFinite(Number(vat_rate)) ? Number(vat_rate) : 7;
-
     try {
-        const existing = await pgPool.query(
-            `SELECT id FROM system_company_profile ORDER BY id ASC LIMIT 1`
-        );
+        const existing = await pgPool.query(`SELECT ctid FROM system_company_profile LIMIT 1`);
 
         let saved;
         if (existing.rows.length > 0) {
             const upd = await pgPool.query(
                 `UPDATE system_company_profile
                  SET company_name_th = $1,
-                     branch_name = $2,
-                     address_full = $3,
+                     branch_name_th = $2,
+                     address_th = $3,
                      tax_id = $4,
                      phone = $5,
                      email = $6,
                      vat_rate = $7,
                      updated_at = NOW()
-                 WHERE id = $8
+                 WHERE ctid = $8
                  RETURNING *`,
-                [
-                    company_name_th.trim(),
-                    branch_name.trim(),
-                    address_full.trim(),
-                    tax_id.trim(),
-                    phone.trim(),
-                    email.trim(),
-                    safeVat,
-                    existing.rows[0].id
-                ]
+                [company_name_th, branch_name_th, address_th, tax_id, phone, email, safeVat, existing.rows[0].ctid]
             );
             saved = upd.rows[0];
         } else {
             const ins = await pgPool.query(
                 `INSERT INTO system_company_profile (
-                    company_name_th, branch_name, address_full, tax_id, phone, email, vat_rate
+                    company_name_th, branch_name_th, address_th, tax_id, phone, email, vat_rate
                 ) VALUES ($1,$2,$3,$4,$5,$6,$7)
                 RETURNING *`,
-                [
-                    company_name_th.trim(),
-                    branch_name.trim(),
-                    address_full.trim(),
-                    tax_id.trim(),
-                    phone.trim(),
-                    email.trim(),
-                    safeVat
-                ]
+                [company_name_th, branch_name_th, address_th, tax_id, phone, email, safeVat]
             );
             saved = ins.rows[0];
         }
@@ -12047,6 +12041,7 @@ app.put('/api/admin/company-profile', async (req, res) => {
         return res.status(500).json({ success: false, message: err.message });
     }
 });
+
 
 // -------------------------------------------------------------------------
 // [COMP-02] POST /api/company-profile — อัปเดตข้อมูลบริษัท/เลขผู้เสียภาษี/VAT
