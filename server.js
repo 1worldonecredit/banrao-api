@@ -12801,6 +12801,95 @@ app.get('/api/admin/reconcile-summary', async (req, res) => {
     }
 });
 
+
+// -------------------------------------------------------------------------
+// [NUMBER-03] POST /api/admin/premium-numbers/seed-batch — สร้างคลังเลขสวยเข้าตารางจำนวนมากอัตโนมัติ
+// -------------------------------------------------------------------------
+app.post('/api/admin/premium-numbers/seed-batch', async (req, res) => {
+    const items = [];
+    const add = (digits, tier, tier_label_th, pattern_note, price) => {
+        if (/^\d{10}$/.test(digits)) {
+            items.push({ public_code: `BR-${digits}`, digits_only: digits, tier, tier_label_th, pattern_note, price });
+        }
+    };
+
+    // 1. VIP: ตองสิบ (1111111111 - 9999999999) + คู่เรียง + ตองเรียง
+    for (let i = 1; i <= 9; i++) {
+        add(String(i).repeat(10), 'VIP', 'เลข VIP', `เลข ${i} ล้วน 10 หลัก`, i === 8 || i === 9 ? 250000 : 150000);
+    }
+    for (let i = 1; i <= 5; i++) {
+        const d = `${i}${i}${i + 1}${i + 1}${i + 2}${i + 2}${i + 3}${i + 3}${i + 4}${i + 4}`;
+        add(d, 'VIP', 'เลข VIP', `เลขคู่เรียง ${i}${i}-${i + 4}${i + 4}`, 89000);
+    }
+    for (let i = 1; i <= 7; i++) {
+        const d = `${i}${i}${i}${i + 1}${i + 1}${i + 1}${i + 2}${i + 2}${i + 2}9`;
+        add(d, 'VIP', 'เลข VIP', `เลขตองเรียง ${i}${i}${i}-${i + 2}${i + 2}${i + 2}`, 79000);
+    }
+
+    // 2. SUPER_NICE (สวยมาก): สลับคู่ (1212121212, 8989898989...) และ ตองนำหน้า+ตองท้าย (111xxxx999)
+    const nicePairs = ['12', '15', '19', '24', '36', '45', '56', '59', '65', '68', '78', '89', '95', '98'];
+    for (const p of nicePairs) {
+        add(p.repeat(5), 'SUPER_NICE', 'สวยมาก', `เลขสลับคู่ ${p} ซ้ำ 5 รอบ`, 39000);
+    }
+    for (let a = 1; a <= 9; a++) {
+        for (let b = 8; b <= 9; b++) {
+            if (a === b) continue;
+            add(`${a}${a}${a}${b}${b}${b}${a}${a}${b}${b}`, 'SUPER_NICE', 'สวยมาก', `ตองนำหน้า ${a}${a}${a} สลับ ${b}${b}${b}`, 29000);
+        }
+    }
+
+    // 3. NICE_TIER_2 (สวยรอง): เบิ้ลนำหน้า (11-99) + สลับคู่สวย
+    for (let a = 1; a <= 9; a++) {
+        add(`${a}${a}00${a}${a}00${a}${a}`, 'NICE_TIER_2', 'สวยรอง', `เบิ้ลนำหน้า ${a}${a} สลับ 00`, 15900);
+        add(`${a}${a}8899${a}${a}88`, 'NICE_TIER_2', 'สวยรอง', `เบิ้ลนำหน้า ${a}${a} คู่มงคล 8899`, 14900);
+        add(`${a}${a}123456${a}${a}`, 'NICE_TIER_2', 'สวยรอง', `เบิ้ลหัวท้าย ${a}${a} กลางเรียง`, 12900);
+    }
+
+    // 4. NICE (สวย): ตองนำหน้า (111-999) + เลขลงท้ายสวย
+    for (let a = 1; a <= 9; a++) {
+        add(`${a}${a}${a}0001689`, 'NICE', 'สวย', `ตองนำหน้า ${a}${a}${a} ลงท้าย 1689`, 5900);
+        add(`${a}${a}${a}2026888`, 'NICE', 'สวย', `ตองนำหน้า ${a}${a}${a} ลงท้าย 888`, 4900);
+        add(`${a}${a}${a}2026999`, 'NICE', 'สวย', `ตองนำหน้า ${a}${a}${a} ลงท้าย 999`, 5500);
+    }
+
+    // 5. LUCKY (เลขมงคล): ชุดเลขมงคล 4289, 6395, 168, 789
+    const luckyPrefixes = ['19', '24', '45', '56', '59', '65', '78', '89', '95', '99'];
+    for (const lp of luckyPrefixes) {
+        add(`${lp}20264289`, 'LUCKY', 'เลขมงคล', `นำหน้า ${lp} ลงท้ายมังกร 4289`, 2999);
+        add(`${lp}20266395`, 'LUCKY', 'เลขมงคล', `นำหน้า ${lp} ลงท้ายเสน่ห์ 6395`, 2599);
+        add(`${lp}20261689`, 'LUCKY', 'เลขมงคล', `นำหน้า ${lp} ลงท้ายฮกลกซิ่ว 1689`, 2999);
+    }
+
+    const client = await pgPool.connect();
+    try {
+        await client.query('BEGIN');
+        let inserted = 0;
+        for (const it of items) {
+            // ข้ามเลขที่มีคนใช้งานอยู่ใน wallets แล้ว
+            const used = await client.query(`SELECT 1 FROM wallets WHERE public_code = $1 LIMIT 1`, [it.public_code]);
+            if (used.rows.length > 0) continue;
+
+            const r = await client.query(
+                `INSERT INTO premium_account_numbers (
+                    public_code, digits_only, tier, tier_label_th, pattern_note, price
+                ) VALUES ($1,$2,$3,$4,$5,$6)
+                ON CONFLICT (digits_only) DO NOTHING`,
+                [it.public_code, it.digits_only, it.tier, it.tier_label_th, it.pattern_note, it.price]
+            );
+            inserted += r.rowCount;
+        }
+        await client.query('COMMIT');
+        return res.json({ success: true, total_generated: items.length, newly_inserted: inserted });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error('[NUMBER-03] seed-batch error:', err);
+        return res.status(500).json({ success: false, message: err.message });
+    } finally {
+        client.release();
+    }
+});
+
+
 app.listen(port, () => {
     console.log(`Server is running on port ${port}`);
 });
