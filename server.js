@@ -8,6 +8,8 @@ const multer = require('multer');
 // ตั้งค่าให้ multer เก็บไฟล์ไว้ในหน่วยความจำ (RAM) ก่อนส่งไป Cloudflare
 const upload = multer({ storage: multer.memoryStorage() });
 
+const crypto = require('crypto');
+
 const app = express();
 
 const bcrypt = require('bcrypt');
