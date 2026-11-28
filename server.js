@@ -13430,6 +13430,108 @@ app.get('/api/wallets/transactions', async (req, res) => {
 });
 
 
+
+// =========================================================================
+// [LEGAL-01] GET /api/legal/wallet-opening-status — เช็กว่าผู้ใช้ขอเปิดบัญชีแล้วหรือยัง + ดึงเอกสารกฎหมายล่าสุด
+// =========================================================================
+app.get('/api/legal/wallet-opening-status', async (req, res) => {
+    const accountId = String(req.query.account_id || '').trim();
+    if (!accountId) return res.status(400).json({ success: false, message: 'กรุณาระบุ account_id' });
+    try {
+        const [consentRes, docRes] = await Promise.all([
+            pgPool.query(`SELECT * FROM wallet_opening_consents WHERE account_id = $1 LIMIT 1`, [accountId]),
+            pgPool.query(
+                `SELECT * FROM legal_documents
+                 WHERE doc_code = 'WALLET_OPENING_TERMS' AND is_active = TRUE
+                 ORDER BY doc_id DESC LIMIT 1`
+            )
+        ]);
+        return res.json({
+            success: true,
+            has_consented: consentRes.rows.length > 0,
+            consent: consentRes.rows[0] || null,
+            document: docRes.rows[0] || null
+        });
+    } catch (err) {
+        console.error('[LEGAL-01] error:', err);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// =========================================================================
+// [LEGAL-02] POST /api/legal/wallet-opening-consent — ยื่นคำขอเปิดบัญชี + ยืนยัน PIN + อนุมัติอัตโนมัติ (แผนกการตลาด)
+// =========================================================================
+app.post('/api/legal/wallet-opening-consent', async (req, res) => {
+    const { account_id, applicant_name = '', accepted_terms = false, pin } = req.body || {};
+    if (!account_id || !accepted_terms) {
+        return res.status(400).json({ success: false, message: 'กรุณาติ๊กยอมรับเงื่อนไขการขอเปิดบัญชีก่อนยืนยัน' });
+    }
+    if (!/^\d{6}$/.test(String(pin || ''))) {
+        return res.status(400).json({ success: false, message: 'กรุณากรอกรหัส PIN ตัวเลข 6 หลักเพื่อยืนยันตัวตน' });
+    }
+
+    const client = await pgPool.connect();
+    try {
+        await client.query('BEGIN');
+
+        // 1. ถ้ายังไม่มี PIN ให้บันทึก PIN 6 หลักนี้ให้เลย / ถ้ามีแล้วให้ตรวจสอบ PIN เดิม
+        const existingPin = await client.query(`SELECT account_id FROM user_security_pins WHERE account_id = $1`, [account_id]);
+        if (existingPin.rows.length === 0) {
+            const salt = crypto.randomBytes(16).toString('hex');
+            const hashed = hashPin(pin, salt);
+            await client.query(
+                `INSERT INTO user_security_pins (account_id, pin_salt, pin_hash, failed_attempts, updated_at)
+                 VALUES ($1, $2, $3, 0, NOW())`,
+                [account_id, salt, hashed]
+            );
+        } else {
+            const pinCheck = await verifyUserPin(client, account_id, pin);
+            if (!pinCheck.ok) {
+                await client.query('ROLLBACK');
+                return res.status(400).json({ success: false, message: pinCheck.message });
+            }
+        }
+
+        // 2. ดึงเอกสารทางกฎหมายเวอร์ชันล่าสุดที่ใช้งานอยู่
+        const docRes = await client.query(
+            `SELECT doc_id, version FROM legal_documents
+             WHERE doc_code = 'WALLET_OPENING_TERMS' AND is_active = TRUE
+             ORDER BY doc_id DESC LIMIT 1`
+        );
+        const docId = docRes.rows[0]?.doc_id || null;
+        const docVersion = docRes.rows[0]?.version || '1.0';
+
+        // 3. เก็บ IP และ User-Agent เป็นหลักฐานทางกฎหมาย + อนุมัติอัตโนมัติโดยแผนกการตลาด
+        const ip = String(req.headers['x-forwarded-for'] || req.socket?.remoteAddress || '').split(',')[0].trim();
+        const ua = String(req.headers['user-agent'] || '').slice(0, 500);
+
+        const ins = await client.query(
+            `INSERT INTO wallet_opening_consents (
+                account_id, applicant_name, doc_id, doc_version,
+                accepted_terms, pin_verified, approval_status,
+                approved_by_dept, approved_by_name, ip_address, user_agent
+            ) VALUES ($1,$2,$3,$4,TRUE,TRUE,'AUTO_APPROVED','แผนกการตลาด (พนักงานดูแลลูกค้า)','ระบบอนุมัติอัตโนมัติ - แผนกการตลาด',$5,$6)
+            ON CONFLICT (account_id) DO NOTHING
+            RETURNING *`,
+            [account_id, applicant_name, docId, docVersion, ip, ua]
+        );
+
+        await client.query('COMMIT');
+        return res.json({
+            success: true,
+            consent: ins.rows[0] || { account_id, approval_status: 'AUTO_APPROVED' },
+            message: 'อนุมัติเปิดบัญชีอัตโนมัติเรียบร้อยแล้ว (โดยฝ่ายดูแลลูกค้า แผนกการตลาด)'
+        });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error('[LEGAL-02] consent error:', err);
+        return res.status(500).json({ success: false, message: err.message });
+    } finally {
+        client.release();
+    }
+});
+
+
 app.listen(port, () => {
     console.log(`Server is running on port ${port}`);
 });
