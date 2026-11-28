@@ -12417,13 +12417,14 @@ app.post('/api/admin/bank-statements', async (req, res) => {
 // เงื่อนไข: บัญชีตรงกัน + ยอดเงินตรงกัน + วันที่ตรงกัน + เวลาคลาดเคลื่อนไม่เกิน tolerance_sec (ค่าเริ่มต้น 60 วินาที)
 // -------------------------------------------------------------------------
 // -------------------------------------------------------------------------
-// [RECON-03] POST /api/admin/auto-reconcile — กระทบยอดอัตโนมัติ (เทียบวันที่จาก SQL ตรงๆ กันเพี้ยน Timezone)
+// [RECON-03] POST /api/admin/auto-reconcile — กระทบยอดอัตโนมัติ (รองรับทั้งซื้อแพ็กเกจ Parkgate และเติมเงินเข้ากระเป๋า Wallet)
 // เงื่อนไข: สลิปสถานะ SLIP_VERIFIED + ยอดเงินตรงกัน + วันที่ตรงกัน + เวลาคลาดเคลื่อนไม่เกิน tolerance_sec (60 วินาที)
 // -------------------------------------------------------------------------
 app.post('/api/admin/auto-reconcile', async (req, res) => {
     const toleranceSec = Number(req.body?.tolerance_sec ?? 60);
     const verifiedBy = req.body?.verified_by || 'AUTO_RECONCILE';
 
+    // แปลงเวลา HH:MM:SS เป็นจำนวนวินาที เพื่อคำนวณส่วนต่างเวลาได้แม่นยำ
     const hmsToSeconds = (hms) => {
         const [h = 0, m = 0, s = 0] = String(hms || '00:00:00').split(':').map(Number);
         return h * 3600 + m * 60 + s;
@@ -12433,12 +12434,15 @@ app.post('/api/admin/auto-reconcile', async (req, res) => {
     try {
         await client.query('BEGIN');
 
+        // 1. ดึงรายการสลิปที่แอดมินตรวจแล้ว (SLIP_VERIFIED) และยังไม่ได้จับคู่กับ Statement
         const slipsRes = await client.query(
             `SELECT *, TO_CHAR(transfer_date, 'YYYY-MM-DD') AS transfer_date_str
              FROM payment_slip_submissions
              WHERE status = 'SLIP_VERIFIED' AND matched_statement_id IS NULL
              ORDER BY transfer_date ASC, transfer_time_hms ASC`
         );
+
+        // 2. ดึงรายการเงินเข้าบัญชีจริง (Statement) ที่ยังไม่ได้ถูกจับคู่ (UNMATCHED)
         const stmtsRes = await client.query(
             `SELECT *, TO_CHAR(received_date, 'YYYY-MM-DD') AS received_date_str
              FROM bank_statement_entries
@@ -12449,6 +12453,7 @@ app.post('/api/admin/auto-reconcile', async (req, res) => {
         const availableStmts = [...stmtsRes.rows];
         const matchedPairs = [];
 
+        // 3. วนลูปจับคู่สลิปกับ Statement ทีละรายการ
         for (const slip of slipsRes.rows) {
             const slipDate = slip.transfer_date_str;
             const slipSec = hmsToSeconds(slip.transfer_time_hms);
@@ -12466,8 +12471,10 @@ app.post('/api/admin/auto-reconcile', async (req, res) => {
             });
 
             if (matchIdx !== -1) {
+                // ดึง Statement ที่จับคู่ได้ออกจากคิว เพื่อไม่ให้จับคู่ซ้ำกับสลิปอื่น
                 const st = availableStmts.splice(matchIdx, 1)[0];
 
+                // 4. อัปเดตสถานะสลิปเป็น APPROVED และผูกกับ statement_id
                 await client.query(
                     `UPDATE payment_slip_submissions
                      SET status = 'APPROVED',
@@ -12478,6 +12485,7 @@ app.post('/api/admin/auto-reconcile', async (req, res) => {
                     [st.statement_id, verifiedBy, slip.submission_id]
                 );
 
+                // 5. อัปเดตสถานะ Statement เป็น MATCHED และผูกกับ submission_id
                 await client.query(
                     `UPDATE bank_statement_entries
                      SET match_status = 'MATCHED',
@@ -12486,18 +12494,62 @@ app.post('/api/admin/auto-reconcile', async (req, res) => {
                     [slip.submission_id, st.statement_id]
                 );
 
+                // 6. ดำเนินการตามประเภทธุรกรรม (tx_category)
                 if (slip.tx_category === 'PACKAGE' && slip.payer_account_id) {
+                    // 6.1 กรณีซื้อแพ็กเกจ Parkgate: ปรับสถานะแพ็กเกจที่รอชำระเป็น PAID อัตโนมัติ
                     await client.query(
                         `UPDATE user_package_subscriptions
                          SET payment_status = 'PAID', updated_at = NOW()
                          WHERE account_id = $1 AND payment_status = 'PENDING'`,
                         [slip.payer_account_id]
                     );
+                } else if (slip.tx_category === 'WALLET_TOPUP' && slip.payer_account_id) {
+                    // 6.2 กรณีเติมเงินเข้ากระเป๋า (Wallet): ล็อกแถวกระเป๋าหลัก (FOR UPDATE) แล้วบวกยอดเงินเข้า
+                    const wRes = await client.query(
+                        `SELECT wallet_id, balance FROM wallets
+                         WHERE account_id = $1
+                         ORDER BY created_at ASC LIMIT 1
+                         FOR UPDATE`,
+                        [slip.payer_account_id]
+                    );
+
+                    if (wRes.rows.length > 0) {
+                        const w = wRes.rows[0];
+                        const beforeBal = Number(w.balance || 0);
+                        const afterBal = Number((beforeBal + slipAmt).toFixed(2));
+
+                        // อัปเดตยอดเงินคงเหลือในกระเป๋า
+                        await client.query(
+                            `UPDATE wallets SET balance = $1, updated_at = NOW() WHERE wallet_id = $2`,
+                            [afterBal, w.wallet_id]
+                        );
+
+                        // บันทึกประวัติธุรกรรมแบบ Append-Only ลงตาราง wallet_transactions เพื่อตรวจสอบบัญชี
+                        await client.query(
+                            `INSERT INTO wallet_transactions (
+                                tx_ref, wallet_id, account_id, tx_type, direction,
+                                amount, balance_before, balance_after,
+                                counterparty_name, note, status
+                            ) VALUES ($1,$2,$3,'TOPUP','CREDIT',$4,$5,$6,$7,$8,'COMPLETED')`,
+                            [
+                                slip.qr_reference || `TOP-${Date.now()}`,
+                                w.wallet_id,
+                                slip.payer_account_id,
+                                slipAmt,
+                                beforeBal,
+                                afterBal,
+                                slip.receiver_bank_name || 'เติมเงินผ่าน QR Code',
+                                `เติมเงินเข้ากระเป๋า (กระทบยอดสำเร็จ #${slip.submission_id})`
+                            ]
+                        );
+                    }
                 }
 
+                // เก็บผลลัพธ์คู่ที่จับคู่สำเร็จไว้ส่งกลับให้หน้าหลังบ้านแสดงแจ้งเตือน
                 matchedPairs.push({
                     submission_id: slip.submission_id,
                     statement_id: st.statement_id,
+                    tx_category: slip.tx_category,
                     amount: slipAmt,
                     qr_reference: slip.qr_reference
                 });
